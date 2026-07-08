@@ -13,15 +13,18 @@
 //! `Builder`'s bottom-up, each-node-final-once shape.
 //!
 //! References and footnotes are never resolved here — `Link`/`Image` nodes
-//! carry a label string, and `AST.references`/`.footnotes` are label -> node
-//! maps consulted at render time (see djot.js's `parse.ts`/`html.ts` split,
-//! documented on `AST.references`).
+//! carry a label string, and `Document.references`/`.footnotes` are label ->
+//! node maps consulted at render time (see djot.js's `parse.ts`/`html.ts`
+//! split, documented on `Document.references` in `djot.zig`), which is why
+//! `build` produces a `Document` (AST + side tables) rather than a bare
+//! `AST`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ast_mod = @import("../../ast/ast.zig");
 const AST = ast_mod;
 const Node = AST.Node;
+const Document = @import("djot.zig").Document;
 const Span = @import("../../span.zig");
 const event = @import("event.zig");
 const Event = event.Event;
@@ -132,7 +135,13 @@ fn getListStart(marker: []const u8, numbering: ListMarkerStyle.Numbering) ?u32 {
 /// (safe to reference indefinitely; only `commitAttrs` ever copies into the
 /// AST's permanent `owned_strings`).
 const PendingAttrs = struct {
-    entries: std.ArrayList(AST.KeyVal) = .empty,
+    /// Like `AST.KeyVal` but with a NON-optional value: djot attribute
+    /// syntax cannot express a bare (valueless) attribute, so keeping the
+    /// accumulator's value required saves unwrapping at every use below —
+    /// optionality only enters at the `AST.KeyVal` boundary (`commitAttrs`).
+    const Entry = struct { key: []const u8, value: []const u8 };
+
+    entries: std.ArrayList(Entry) = .empty,
     owned_bufs: std.ArrayList([]const u8) = .empty,
     pending_key: ?[]const u8 = null,
 
@@ -407,7 +416,7 @@ pub const TreeBuilder = struct {
 
     // ── the big dispatch ─────────────────────────────────────────────────
 
-    pub fn build(self: *TreeBuilder, events: []const Event) Allocator.Error!AST {
+    pub fn build(self: *TreeBuilder, events: []const Event) Allocator.Error!Document {
         try self.pushContainer(0);
         self.topContainer().data.heading_level = 0;
 
@@ -437,11 +446,13 @@ pub const TreeBuilder = struct {
         self.deinitScratch();
 
         return .{
-            .allocator = self.allocator,
-            .owned_strings = try self.owned_strings.toOwnedSlice(self.allocator),
-            .root = doc_id,
-            .nodes = try self.nodes.toOwnedSlice(self.allocator),
-            .attrs = try self.attrs_table.toOwnedSlice(self.allocator),
+            .ast = .{
+                .allocator = self.allocator,
+                .owned_strings = try self.owned_strings.toOwnedSlice(self.allocator),
+                .root = doc_id,
+                .nodes = try self.nodes.toOwnedSlice(self.allocator),
+                .attrs = try self.attrs_table.toOwnedSlice(self.allocator),
+            },
             .references = self.references,
             .auto_references = self.auto_references,
             .footnotes = self.footnotes,
@@ -943,7 +954,10 @@ pub const TreeBuilder = struct {
         defer existing.deinit(self.allocator);
         if (self.nodes.items[id].attrs) |idx| {
             const a = self.attrs_table.items[idx];
-            for (a.entries) |kv| try existing.setKeyval(self.allocator, kv.key, kv.value);
+            // Every committed entry came from a `PendingAttrs` (whose values
+            // are non-optional — djot can't write a bare attribute), so
+            // unwrapping here can't fail.
+            for (a.entries) |kv| try existing.setKeyval(self.allocator, kv.key, kv.value.?);
         }
         try existing.mergeFrom(self.allocator, src);
         try self.commitAttrs(id, &existing);

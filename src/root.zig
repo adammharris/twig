@@ -12,11 +12,20 @@
 /// original source and is safe to hold onto after parsing).
 pub const AST = @import("ast/ast.zig");
 
-/// Djot support: `Djot.parse(allocator, source) !AST` plus `Djot.html` for
+/// Djot support: `Djot.parse(allocator, source) !Djot.Document` (the shared
+/// `AST` plus djot's reference/footnote side tables) plus `Djot.html` for
 /// rendering. See `languages/djot/djot.zig`'s module doc comment.
 pub const Djot = @import("languages/djot/djot.zig");
+
+/// XML support: `Xml.parse(allocator, source) !AST` (well-formed XML 1.0, no
+/// external DTD processing) plus `Xml.serialize`/`Xml.serializeAlloc` for
+/// rendering back to text. Unlike `Djot`, XML needs no side-table wrapper —
+/// `parse` returns the shared `AST` directly. See `languages/xml/xml.zig`'s
+/// module doc comment.
+pub const Xml = @import("languages/xml/xml.zig");
 
 test {
     _ = AST;
     _ = Djot;
+    _ = Xml;
 }

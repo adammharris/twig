@@ -29,9 +29,9 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
-    var ast = try twig.Djot.parse(arena, source);
-    defer ast.deinit();
+    var doc = try twig.Djot.parse(arena, source);
+    defer doc.deinit();
 
-    try twig.Djot.html.render(arena, &ast, stdout_writer, .{});
+    try twig.Djot.html.render(arena, &doc, stdout_writer, .{});
     try stdout_writer.flush();
 }

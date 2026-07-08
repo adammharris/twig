@@ -1,7 +1,20 @@
 //! AST = Abstract Syntax Tree for a parsed document.
 //!
-//! This is Twig's document-format counterpart to fig's config-tree `AST`
-//! https://github.com/adammharris/fig/blob/main/src/ast/ast.zig`
+//! This is Twig's SHARED node vocabulary: every language module
+//! (`src/languages/djot/` today; XML/HTML next) parses into this one node
+//! model, so structural operations and printers written against `AST` work
+//! regardless of which format produced the tree. The kinds below form a
+//! common semantic core (headings, emphasis, lists, tables, ...) plus a
+//! small generic-markup escape hatch (`element`, `comment`, `doctype`, ...)
+//! for constructs with no semantic mapping — languages map what they can to
+//! semantic kinds (`<em>` → `emph`) and fall back to `element` for the rest,
+//! which is what keeps this vocabulary closed. Djot's tag-by-tag mapping
+//! (mirroring djot.js's `src/ast.ts`) is one language's mapping, not this
+//! file's definition; anything djot-specific (the reference/footnote
+//! side-tables, the block/inline dichotomy) lives in the djot module.
+//!
+//! Structurally this is the document-format counterpart to fig's config-tree
+//! `AST` https://github.com/adammharris/fig/blob/main/src/ast/ast.zig`
 //! and follows the same conventions:
 //! an index-based arena (`Node.Id = u32`, a flat `[]Node`),
 //! containers link their children via `first_child`/`next_sibling`
@@ -10,16 +23,13 @@
 //! so a finished `AST` never borrows the original source text and printers can take `*const AST` alone.
 //!
 //! Node *shape* is much more heterogeneous here than in fig's config AST
-//! (~45 kinds vs. ~8), so unlike fig — which folds a container's child
+//! (~50 kinds vs. ~8), so unlike fig — which folds a container's child
 //! pointer directly into its `Kind` union payload (`sequence: ?Id`) — every
 //! `Node` carries its own `first_child`/`next_sibling` fields uniformly,
 //! regardless of kind. `Kind` then only needs to carry each kind's *extra*
 //! data (a heading's level, a code block's language/text, ...); kinds with no
 //! extra data beyond their children (e.g. `emph`, `block_quote`) are `void`
 //! payloads, following fig's `null_,` shorthand.
-//!
-//! The first format built on this AST is Djot (`src/languages/djot/`); the
-//! node kinds below mirror djot.js's `src/ast.ts` tag-by-tag.
 
 const AST = @This();
 const std = @import("std");
@@ -31,8 +41,6 @@ pub const Builder = @import("builder.zig");
 
 pub const children = reader.children;
 pub const ChildIterator = reader.ChildIterator;
-pub const isBlock = reader.isBlock;
-pub const isInline = reader.isInline;
 pub const attrsOf = reader.attrsOf;
 
 allocator: Allocator,
@@ -50,21 +58,6 @@ nodes: []const Node,
 /// because most nodes carry no attributes at all.
 attrs: []const Attrs = &.{},
 
-/// Label (normalized) -> the `reference` definition node with that label.
-/// Populated during parsing; never consulted during parsing itself — label
-/// resolution (matching a `Link`/`Image`'s `reference` string against this
-/// table) is deferred entirely to render time, so forward references need no
-/// special handling. See djot.js's `parse.ts`/`html.ts` split.
-references: std.StringHashMapUnmanaged(Node.Id) = .empty,
-
-/// Same shape as `references`, for reference definitions synthesized by the
-/// parser itself (e.g. implicit heading-derived link targets) rather than
-/// written explicitly by the author.
-auto_references: std.StringHashMapUnmanaged(Node.Id) = .empty,
-
-/// Label -> the `footnote` definition node with that label.
-footnotes: std.StringHashMapUnmanaged(Node.Id) = .empty,
-
 pub fn deinit(self: *AST) void {
     for (self.owned_strings) |s| self.allocator.free(s);
     self.allocator.free(self.owned_strings);
@@ -73,9 +66,6 @@ pub fn deinit(self: *AST) void {
         self.allocator.free(a.entries);
     }
     self.allocator.free(self.attrs);
-    self.references.deinit(self.allocator);
-    self.auto_references.deinit(self.allocator);
-    self.footnotes.deinit(self.allocator);
 }
 
 pub const Node = struct {
@@ -85,18 +75,29 @@ pub const Node = struct {
     next_sibling: ?Id = null,
     /// Byte range `[start, end)` into the source this node was parsed from.
     span: Span = Span.init(0, 0),
+    /// For container nodes: the byte range of the node's *interior* — the
+    /// region between its opening and closing delimiters where its children
+    /// live, and where an editor may splice new children (for
+    /// `<div class=x>abc</div>`, the span of `abc`; for a djot `::: div`,
+    /// the lines between the fences). `null` = unknown or not meaningful
+    /// (leaves; synthesized nodes). Parsers should populate it when it is
+    /// cheap to compute; a parser that leaves it `null` is still correct,
+    /// just less useful to editors.
+    content_span: ?Span = null,
     /// Index into `AST.attrs`, or `null` if this node has no `{...}`
     /// attributes attached.
     attrs: ?u32 = null,
 
     pub const Id = u32;
 
-    /// One node kind per djot.js `ast.ts` tag. Container kinds (whose payload
-    /// is `void` below) still get children like any other node, via the
-    /// uniform `first_child`/`next_sibling` fields on `Node` itself — see
-    /// this file's module doc comment for why that's a `Node`-level field
-    /// rather than folded into each variant here (as fig does for its much
-    /// smaller, config-oriented `Kind`).
+    /// The shared kind vocabulary: a semantic core (one kind per djot.js
+    /// `ast.ts` tag) plus generic-markup kinds for what XML/HTML can't map
+    /// semantically. Container kinds (whose payload is `void` below) still
+    /// get children like any other node, via the uniform
+    /// `first_child`/`next_sibling` fields on `Node` itself — see this
+    /// file's module doc comment for why that's a `Node`-level field rather
+    /// than folded into each variant here (as fig does for its much smaller,
+    /// config-oriented `Kind`).
     pub const Kind = union(enum) {
         // ── Document root ───────────────────────────────────────────────
         doc,
@@ -162,11 +163,38 @@ pub const Node = struct {
         delete,
         double_quoted,
         single_quoted,
+
+        // ── Generic markup ────────────────────────────────────────────────
+        /// A named element with no semantic mapping (HTML `<video>`,
+        /// arbitrary XML) — the escape hatch that keeps this vocabulary
+        /// closed: languages map what they can to semantic kinds (`<em>` →
+        /// `emph`) and fall back to `element` for the rest. Children are
+        /// parsed nodes like any container; attributes go in the normal
+        /// `attrs` side-table. `name` is stored as written, including any
+        /// namespace prefix (`svg:rect`) — prefix resolution is a
+        /// reader-side helper, later.
+        element: struct { name: []const u8 },
+        /// HTML/XML `<!-- ... -->`; payload is the text between the
+        /// delimiters, as written.
+        comment: []const u8,
+        /// Payload is everything between `<!DOCTYPE` and `>`, as written
+        /// (e.g. `html`, or a full XML public/system id soup). Not parsed
+        /// further.
+        doctype: []const u8,
+        /// XML `<?target data?>`.
+        processing_instruction: struct { target: []const u8, data: []const u8 },
+        /// XML `<![CDATA[...]]>`; payload is the raw contents. (Plain text
+        /// nodes are `str`; `cdata` exists separately so the distinction
+        /// round-trips.)
+        cdata: []const u8,
     };
 };
 
-/// A single `key="value"` attribute pair (`AttributeParser`'s `keyval`).
-pub const KeyVal = struct { key: []const u8, value: []const u8 };
+/// A single attribute pair (`AttributeParser`'s `keyval`). A `null` value
+/// means a *bare* attribute — HTML `disabled`, which must round-trip
+/// distinctly from `disabled=""`. Djot attribute syntax has no way to write
+/// a bare attribute, so djot parses always produce non-null values.
+pub const KeyVal = struct { key: []const u8, value: ?[]const u8 };
 
 /// The parsed contents of a `{.class #id key="val"}` attribute block, as
 /// attached to a `Node` via `Node.attrs`. See djot.js's `attributes.ts`.
@@ -189,12 +217,22 @@ pub const Attrs = struct {
         return self.entries.len == 0;
     }
 
-    /// Look up an attribute by key (e.g. `"id"`, `"class"`).
-    pub fn get(self: Attrs, key: []const u8) ?[]const u8 {
+    /// Look up an attribute's whole entry by key — the presence test that
+    /// distinguishes "key absent" (`null` here) from "key present but bare"
+    /// (an entry whose `value` is `null`, e.g. HTML `disabled`).
+    pub fn find(self: Attrs, key: []const u8) ?KeyVal {
         for (self.entries) |kv| {
-            if (std.mem.eql(u8, kv.key, key)) return kv.value;
+            if (std.mem.eql(u8, kv.key, key)) return kv;
         }
         return null;
+    }
+
+    /// Look up an attribute's value by key (e.g. `"id"`, `"class"`). Both
+    /// an absent key and a bare (valueless) attribute yield `null` — use
+    /// `find` when that distinction matters.
+    pub fn get(self: Attrs, key: []const u8) ?[]const u8 {
+        const kv = self.find(key) orelse return null;
+        return kv.value;
     }
 };
 
@@ -224,4 +262,27 @@ pub const SmartPunctuationKind = enum {
 test {
     _ = Builder;
     _ = reader;
+}
+
+test "Attrs.find distinguishes a bare attribute from an absent key" {
+    const testing = std.testing;
+    const attrs: Attrs = .{ .entries = &.{
+        .{ .key = "disabled", .value = null },
+        .{ .key = "id", .value = "x" },
+    } };
+
+    // Bare attribute: present per `find`, but `get` can't tell it apart
+    // from an absent key.
+    const bare = attrs.find("disabled") orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("disabled", bare.key);
+    try testing.expectEqual(@as(?[]const u8, null), bare.value);
+    try testing.expectEqual(@as(?[]const u8, null), attrs.get("disabled"));
+
+    // Valued attribute: both accessors agree.
+    try testing.expectEqualStrings("x", attrs.find("id").?.value.?);
+    try testing.expectEqualStrings("x", attrs.get("id").?);
+
+    // Absent key: `find` is the only way to see the difference.
+    try testing.expectEqual(@as(?KeyVal, null), attrs.find("missing"));
+    try testing.expectEqual(@as(?[]const u8, null), attrs.get("missing"));
 }

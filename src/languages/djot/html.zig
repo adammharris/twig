@@ -1,14 +1,21 @@
-//! AST -> HTML renderer. Ported from djot.js's `src/html.ts`. Used both as
-//! a genuinely useful output format and — via `conformance.zig` — as the
-//! parser's main correctness oracle: djot.js's own test suite is entirely
-//! input-djot -> expected-HTML pairs, so an accurate renderer is what makes
-//! that corpus usable here too.
+//! Document -> HTML renderer. Ported from djot.js's `src/html.ts`. Used
+//! both as a genuinely useful output format and — via `conformance.zig` —
+//! as the parser's main correctness oracle: djot.js's own test suite is
+//! entirely input-djot -> expected-HTML pairs, so an accurate renderer is
+//! what makes that corpus usable here too.
+//!
+//! Renders a djot `Document`, not a bare `AST`: reference/footnote
+//! resolution is deferred entirely to render time (see `Document`'s doc
+//! comments in `djot.zig`), so the renderer needs the side tables alongside
+//! the tree.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 const AST = @import("../../ast/ast.zig");
 const Node = AST.Node;
+const djot = @import("djot.zig");
+const Document = djot.Document;
 
 pub const RenderOptions = struct {
     warn: ?*const fn (message: []const u8) void = null,
@@ -27,6 +34,10 @@ pub const RenderError = Writer.Error || Allocator.Error;
 
 pub const Renderer = struct {
     allocator: Allocator,
+    doc: *const Document,
+    /// Always `&doc.ast` — kept as its own field because the tree is what
+    /// nearly every render function touches; `doc` itself is only consulted
+    /// for the reference/footnote side tables.
     ast: *const AST,
     writer: *Writer,
     tight: bool = false,
@@ -35,8 +46,8 @@ pub const Renderer = struct {
     fnref_id_emitted: std.StringHashMapUnmanaged(void) = .empty,
     options: RenderOptions = .{},
 
-    pub fn init(allocator: Allocator, ast: *const AST, writer: *Writer, options: RenderOptions) Renderer {
-        return .{ .allocator = allocator, .ast = ast, .writer = writer, .options = options };
+    pub fn init(allocator: Allocator, doc: *const Document, writer: *Writer, options: RenderOptions) Renderer {
+        return .{ .allocator = allocator, .doc = doc, .ast = &doc.ast, .writer = writer, .options = options };
     }
 
     pub fn deinit(self: *Renderer) void {
@@ -112,9 +123,17 @@ pub const Renderer = struct {
         const extra_has_class = hasKey(extra, "class");
         for (attrs.entries) |kv| {
             if (std.mem.eql(u8, kv.key, "class") and extra_has_class) continue;
-            try self.writer.print(" {s}=\"", .{kv.key});
-            try self.writeEscapedAttr(kv.value);
-            try self.writer.writeByte('"');
+            if (kv.value) |value| {
+                try self.writer.print(" {s}=\"", .{kv.key});
+                try self.writeEscapedAttr(value);
+                try self.writer.writeByte('"');
+            } else {
+                // A bare attribute (HTML `disabled`) renders as just its
+                // key — distinct from `disabled=""`. Djot syntax can't
+                // produce one, but this shared path must stay correct for
+                // trees built by other languages/by hand.
+                try self.writer.print(" {s}", .{kv.key});
+            }
         }
     }
 
@@ -197,7 +216,7 @@ pub const Renderer = struct {
             rendered.deinit(self.allocator);
         }
 
-        // `AST.footnotes` is a hash map, so its iteration order is
+        // `Document.footnotes` is a hash map, so its iteration order is
         // unspecified -- but djot.js's `notes` is a plain JS object, which
         // (for string keys) iterates in INSERTION order, i.e. definition
         // order. That matters here: a footnote can forward- or self-
@@ -210,7 +229,7 @@ pub const Renderer = struct {
         const Entry = struct { key: []const u8, id: Node.Id };
         var entries = std.ArrayList(Entry).empty;
         defer entries.deinit(self.allocator);
-        var kit = self.ast.footnotes.iterator();
+        var kit = self.doc.footnotes.iterator();
         while (kit.next()) |entry| try entries.append(self.allocator, .{ .key = entry.key_ptr.*, .id = entry.value_ptr.* });
         std.mem.sort(Entry, entries.items, {}, struct {
             fn lessThan(_: void, a: Entry, b: Entry) bool {
@@ -439,6 +458,14 @@ pub const Renderer = struct {
             .delete => try self.inTags("del", id, 0, &.{}),
             .superscript => try self.inTags("sup", id, 0, &.{}),
             .subscript => try self.inTags("sub", id, 0, &.{}),
+            // The generic-markup kinds can never appear in a djot parse
+            // today; render nothing rather than crash (the same degrade-
+            // gracefully choice `else` makes for the definition-only kinds
+            // below), so a hand-built or foreign tree still renders its
+            // renderable parts.
+            .element, .comment, .doctype, .processing_instruction, .cdata => {},
+            // `footnote`/`reference` definitions: rendered via the side
+            // tables (`renderNotes`/`renderLinkOrImage`), never in place.
             else => {},
         }
     }
@@ -504,7 +531,7 @@ pub const Renderer = struct {
         defer if (alt) |a| self.allocator.free(a);
 
         if (v.reference) |ref| {
-            const resolved = self.ast.references.get(ref) orelse self.ast.auto_references.get(ref);
+            const resolved = self.doc.references.get(ref) orelse self.doc.auto_references.get(ref);
             if (resolved) |ref_id| {
                 const ref_attrs = self.ast.attrsOf(ref_id);
                 dest = self.ast.nodes[ref_id].kind.reference.destination;
@@ -517,7 +544,10 @@ pub const Renderer = struct {
                 }
                 const own_attrs = self.ast.attrsOf(id);
                 for (ref_attrs.entries) |kv| {
-                    if (own_attrs.get(kv.key) == null) try extra.append(self.allocator, .{ .key = kv.key, .value = kv.value });
+                    // Reference-definition attrs come from djot syntax,
+                    // which can't express a bare (null-value) attribute, so
+                    // unwrapping can't fail.
+                    if (own_attrs.get(kv.key) == null) try extra.append(self.allocator, .{ .key = kv.key, .value = kv.value.? });
                 }
             } else {
                 self.warn("reference not found");
@@ -551,50 +581,67 @@ pub const Renderer = struct {
     }
 };
 
-/// Render `ast` (rooted at `ast.root`, normally a `doc` node) to HTML,
+/// Render `doc` (rooted at `doc.ast.root`, normally a `doc` node) to HTML,
 /// writing to `writer`.
-pub fn render(allocator: Allocator, ast: *const AST, writer: *Writer, options: RenderOptions) RenderError!void {
-    var r = Renderer.init(allocator, ast, writer, options);
+pub fn render(allocator: Allocator, doc: *const Document, writer: *Writer, options: RenderOptions) RenderError!void {
+    var r = Renderer.init(allocator, doc, writer, options);
     defer r.deinit();
-    try r.renderNode(ast.root);
+    try r.renderNode(doc.ast.root);
 }
 
 /// Convenience wrapper: render to an owned string.
-pub fn renderAlloc(allocator: Allocator, ast: *const AST, options: RenderOptions) Allocator.Error![]u8 {
+pub fn renderAlloc(allocator: Allocator, doc: *const Document, options: RenderOptions) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(allocator);
     defer out.deinit();
     // `Writer.Allocating` only ever fails (`error.WriteFailed`) when its own
     // backing allocation fails, so both halves of `RenderError` collapse to
     // `error.OutOfMemory` here.
-    render(allocator, ast, &out.writer, options) catch |err| switch (err) {
+    render(allocator, doc, &out.writer, options) catch |err| switch (err) {
         error.WriteFailed, error.OutOfMemory => return error.OutOfMemory,
     };
     return out.toOwnedSlice();
 }
 
 const testing = std.testing;
-const djot = @import("djot.zig");
 
 test "renders a simple paragraph with emphasis" {
-    var ast = try djot.parse(testing.allocator, "hello *world*\n");
-    defer ast.deinit();
-    const html = try renderAlloc(testing.allocator, &ast, .{});
+    var doc = try djot.parse(testing.allocator, "hello *world*\n");
+    defer doc.deinit();
+    const html = try renderAlloc(testing.allocator, &doc, .{});
     defer testing.allocator.free(html);
     try testing.expectEqualStrings("<p>hello <strong>world</strong></p>\n", html);
 }
 
 test "heading renders with level and section wrapper" {
-    var ast = try djot.parse(testing.allocator, "# Hi\n");
-    defer ast.deinit();
-    const html = try renderAlloc(testing.allocator, &ast, .{});
+    var doc = try djot.parse(testing.allocator, "# Hi\n");
+    defer doc.deinit();
+    const html = try renderAlloc(testing.allocator, &doc, .{});
     defer testing.allocator.free(html);
     try testing.expectEqualStrings("<section id=\"Hi\">\n<h1>Hi</h1>\n</section>\n", html);
 }
 
 test "tight list renders without <p> wrappers" {
-    var ast = try djot.parse(testing.allocator, "- a\n- b\n");
-    defer ast.deinit();
-    const html = try renderAlloc(testing.allocator, &ast, .{});
+    var doc = try djot.parse(testing.allocator, "- a\n- b\n");
+    defer doc.deinit();
+    const html = try renderAlloc(testing.allocator, &doc, .{});
     defer testing.allocator.free(html);
     try testing.expectEqualStrings("<ul>\n<li>\na\n</li>\n<li>\nb\n</li>\n</ul>\n", html);
+}
+
+test "a bare (null-value) attribute renders as just its key" {
+    // Djot can't produce a bare attribute, so build the tree by hand (the
+    // way an XML/HTML parser would) and wrap it in a side-table-less
+    // `Document` to reach the shared attr-rendering path.
+    var b = AST.Builder.init(testing.allocator);
+    defer b.deinit();
+    const text = try b.addLeaf(.{ .str = "x" });
+    const para = try b.addContainer(.para, &.{text});
+    try b.setAttrs(para, .{ .entries = &.{ .{ .key = "disabled", .value = null }, .{ .key = "id", .value = "y" } } });
+
+    var doc: Document = .{ .ast = try b.finish(para) };
+    defer doc.deinit();
+
+    const html = try renderAlloc(testing.allocator, &doc, .{});
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings("<p disabled id=\"y\">x</p>\n", html);
 }

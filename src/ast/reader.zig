@@ -1,7 +1,10 @@
 //! Navigation helpers — the read-path surface of `AST` (the mirror of the
 //! write path in `builder.zig`). Every public function here is re-exported as
-//! an `AST` method from `ast.zig`. Mirrors fig's `src/ast/reader.zig`, minus
-//! the YAML-specific alias/merge-key resolution (not applicable to Djot).
+//! an `AST` method from `ast.zig`, and — like `AST` itself — is language-
+//! neutral: anything that encodes one language's node taxonomy (e.g. djot's
+//! block/inline dichotomy, `Djot.isBlock`/`isInline`) belongs in that
+//! language's module instead. Mirrors fig's `src/ast/reader.zig`, minus the
+//! YAML-specific alias/merge-key resolution (no analogue here).
 
 const std = @import("std");
 const AST = @import("ast.zig");
@@ -34,30 +37,6 @@ pub fn attrsOf(self: *const AST, id: Node.Id) AST.Attrs {
     return self.attrs[idx];
 }
 
-const block_tags = std.EnumSet(std.meta.Tag(AST.Node.Kind)).initMany(&.{
-    .para,       .heading,         .thematic_break, .section,     .div,
-    .code_block, .raw_block,       .block_quote,    .bullet_list, .ordered_list,
-    .task_list,  .definition_list, .table,          .reference,   .footnote,
-});
-
-const inline_tags = std.EnumSet(std.meta.Tag(AST.Node.Kind)).initMany(&.{
-    .str,       .soft_break,         .hard_break,         .non_breaking_space, .symb,
-    .verbatim,  .raw_inline,         .inline_math,        .display_math,       .url,
-    .email,     .footnote_reference, .smart_punctuation,  .emph,               .strong,
-    .link,      .image,              .span,               .mark,               .superscript,
-    .subscript, .insert,             .delete,             .double_quoted,      .single_quoted,
-});
-
-/// Mirrors djot.js `ast.ts`'s `isBlock`.
-pub fn isBlock(kind: AST.Node.Kind) bool {
-    return block_tags.contains(std.meta.activeTag(kind));
-}
-
-/// Mirrors djot.js `ast.ts`'s `isInline`.
-pub fn isInline(kind: AST.Node.Kind) bool {
-    return inline_tags.contains(std.meta.activeTag(kind));
-}
-
 test "children walks first_child/next_sibling in order" {
     const testing = std.testing;
     var b = AST.Builder.init(testing.allocator);
@@ -76,11 +55,4 @@ test "children walks first_child/next_sibling in order" {
     const second = it.next() orelse return error.TestExpectedNonNull;
     try testing.expectEqualStrings("b", second.kind.str);
     try testing.expectEqual(@as(?*const AST.Node, null), it.next());
-}
-
-test "isBlock/isInline classify kinds" {
-    try std.testing.expect(isBlock(.{ .heading = .{ .level = 1 } }));
-    try std.testing.expect(!isInline(.{ .heading = .{ .level = 1 } }));
-    try std.testing.expect(isInline(.{ .str = "x" }));
-    try std.testing.expect(!isBlock(.{ .str = "x" }));
 }

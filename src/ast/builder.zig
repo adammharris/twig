@@ -84,6 +84,13 @@ pub fn setSpan(self: *Builder, id: Node.Id, span: Span) void {
     self.nodes.items[id].span = span;
 }
 
+/// Set the interior (between-the-delimiters) span of a container node — see
+/// `Node.content_span`'s doc comment for the contract. Left `null` when
+/// never called, which is always a correct (if less informative) value.
+pub fn setContentSpan(self: *Builder, id: Node.Id, span: Span) void {
+    self.nodes.items[id].content_span = span;
+}
+
 /// Attach `attrs` to `id` (copying its strings into owned storage),
 /// replacing any attributes previously set. Passing an empty `Attrs` clears
 /// the attachment (`node.attrs` goes back to `null`) without growing the
@@ -96,7 +103,11 @@ pub fn setAttrs(self: *Builder, id: Node.Id, attrs: AST.Attrs) Allocator.Error!v
     const entries = try self.allocator.alloc(AST.KeyVal, attrs.entries.len);
     errdefer self.allocator.free(entries);
     for (attrs.entries, entries) |src, *dst| {
-        dst.* = .{ .key = try self.dupe(src.key), .value = try self.dupe(src.value) };
+        dst.* = .{
+            .key = try self.dupe(src.key),
+            // `null` (a bare attribute, e.g. HTML `disabled`) stays null.
+            .value = if (src.value) |v| try self.dupe(v) else null,
+        };
     }
 
     const idx: u32 = @intCast(self.attrs.items.len);
@@ -167,6 +178,14 @@ fn dupeKind(self: *Builder, kind: Node.Kind) Allocator.Error!Node.Kind {
             .destination = if (v.destination) |d| try self.dupe(d) else null,
             .reference = if (v.reference) |r| try self.dupe(r) else null,
         } },
+        .element => |v| .{ .element = .{ .name = try self.dupe(v.name) } },
+        .comment => |v| .{ .comment = try self.dupe(v) },
+        .doctype => |v| .{ .doctype = try self.dupe(v) },
+        .processing_instruction => |v| .{ .processing_instruction = .{
+            .target = try self.dupe(v.target),
+            .data = try self.dupe(v.data),
+        } },
+        .cdata => |v| .{ .cdata = try self.dupe(v) },
         else => kind,
     };
 }
@@ -206,4 +225,78 @@ test "setAttrs copies attribute strings into owned storage" {
     const attrs = ast.attrsOf(id);
     try testing.expectEqualStrings("warn", attrs.get("class").?);
     try testing.expectEqualStrings("y", attrs.get("id").?);
+}
+
+test "setAttrs keeps a bare (null-value) attribute bare" {
+    const testing = std.testing;
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+
+    const id = try b.addLeaf(.{ .element = .{ .name = "input" } });
+    try b.setAttrs(id, .{ .entries = &.{ .{ .key = "disabled", .value = null }, .{ .key = "type", .value = "checkbox" } } });
+
+    var ast = try b.finish(id);
+    defer ast.deinit();
+
+    const attrs = ast.attrsOf(id);
+    try testing.expectEqual(@as(?[]const u8, null), attrs.find("disabled").?.value);
+    try testing.expectEqualStrings("checkbox", attrs.get("type").?);
+}
+
+test "dupeKind copies generic-markup string payloads into owned storage" {
+    const testing = std.testing;
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+
+    // Mutable source buffers: mutating them after `addLeaf` proves the
+    // builder copied rather than aliased (same trick as the setAttrs test).
+    var name_buf = "svg:rect".*;
+    var comment_buf = " todo ".*;
+    var doctype_buf = "html".*;
+    var target_buf = "xml".*;
+    var data_buf = "version=\"1.0\"".*;
+    var cdata_buf = "a < b".*;
+
+    const el = try b.addLeaf(.{ .element = .{ .name = name_buf[0..] } });
+    const cm = try b.addLeaf(.{ .comment = comment_buf[0..] });
+    const dt = try b.addLeaf(.{ .doctype = doctype_buf[0..] });
+    const pi = try b.addLeaf(.{ .processing_instruction = .{ .target = target_buf[0..], .data = data_buf[0..] } });
+    const cd = try b.addLeaf(.{ .cdata = cdata_buf[0..] });
+    const root = try b.addContainer(.doc, &.{ el, cm, dt, pi, cd });
+
+    name_buf[0] = 'X';
+    comment_buf[0] = 'X';
+    doctype_buf[0] = 'X';
+    target_buf[0] = 'X';
+    data_buf[0] = 'X';
+    cdata_buf[0] = 'X';
+
+    var ast = try b.finish(root);
+    defer ast.deinit();
+
+    try testing.expectEqualStrings("svg:rect", ast.nodes[el].kind.element.name);
+    try testing.expectEqualStrings(" todo ", ast.nodes[cm].kind.comment);
+    try testing.expectEqualStrings("html", ast.nodes[dt].kind.doctype);
+    try testing.expectEqualStrings("xml", ast.nodes[pi].kind.processing_instruction.target);
+    try testing.expectEqualStrings("version=\"1.0\"", ast.nodes[pi].kind.processing_instruction.data);
+    try testing.expectEqualStrings("a < b", ast.nodes[cd].kind.cdata);
+    // Not aliasing the (now-mutated) inputs also means distinct pointers.
+    try testing.expect(ast.nodes[el].kind.element.name.ptr != &name_buf);
+}
+
+test "content_span defaults to null and is set via setContentSpan" {
+    const testing = std.testing;
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+
+    const text = try b.addLeaf(.{ .str = "abc" });
+    const el = try b.addContainer(.{ .element = .{ .name = "div" } }, &.{text});
+    b.setSpan(el, Span.init(0, 24));
+    b.setContentSpan(el, Span.init(13, 16));
+
+    var ast = try b.finish(el);
+    defer ast.deinit();
+
+    try testing.expectEqual(@as(?Span, null), ast.nodes[text].content_span);
+    try testing.expect(ast.nodes[el].content_span.?.eql(Span.init(13, 16)));
 }

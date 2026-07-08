@@ -193,7 +193,7 @@ pub fn run(allocator: Allocator, max_failures: usize, failures: *std.ArrayList(F
                 summary.skipped += 1;
                 continue;
             }
-            var ast = djot.parse(allocator, c.input) catch {
+            var doc = djot.parse(allocator, c.input) catch {
                 summary.failed += 1;
                 if (failures.items.len < max_failures) {
                     try failures.append(allocator, .{
@@ -206,8 +206,8 @@ pub fn run(allocator: Allocator, max_failures: usize, failures: *std.ArrayList(F
                 }
                 continue;
             };
-            defer ast.deinit();
-            const rendered = try html.renderAlloc(allocator, &ast, .{});
+            defer doc.deinit();
+            const rendered = try html.renderAlloc(allocator, &doc, .{});
             if (std.mem.eql(u8, rendered, c.expected)) {
                 summary.passed += 1;
                 allocator.free(rendered);
