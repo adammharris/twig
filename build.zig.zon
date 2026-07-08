@@ -1,7 +1,7 @@
 .{
-    .name = .flower,
+    .name = .twig,
     .version = "0.0.0",
-    .fingerprint = 0xa7d7c1da817edddd,
+    .fingerprint = 0xf34eb2175f91fb64,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{

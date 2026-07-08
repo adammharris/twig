@@ -3,18 +3,18 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const mod = b.addModule("flower", .{
+    const mod = b.addModule("twig", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
     const exe = b.addExecutable(.{
-        .name = "flower",
+        .name = "twig",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "flower", .module = mod },
+                .{ .name = "twig", .module = mod },
             },
         }),
     });

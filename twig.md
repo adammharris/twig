@@ -8,7 +8,7 @@ created = 2026-07-07T17:27:37-06:00
 
 A sister project to [`fig`](https://github.com/adammharris/fig).
 While `fig` parses configuration files like JSON, YAML, and TOML,
-Flower parses **document** files, like HTML, Markdown, and Djot.
+Twig parses **document** files, like HTML, Markdown, and Djot.
 
 In this way, Twig is comparable to [Pandoc](https://pandoc.org),
 but Twig has different design goals:
@@ -26,4 +26,8 @@ but Twig has different design goals:
 
 # Status
 
-No code yet.
+Djot is the first supported format: a full parser (block + inline scanning,
+event-stream-to-AST construction) and an HTML renderer, validated against
+djot.js's own conformance suite (265/271 cases passing; the remaining 6 rely
+on an AST pretty-printer this project doesn't implement yet). See
+`src/languages/djot/`.
