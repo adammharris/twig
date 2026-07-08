@@ -24,3 +24,6 @@ but Flower has different design goals:
 - Flower intends to primarily support "round-trippable" formats,
   which excludes not-editable documents such as PDF.
 
+# Status
+
+No code yet.
