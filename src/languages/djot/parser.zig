@@ -410,6 +410,25 @@ pub const TreeBuilder = struct {
         self.topContainer().addChild(self.nodes.items, id);
     }
 
+    /// For a container node whose children are already linked via
+    /// `first_child`/`next_sibling`: its `content_span` is the byte range
+    /// from the first child's span start to the last child's span end --
+    /// the same "interior = extent of the child content" convention the
+    /// XML parser uses for tag interiors (see `ast/ast.zig`'s
+    /// `content_span` doc comment and `xml/parser.zig`'s `parseElement`).
+    /// `null` for an empty container (`first_child == null`): djot has no
+    /// equivalent of XML's explicit open/close tag positions to derive a
+    /// zero-width interior from, and reconstructing one would need
+    /// delimiter-length bookkeeping this parser doesn't otherwise track --
+    /// `null` (unknown/not meaningful) is the honest answer per the
+    /// field's contract, not a guessed offset.
+    fn contentSpanFromChildren(self: *const TreeBuilder, first_child: ?Node.Id) ?Span {
+        const first = first_child orelse return null;
+        var last = first;
+        while (self.nodes.items[last].next_sibling) |next| last = next;
+        return Span.init(self.nodes.items[first].span.start, self.nodes.items[last].span.end);
+    }
+
     fn textOf(self: *const TreeBuilder, ev: Event) []const u8 {
         return self.source[ev.start .. ev.end + 1];
     }
@@ -431,6 +450,7 @@ pub const TreeBuilder = struct {
             var c = closed;
             const sec_id = try self.addNode(.section, Span.init(c.start, self.source.len));
             self.nodes.items[sec_id].first_child = c.first_child;
+            self.nodes.items[sec_id].content_span = self.contentSpanFromChildren(c.first_child);
             try self.commitAttrs(sec_id, &c.attrs);
             self.addChildToTip(sec_id);
             c.deinit(self.allocator);
@@ -441,6 +461,7 @@ pub const TreeBuilder = struct {
         defer root.deinit(self.allocator);
         const doc_id = try self.addNode(.doc, Span.init(0, self.source.len));
         self.nodes.items[doc_id].first_child = root.first_child;
+        self.nodes.items[doc_id].content_span = self.contentSpanFromChildren(root.first_child);
         try self.commitAttrs(doc_id, &root.attrs);
 
         self.deinitScratch();
@@ -632,6 +653,7 @@ pub const TreeBuilder = struct {
                 const kind: Node.Kind = if (c.data.is_image) .{ .image = .{ .destination = dest, .reference = null } } else .{ .link = .{ .destination = dest, .reference = null } };
                 const id = try self.addNode(kind, Span.init(c.start, ev.end + 1));
                 self.nodes.items[id].first_child = c.first_child;
+                self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
                 try self.commitAttrs(id, &c.attrs);
                 self.addChildToTip(id);
                 self.context = .normal;
@@ -653,6 +675,7 @@ pub const TreeBuilder = struct {
                 const kind: Node.Kind = if (c.data.is_image) .{ .image = .{ .destination = null, .reference = lab } } else .{ .link = .{ .destination = null, .reference = lab } };
                 const id = try self.addNode(kind, Span.init(c.start, ev.end + 1));
                 self.nodes.items[id].first_child = c.first_child;
+                self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
                 try self.commitAttrs(id, &c.attrs);
                 self.addChildToTip(id);
                 self.context = .normal;
@@ -720,6 +743,7 @@ pub const TreeBuilder = struct {
                 defer c.deinit(self.allocator);
                 const id = try self.addNode(.para, Span.init(c.start, ev.end + 1));
                 self.nodes.items[id].first_child = c.first_child;
+                self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
                 try self.commitAttrs(id, &c.attrs);
                 self.addChildToTip(id);
             },
@@ -760,6 +784,7 @@ pub const TreeBuilder = struct {
                 defer c.deinit(self.allocator);
                 const id = try self.addNode(.block_quote, Span.init(c.start, ev.end + 1));
                 self.nodes.items[id].first_child = c.first_child;
+                self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
                 try self.commitAttrs(id, &c.attrs);
                 self.addChildToTip(id);
             },
@@ -778,6 +803,7 @@ pub const TreeBuilder = struct {
                 defer c.deinit(self.allocator);
                 const id = try self.addNode(.{ .cell = .{ .head = false, .alignment = .default } }, Span.init(c.start, ev.end + 1));
                 self.nodes.items[id].first_child = c.first_child;
+                self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
                 try self.commitAttrs(id, &c.attrs);
                 self.addChildToTip(id);
             },
@@ -802,6 +828,7 @@ pub const TreeBuilder = struct {
                 defer c.deinit(self.allocator);
                 const id = try self.addNode(.div, Span.init(c.start, ev.end + 1));
                 self.nodes.items[id].first_child = c.first_child;
+                self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
                 try self.commitAttrs(id, &c.attrs);
                 self.addChildToTip(id);
             },
@@ -878,6 +905,7 @@ pub const TreeBuilder = struct {
         };
         const id = try self.addNode(kind, Span.init(c.start, ev.end + 1));
         self.nodes.items[id].first_child = c.first_child;
+        self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
         self.addChildToTip(id);
     }
 
@@ -1029,6 +1057,7 @@ pub const TreeBuilder = struct {
                 var closed = self.popContainer();
                 const sec_id = try self.addNode(.section, Span.init(closed.start, ev.end + 1));
                 self.nodes.items[sec_id].first_child = closed.first_child;
+                self.nodes.items[sec_id].content_span = self.contentSpanFromChildren(closed.first_child);
                 try self.commitAttrs(sec_id, &closed.attrs);
                 self.addChildToTip(sec_id);
                 closed.deinit(self.allocator);
@@ -1047,6 +1076,7 @@ pub const TreeBuilder = struct {
 
         const id = try self.addNode(.{ .heading = .{ .level = level } }, Span.init(c.start, ev.end + 1));
         self.nodes.items[id].first_child = c.first_child;
+        self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
         try self.commitAttrs(id, &c.attrs);
         self.addChildToTip(id);
         c.deinit(self.allocator);
@@ -1071,6 +1101,7 @@ pub const TreeBuilder = struct {
         };
         const id = try self.addNode(kind, s);
         self.nodes.items[id].first_child = c.first_child;
+        self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
         try self.commitAttrs(id, &c.attrs);
         self.addChildToTip(id);
     }
@@ -1090,21 +1121,26 @@ pub const TreeBuilder = struct {
             }
             const term_id = try self.addNode(.term, s);
             self.nodes.items[term_id].first_child = term_children;
+            self.nodes.items[term_id].content_span = self.contentSpanFromChildren(term_children);
             const def_id = try self.addNode(.definition, s);
             self.nodes.items[def_id].first_child = def_first;
+            self.nodes.items[def_id].content_span = self.contentSpanFromChildren(def_first);
             self.nodes.items[term_id].next_sibling = def_id;
             const item_id = try self.addNode(.definition_list_item, s);
             self.nodes.items[item_id].first_child = term_id;
+            self.nodes.items[item_id].content_span = self.contentSpanFromChildren(term_id);
             try self.commitAttrs(item_id, &c.attrs);
             self.addChildToTip(item_id);
         } else if (c.data.checkbox) |checked| {
             const id = try self.addNode(.{ .task_list_item = .{ .checked = checked } }, s);
             self.nodes.items[id].first_child = c.first_child;
+            self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
             try self.commitAttrs(id, &c.attrs);
             self.addChildToTip(id);
         } else {
             const id = try self.addNode(.list_item, s);
             self.nodes.items[id].first_child = c.first_child;
+            self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
             try self.commitAttrs(id, &c.attrs);
             self.addChildToTip(id);
         }
@@ -1125,6 +1161,7 @@ pub const TreeBuilder = struct {
         self.nodes.items[caption_id].next_sibling = first_row;
         const id = try self.addNode(.table, s);
         self.nodes.items[id].first_child = caption_id;
+        self.nodes.items[id].content_span = self.contentSpanFromChildren(caption_id);
         try self.commitAttrs(id, &c.attrs);
         self.addChildToTip(id);
     }
@@ -1163,6 +1200,7 @@ pub const TreeBuilder = struct {
         }
         const id = try self.addNode(.{ .row = .{ .head = false } }, Span.init(c.start, ev.end + 1));
         self.nodes.items[id].first_child = c.first_child;
+        self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
         try self.commitAttrs(id, &c.attrs);
         self.addChildToTip(id);
     }
@@ -1174,11 +1212,17 @@ pub const TreeBuilder = struct {
         if (self.nodes.items[tip_id].kind != .table) return;
         const capt_id = try self.addNode(.caption, Span.init(c.start, ev.end + 1));
         self.nodes.items[capt_id].first_child = c.first_child;
+        self.nodes.items[capt_id].content_span = self.contentSpanFromChildren(c.first_child);
         try self.commitAttrs(capt_id, &c.attrs);
         if (self.nodes.items[tip_id].first_child) |old_capt| {
             if (self.nodes.items[old_capt].kind == .caption) {
                 self.nodes.items[capt_id].next_sibling = self.nodes.items[old_capt].next_sibling;
                 self.nodes.items[tip_id].first_child = capt_id;
+                // The table's own content_span was derived from its OLD
+                // first child (the placeholder/earlier caption); re-derive
+                // now that the caption swap changed where its interior
+                // starts.
+                self.nodes.items[tip_id].content_span = self.contentSpanFromChildren(capt_id);
             }
         }
     }
@@ -1191,6 +1235,7 @@ pub const TreeBuilder = struct {
         defer self.allocator.free(lab);
         const id = try self.addNode(.{ .footnote = .{ .label = lab } }, Span.init(c.start, ev.end + 1));
         self.nodes.items[id].first_child = c.first_child;
+        self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
         try self.commitAttrs(id, &c.attrs);
         const owned_lab = try self.own(lab);
         if (!self.footnotes.contains(owned_lab)) try self.footnotes.put(self.allocator, owned_lab, id);
@@ -1331,4 +1376,79 @@ fn isIdentifierExcluded(c: u8) bool {
         ']', '[', '~', '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '{', '}', '`', ',', '.', '<', '>', '\\', '|', '=', '+', '/', '?' => true,
         else => false,
     };
+}
+
+// ── content_span tests ──────────────────────────────────────────────────
+// `TreeBuilder.contentSpanFromChildren` is the one place `content_span`
+// gets populated; these exercise it end-to-end (source -> events -> tree)
+// rather than unit-testing the helper in isolation, since what matters is
+// that each container-close site wires it up correctly. Mirrors
+// `djot.zig`'s own `pub fn parse`, just without going through that file
+// (which imports this one) to avoid a needless round trip.
+
+const testing = std.testing;
+const block = @import("block.zig");
+
+fn parseDoc(allocator: Allocator, source: []const u8) Allocator.Error!Document {
+    var block_parser = try block.Parser.init(allocator, source);
+    defer block_parser.deinit();
+    const events = try block_parser.scan();
+    defer allocator.free(events);
+
+    var tree_builder = TreeBuilder.init(allocator, block_parser.subject);
+    return tree_builder.build(events);
+}
+
+test "content_span: div's interior covers its child paragraph" {
+    const src = ":::\nabc\n:::\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const div_id = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[div_id].kind == .div);
+    const cs = ast.nodes[div_id].content_span orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("abc", std.mem.trim(u8, src[cs.start..cs.end], " \t\r\n"));
+
+    // The interior is exactly the extent of the div's one child (the
+    // paragraph), matching the XML parser's tag-interior convention.
+    const para_id = ast.nodes[div_id].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(cs.eql(ast.nodes[para_id].span));
+}
+
+test "content_span: inline emphasis covers its text" {
+    const src = "_abc_\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const para_id = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    const emph_id = ast.nodes[para_id].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[emph_id].kind == .emph);
+    const cs = ast.nodes[emph_id].content_span orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("abc", src[cs.start..cs.end]);
+}
+
+test "content_span: a leaf str node stays null" {
+    const src = "hello\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const para_id = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    const str_id = ast.nodes[para_id].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[str_id].kind == .str);
+    try testing.expectEqual(@as(?Span, null), ast.nodes[str_id].content_span);
+}
+
+test "content_span: an empty div (no children) stays null" {
+    const src = ":::\n:::\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const div_id = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[div_id].kind == .div);
+    try testing.expectEqual(@as(?Node.Id, null), ast.nodes[div_id].first_child);
+    try testing.expectEqual(@as(?Span, null), ast.nodes[div_id].content_span);
 }
