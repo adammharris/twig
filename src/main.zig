@@ -1,7 +1,27 @@
+//! Twig's CLI entry point: `twig <command> [options] <file>`, modeled on
+//! sister project fig's `cli/main.zig` at Twig's smaller scale. Deliberately
+//! thin — process/IO setup, turning argv into a `CliConfig`
+//! (`cli/args.zig`), and a dispatch switch straight into `cli/actions.zig`.
+//! Everything else (format inference/registry, argument parsing, the verb
+//! implementations, the AST JSON encoder) lives in its own sibling module
+//! under `cli/` — see each file's own doc comment.
+//!
+//! Unlike fig's `cli/main.zig`, there is no `std.log`/terminal-color/`NO_COLOR`
+//! machinery here: Twig's CLI is plain `stdout`/`stderr` writers throughout
+//! (per the mission's "keep Twig's CLI modest and clean"), and diagnostics
+//! are printed directly by whichever `cli/` module detects the problem
+//! (`args.zig` for bad flags/undetectable formats, `actions.zig` for
+//! read/parse/render/serialize failures — see their module doc comments for
+//! the shared "print then return a sentinel error" convention that keeps
+//! this file's dispatch switch simple).
+
 const std = @import("std");
 const Io = std.Io;
 
-const twig = @import("twig");
+const cli_args = @import("cli/args.zig");
+const cli_format = @import("cli/format.zig");
+const cli_actions = @import("cli/actions.zig");
+const cli_ast_json = @import("cli/ast_json.zig");
 
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
@@ -15,23 +35,44 @@ pub fn main(init: std.process.Init) !void {
     var stderr_file_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
     const stderr_writer = &stderr_file_writer.interface;
 
-    const args = try init.minimal.args.toSlice(arena);
-    if (args.len < 2) {
-        try stderr_writer.print("usage: {s} <file.dj>\n\nParses a Djot file and prints its HTML rendering.\n", .{if (args.len > 0) args[0] else "twig"});
-        try stderr_writer.flush();
-        return;
-    }
+    const argv = try init.minimal.args.toSlice(arena);
+    var arg_iter = cli_args.ArgIterator{ .items = argv };
 
-    const path = args[1];
-    const source = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024)) catch |err| {
-        try stderr_writer.print("error: could not read '{s}': {t}\n", .{ path, err });
-        try stderr_writer.flush();
-        return err;
+    const config = cli_args.parseConfig(&arg_iter, stderr_writer) catch |err| {
+        // `args.zig` already printed a tailored diagnostic for every
+        // resolvable-format failure; the remaining variants (a flag missing
+        // its value, no file given, an extra positional) have nothing
+        // format-specific to say, so add a short usage reminder for those.
+        switch (err) {
+            cli_args.ArgError.MissingFile,
+            cli_args.ArgError.MissingFormatValue,
+            cli_args.ArgError.TooManyPositionals,
+            => cli_actions.runHelp(stderr_writer, "twig") catch {},
+            else => {},
+        }
+        stderr_writer.flush() catch {};
+        std.process.exit(2);
     };
 
-    var doc = try twig.Djot.parse(arena, source);
-    defer doc.deinit();
+    switch (config.action) {
+        .help => try cli_actions.runHelp(stdout_writer, config.binary_name),
+        .version => try cli_actions.runVersion(stdout_writer),
+        .identify => try cli_actions.runIdentify(stdout_writer, config.options.identify),
+        .convert => cli_actions.runConvert(arena, io, stdout_writer, stderr_writer, config.options.convert) catch |err| switch (err) {
+            // `actions.zig` already printed and flushed a clear message;
+            // just set the exit code.
+            error.ActionFailed => std.process.exit(1),
+        },
+    }
+}
 
-    try twig.Djot.html.render(arena, &doc, stdout_writer, .{});
-    try stdout_writer.flush();
+// Pull every CLI sibling module's tests into this binary's `exe_tests` (the
+// fig/djot/xml convention — see e.g. `djot.zig`'s trailing `test {}` block).
+// Without this, a `test {}`-only module reachable solely through `main.zig`
+// (never through `root.zig`'s module graph) would never actually run.
+test {
+    _ = cli_args;
+    _ = cli_format;
+    _ = cli_actions;
+    _ = cli_ast_json;
 }

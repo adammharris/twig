@@ -1,0 +1,397 @@
+//! `convert -o ast`'s implementation: a stable, inspectable JSON encoding of
+//! the shared `AST`, for debugging parsers and diffing tree shapes across
+//! runs. Every node becomes an object with a `"kind"` tag (the `Node.Kind`
+//! union's tag name, e.g. `"heading"`, `"str"`), a `"span"` byte range, that
+//! kind's own payload fields inlined (switching exhaustively over
+//! `AST.Node.Kind` — see `writeKindPayload`), and `"attrs"`/`"children"` when
+//! non-empty.
+//!
+//! Escaping correctness comes for free from `std.json.Stringify.write`,
+//! which is used for every leaf value (strings, ints, bools, `?T`, and even
+//! the payload enums like `BulletListStyle`/`Alignment`, which `write`
+//! renders as their tag name — no manual `@tagName` calls needed for those).
+//! Only the *shape* (which fields a kind gets, in what order) is decided by
+//! hand below, via `writeNode`'s explicit `beginObject`/`objectField`/
+//! `endObject` calls walking the `first_child`/`next_sibling` tree — `write`
+//! alone can't do that part since `AST` is a linked structure, not a
+//! `[]node`-shaped value `write`'s reflection could walk on its own.
+
+const std = @import("std");
+const Writer = std.Io.Writer;
+const Stringify = std.json.Stringify;
+
+const twig = @import("twig");
+const AST = twig.AST;
+const Node = AST.Node;
+
+/// Encode `ast` (rooted at `ast.root`) as pretty-printed (2-space indent)
+/// JSON, writing to `writer`. Emits a trailing newline so piping straight to
+/// a terminal or a file looks like any other well-behaved text tool's
+/// output.
+pub fn encode(ast: *const AST, writer: *Writer) Writer.Error!void {
+    var w: Stringify = .{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
+    try writeNode(&w, ast, ast.root);
+    try writer.writeByte('\n');
+}
+
+fn writeNode(w: *Stringify, ast: *const AST, id: Node.Id) Writer.Error!void {
+    const node = ast.nodes[id];
+
+    try w.beginObject();
+
+    try w.objectField("kind");
+    try w.write(@tagName(node.kind));
+
+    try w.objectField("span");
+    try w.beginArray();
+    try w.write(node.span.start);
+    try w.write(node.span.end);
+    try w.endArray();
+
+    if (node.content_span) |cs| {
+        try w.objectField("content_span");
+        try w.beginArray();
+        try w.write(cs.start);
+        try w.write(cs.end);
+        try w.endArray();
+    }
+
+    try writeKindPayload(w, node.kind);
+
+    const attrs = ast.attrsOf(id);
+    if (!attrs.isEmpty()) {
+        try w.objectField("attrs");
+        try w.beginArray();
+        for (attrs.entries) |kv| {
+            try w.beginObject();
+            try w.objectField("key");
+            try w.write(kv.key);
+            try w.objectField("value");
+            try w.write(kv.value);
+            try w.endObject();
+        }
+        try w.endArray();
+    }
+
+    if (node.first_child != null) {
+        try w.objectField("children");
+        try w.beginArray();
+        var it = ast.children(id);
+        while (it.next()) |child| try writeNode(w, ast, child.id);
+        try w.endArray();
+    }
+
+    try w.endObject();
+}
+
+/// Write the fields specific to `kind`'s payload — the part of each node
+/// that isn't `kind`/`span`/`content_span`/`attrs`/`children`. Switches
+/// exhaustively over `AST.Node.Kind` (see `ast.zig`'s doc comment for the
+/// full vocabulary) so adding a new `Kind` variant fails this file's build
+/// until it's given a field mapping here.
+fn writeKindPayload(w: *Stringify, kind: Node.Kind) Writer.Error!void {
+    switch (kind) {
+        // Payload-free kinds: nothing beyond kind/span/attrs/children.
+        .doc,
+        .para,
+        .thematic_break,
+        .section,
+        .div,
+        .block_quote,
+        .definition_list,
+        .table,
+        .list_item,
+        .definition_list_item,
+        .term,
+        .definition,
+        .caption,
+        .soft_break,
+        .hard_break,
+        .non_breaking_space,
+        .emph,
+        .strong,
+        .span,
+        .mark,
+        .superscript,
+        .subscript,
+        .insert,
+        .delete,
+        .double_quoted,
+        .single_quoted,
+        => {},
+
+        .heading => |h| {
+            try w.objectField("level");
+            try w.write(h.level);
+        },
+        .code_block => |c| {
+            try w.objectField("lang");
+            try w.write(c.lang);
+            try w.objectField("text");
+            try w.write(c.text);
+        },
+        .raw_block => |r| {
+            try w.objectField("format");
+            try w.write(r.format);
+            try w.objectField("text");
+            try w.write(r.text);
+        },
+        .bullet_list => |b| {
+            try w.objectField("style");
+            try w.write(b.style);
+            try w.objectField("tight");
+            try w.write(b.tight);
+        },
+        .ordered_list => |o| {
+            try w.objectField("numbering");
+            try w.write(o.style.numbering);
+            try w.objectField("delim");
+            try w.write(o.style.delim);
+            try w.objectField("tight");
+            try w.write(o.tight);
+            try w.objectField("start");
+            try w.write(o.start);
+        },
+        .task_list => |t| {
+            try w.objectField("tight");
+            try w.write(t.tight);
+        },
+        .task_list_item => |t| {
+            try w.objectField("checked");
+            try w.write(t.checked);
+        },
+        .row => |r| {
+            try w.objectField("head");
+            try w.write(r.head);
+        },
+        .cell => |c| {
+            try w.objectField("head");
+            try w.write(c.head);
+            try w.objectField("alignment");
+            try w.write(c.alignment);
+        },
+        .footnote => |f| {
+            try w.objectField("label");
+            try w.write(f.label);
+        },
+        .reference => |r| {
+            try w.objectField("label");
+            try w.write(r.label);
+            try w.objectField("destination");
+            try w.write(r.destination);
+        },
+        .str => |s| {
+            try w.objectField("text");
+            try w.write(s);
+        },
+        .symb => |s| {
+            try w.objectField("text");
+            try w.write(s);
+        },
+        .verbatim => |s| {
+            try w.objectField("text");
+            try w.write(s);
+        },
+        .raw_inline => |r| {
+            try w.objectField("format");
+            try w.write(r.format);
+            try w.objectField("text");
+            try w.write(r.text);
+        },
+        .inline_math => |s| {
+            try w.objectField("text");
+            try w.write(s);
+        },
+        .display_math => |s| {
+            try w.objectField("text");
+            try w.write(s);
+        },
+        .url => |s| {
+            try w.objectField("text");
+            try w.write(s);
+        },
+        .email => |s| {
+            try w.objectField("text");
+            try w.write(s);
+        },
+        .footnote_reference => |s| {
+            try w.objectField("label");
+            try w.write(s);
+        },
+        .smart_punctuation => |sp| {
+            try w.objectField("punctuation_kind");
+            try w.write(sp.kind);
+            try w.objectField("text");
+            try w.write(sp.text);
+        },
+        .link => |l| {
+            try w.objectField("destination");
+            try w.write(l.destination);
+            try w.objectField("reference");
+            try w.write(l.reference);
+        },
+        .image => |l| {
+            try w.objectField("destination");
+            try w.write(l.destination);
+            try w.objectField("reference");
+            try w.write(l.reference);
+        },
+        .element => |e| {
+            try w.objectField("name");
+            try w.write(e.name);
+        },
+        .comment => |s| {
+            try w.objectField("text");
+            try w.write(s);
+        },
+        .doctype => |s| {
+            try w.objectField("text");
+            try w.write(s);
+        },
+        .processing_instruction => |p| {
+            try w.objectField("target");
+            try w.write(p.target);
+            try w.objectField("data");
+            try w.write(p.data);
+        },
+        .cdata => |s| {
+            try w.objectField("text");
+            try w.write(s);
+        },
+    }
+}
+
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+
+fn encodeAlloc(allocator: Allocator, ast: *const AST) ![]u8 {
+    var out: Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    encode(ast, &out.writer) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    return out.toOwnedSlice();
+}
+
+test "encode: leaf node gets kind/span, omits content_span/attrs/children when absent" {
+    var b = AST.Builder.init(testing.allocator);
+    defer b.deinit();
+    const leaf = try b.addLeaf(.{ .str = "hi" });
+    b.setSpan(leaf, .init(0, 2));
+
+    var ast = try b.finish(leaf);
+    defer ast.deinit();
+
+    const out = try encodeAlloc(testing.allocator, &ast);
+    defer testing.allocator.free(out);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try testing.expectEqualStrings("str", obj.get("kind").?.string);
+    try testing.expectEqualStrings("hi", obj.get("text").?.string);
+    const span = obj.get("span").?.array;
+    try testing.expectEqual(@as(usize, 2), span.items.len);
+    try testing.expectEqual(@as(i64, 0), span.items[0].integer);
+    try testing.expectEqual(@as(i64, 2), span.items[1].integer);
+    try testing.expectEqual(@as(?std.json.Value, null), obj.get("content_span"));
+    try testing.expectEqual(@as(?std.json.Value, null), obj.get("attrs"));
+    try testing.expectEqual(@as(?std.json.Value, null), obj.get("children"));
+}
+
+test "encode: container node nests children in source order" {
+    var b = AST.Builder.init(testing.allocator);
+    defer b.deinit();
+    const a = try b.addLeaf(.{ .str = "a" });
+    const em_text = try b.addLeaf(.{ .str = "b" });
+    const em = try b.addContainer(.emph, &.{em_text});
+    const para = try b.addContainer(.para, &.{ a, em });
+
+    var ast = try b.finish(para);
+    defer ast.deinit();
+
+    const out = try encodeAlloc(testing.allocator, &ast);
+    defer testing.allocator.free(out);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try testing.expectEqualStrings("para", obj.get("kind").?.string);
+    const children = obj.get("children").?.array;
+    try testing.expectEqual(@as(usize, 2), children.items.len);
+    try testing.expectEqualStrings("str", children.items[0].object.get("kind").?.string);
+    try testing.expectEqualStrings("a", children.items[0].object.get("text").?.string);
+    try testing.expectEqualStrings("emph", children.items[1].object.get("kind").?.string);
+    const em_children = children.items[1].object.get("children").?.array;
+    try testing.expectEqualStrings("b", em_children.items[0].object.get("text").?.string);
+}
+
+test "encode: attrs render as ordered key/value pairs, bare attrs get a null value" {
+    var b = AST.Builder.init(testing.allocator);
+    defer b.deinit();
+    const el = try b.addLeaf(.{ .element = .{ .name = "input" } });
+    try b.setAttrs(el, .{ .entries = &.{
+        .{ .key = "disabled", .value = null },
+        .{ .key = "type", .value = "checkbox" },
+    } });
+
+    var ast = try b.finish(el);
+    defer ast.deinit();
+
+    const out = try encodeAlloc(testing.allocator, &ast);
+    defer testing.allocator.free(out);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try testing.expectEqualStrings("element", obj.get("kind").?.string);
+    try testing.expectEqualStrings("input", obj.get("name").?.string);
+    const attrs = obj.get("attrs").?.array;
+    try testing.expectEqual(@as(usize, 2), attrs.items.len);
+    try testing.expectEqualStrings("disabled", attrs.items[0].object.get("key").?.string);
+    try testing.expectEqual(std.json.Value.null, attrs.items[0].object.get("value").?);
+    try testing.expectEqualStrings("type", attrs.items[1].object.get("key").?.string);
+    try testing.expectEqualStrings("checkbox", attrs.items[1].object.get("value").?.string);
+}
+
+test "encode: content_span is emitted only when set, and enum payloads render as tag-name strings" {
+    var b = AST.Builder.init(testing.allocator);
+    defer b.deinit();
+    const list = try b.addContainer(.{ .bullet_list = .{ .style = .dash, .tight = true } }, &.{});
+    b.setContentSpan(list, .init(1, 5));
+
+    var ast = try b.finish(list);
+    defer ast.deinit();
+
+    const out = try encodeAlloc(testing.allocator, &ast);
+    defer testing.allocator.free(out);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try testing.expectEqualStrings("bullet_list", obj.get("kind").?.string);
+    try testing.expectEqualStrings("dash", obj.get("style").?.string);
+    try testing.expectEqual(true, obj.get("tight").?.bool);
+    const cs = obj.get("content_span").?.array;
+    try testing.expectEqual(@as(i64, 1), cs.items[0].integer);
+    try testing.expectEqual(@as(i64, 5), cs.items[1].integer);
+}
+
+test "encode is pretty-printed with 2-space indentation" {
+    var b = AST.Builder.init(testing.allocator);
+    defer b.deinit();
+    const leaf = try b.addLeaf(.{ .str = "x" });
+    const root = try b.addContainer(.para, &.{leaf});
+
+    var ast = try b.finish(root);
+    defer ast.deinit();
+
+    const out = try encodeAlloc(testing.allocator, &ast);
+    defer testing.allocator.free(out);
+
+    try testing.expect(std.mem.indexOf(u8, out, "\n  \"kind\"") != null);
+}

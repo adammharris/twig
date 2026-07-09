@@ -1,590 +1,62 @@
-//! Document -> HTML renderer. Ported from djot.js's `src/html.ts`. Used
-//! both as a genuinely useful output format and — via `conformance.zig` —
-//! as the parser's main correctness oracle: djot.js's own test suite is
+//! Document -> HTML renderer. Historically a ~600-line bespoke renderer
+//! (ported from djot.js's `src/html.ts`); now a THIN ADAPTER over the
+//! shared, language-neutral printer at `languages/html/serializer.zig`
+//! (`Html`), which was built and proven (see `languages/html/conformance.zig`)
+//! to reproduce this module's output byte-for-byte across the full djot.js
+//! conformance corpus.
+//!
+//! The split exists because reference/footnote resolution is deferred
+//! entirely to render time (see `Document`'s doc comment in `djot.zig`): a
+//! `link`/`image`'s `reference` label and a `footnote_reference`'s label are
+//! resolved against side tables that live on djot's `Document`, not on the
+//! shared `AST` itself — XML/HTML have nothing like them, so they can't live
+//! in `AST` without leaking djot-only baggage into a language-neutral type.
+//! `Html`'s printer stays entirely djot-agnostic by taking those side tables
+//! as an optional, generically-shaped `Html.Context` instead of importing
+//! djot; this module's whole job is building that `Context` from a
+//! `Document`'s public `references`/`auto_references`/`footnotes` fields and
+//! handing it, plus the render-time `warn` hook, to `Html.Renderer`.
+//!
+//! Used both as a genuinely useful output format and — via `conformance.zig`
+//! — as the parser's main correctness oracle: djot.js's own test suite is
 //! entirely input-djot -> expected-HTML pairs, so an accurate renderer is
 //! what makes that corpus usable here too.
-//!
-//! Renders a djot `Document`, not a bare `AST`: reference/footnote
-//! resolution is deferred entirely to render time (see `Document`'s doc
-//! comments in `djot.zig`), so the renderer needs the side tables alongside
-//! the tree.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
-const AST = @import("../../ast/ast.zig");
-const Node = AST.Node;
 const djot = @import("djot.zig");
 const Document = djot.Document;
+const Html = @import("../html/html.zig");
 
 pub const RenderOptions = struct {
     warn: ?*const fn (message: []const u8) void = null,
 };
 
-/// One `key="value"` pair to render ahead of a node's own attributes (used
-/// for e.g. `href`/`src`/`class="task-list"` that a tag contributes itself).
-/// A small fixed slice suffices here since every call site knows its own
-/// extra attributes statically — unlike djot.js's `Record<string,string>`,
-/// Zig has no convenient ordered literal dictionary, and none is needed.
-pub const KV = struct { key: []const u8, value: []const u8 };
+/// Same error set `Html`'s printer returns: write failures from `writer`
+/// merged with allocation failures (footnote index/id tracking, `alt`-text
+/// extraction all need to allocate).
+pub const RenderError = Html.RenderError;
 
-/// Most render functions can both write and allocate (footnote index/id
-/// tracking, `alt`-text extraction) so they share this combined error set.
-pub const RenderError = Writer.Error || Allocator.Error;
-
-pub const Renderer = struct {
-    allocator: Allocator,
-    doc: *const Document,
-    /// Always `&doc.ast` — kept as its own field because the tree is what
-    /// nearly every render function touches; `doc` itself is only consulted
-    /// for the reference/footnote side tables.
-    ast: *const AST,
-    writer: *Writer,
-    tight: bool = false,
-    footnote_index: std.StringHashMapUnmanaged(usize) = .empty,
-    next_footnote_index: usize = 1,
-    fnref_id_emitted: std.StringHashMapUnmanaged(void) = .empty,
-    options: RenderOptions = .{},
-
-    pub fn init(allocator: Allocator, doc: *const Document, writer: *Writer, options: RenderOptions) Renderer {
-        return .{ .allocator = allocator, .doc = doc, .ast = &doc.ast, .writer = writer, .options = options };
-    }
-
-    pub fn deinit(self: *Renderer) void {
-        self.footnote_index.deinit(self.allocator);
-        self.fnref_id_emitted.deinit(self.allocator);
-    }
-
-    fn warn(self: *Renderer, msg: []const u8) void {
-        if (self.options.warn) |f| f(msg);
-    }
-
-    // ── escaping ─────────────────────────────────────────────────────────
-
-    fn writeEscaped(self: *Renderer, s: []const u8) Writer.Error!void {
-        for (s) |c| {
-            switch (c) {
-                '&' => try self.writer.writeAll("&amp;"),
-                '<' => try self.writer.writeAll("&lt;"),
-                '>' => try self.writer.writeAll("&gt;"),
-                else => try self.writer.writeByte(c),
-            }
-        }
-    }
-
-    fn writeEscapedAttr(self: *Renderer, s: []const u8) Writer.Error!void {
-        for (s) |c| {
-            switch (c) {
-                '&' => try self.writer.writeAll("&amp;"),
-                '<' => try self.writer.writeAll("&lt;"),
-                '>' => try self.writer.writeAll("&gt;"),
-                '"' => try self.writer.writeAll("&quot;"),
-                else => try self.writer.writeByte(c),
-            }
-        }
-    }
-
-    fn smartPunct(kind: AST.SmartPunctuationKind) []const u8 {
-        return switch (kind) {
-            .right_single_quote => "\u{2019}",
-            .left_single_quote => "\u{2018}",
-            .right_double_quote => "\u{201D}",
-            .left_double_quote => "\u{201C}",
-            .ellipses => "\u{2026}",
-            .em_dash => "\u{2014}",
-            .en_dash => "\u{2013}",
-        };
-    }
-
-    // ── attribute / tag rendering ────────────────────────────────────────
-
-    /// Render `id`'s attributes (plus `extra`, written first) as
-    /// ` key="value"` pairs. `class` is special: if both `extra` and the
-    /// node supply one, they're space-joined (extra's value first) into a
-    /// single `class` attribute, matching djot.js's `renderAttributes`.
-    fn renderAttributes(self: *Renderer, id: Node.Id, extra: []const KV) Writer.Error!void {
-        const attrs = self.ast.attrsOf(id);
-        const node_class = attrs.get("class");
-        for (extra) |kv| {
-            if (std.mem.eql(u8, kv.key, "class")) {
-                try self.writer.writeAll(" class=\"");
-                try self.writeEscapedAttr(kv.value);
-                if (node_class) |nc| {
-                    try self.writer.writeByte(' ');
-                    try self.writeEscapedAttr(nc);
-                }
-                try self.writer.writeByte('"');
-            } else {
-                try self.writer.print(" {s}=\"", .{kv.key});
-                try self.writeEscapedAttr(kv.value);
-                try self.writer.writeByte('"');
-            }
-        }
-        const extra_has_class = hasKey(extra, "class");
-        for (attrs.entries) |kv| {
-            if (std.mem.eql(u8, kv.key, "class") and extra_has_class) continue;
-            if (kv.value) |value| {
-                try self.writer.print(" {s}=\"", .{kv.key});
-                try self.writeEscapedAttr(value);
-                try self.writer.writeByte('"');
-            } else {
-                // A bare attribute (HTML `disabled`) renders as just its
-                // key — distinct from `disabled=""`. Djot syntax can't
-                // produce one, but this shared path must stay correct for
-                // trees built by other languages/by hand.
-                try self.writer.print(" {s}", .{kv.key});
-            }
-        }
-    }
-
-    fn hasKey(kvs: []const KV, key: []const u8) bool {
-        for (kvs) |kv| if (std.mem.eql(u8, kv.key, key)) return true;
-        return false;
-    }
-
-    fn hasAttrsOrExtra(self: *const Renderer, id: Node.Id, extra: []const KV) bool {
-        return extra.len > 0 or !self.ast.attrsOf(id).isEmpty();
-    }
-
-    fn renderTag(self: *Renderer, tag: []const u8, id: Node.Id, extra: []const KV) Writer.Error!void {
-        try self.writer.print("<{s}", .{tag});
-        if (self.hasAttrsOrExtra(id, extra)) try self.renderAttributes(id, extra);
-        try self.writer.writeByte('>');
-    }
-
-    fn renderCloseTag(self: *Renderer, tag: []const u8) Writer.Error!void {
-        try self.writer.print("</{s}>", .{tag});
-    }
-
-    /// `newlines`: 2 = newline after the open tag AND after the close tag; 1
-    /// = only after the close tag; 0 = none.
-    fn inTags(self: *Renderer, tag: []const u8, id: Node.Id, newlines: u8, extra: []const KV) RenderError!void {
-        try self.renderTag(tag, id, extra);
-        if (newlines >= 2) try self.writer.writeByte('\n');
-        try self.renderChildren(id);
-        try self.renderCloseTag(tag);
-        if (newlines >= 1) try self.writer.writeByte('\n');
-    }
-
-    // ── children / tight-list tracking ──────────────────────────────────
-
-    fn renderChildren(self: *Renderer, id: Node.Id) RenderError!void {
-        const old_tight = self.tight;
-        switch (self.ast.nodes[id].kind) {
-            .bullet_list => |v| self.tight = v.tight,
-            .ordered_list => |v| self.tight = v.tight,
-            .task_list => |v| self.tight = v.tight,
-            else => {},
-        }
-        var it = self.ast.children(id);
-        while (it.next()) |child| try self.renderNode(child.id);
-        self.tight = old_tight;
-    }
-
-    // ── footnotes ────────────────────────────────────────────────────────
-
-    fn addBacklink(self: *Renderer, note: []const u8, ident: usize) Writer.Error!void {
-        // If `note` ends with `</p>` (optionally followed by trailing
-        // newlines), splice the backlink just before that closing tag;
-        // otherwise append a new `<p>` holding just the backlink.
-        const trimmed_end = std.mem.trimEnd(u8, note, "\r\n");
-        if (std.mem.endsWith(u8, trimmed_end, "</p>")) {
-            try self.writer.writeAll(trimmed_end[0 .. trimmed_end.len - 4]);
-            try self.writeBacklinkAnchor(ident);
-            try self.writer.writeAll("</p>");
-            try self.writer.writeAll(note[trimmed_end.len..]);
-        } else {
-            try self.writer.writeAll(note);
-            try self.writer.writeAll("<p>");
-            try self.writeBacklinkAnchor(ident);
-            try self.writer.writeAll("</p>\n");
-        }
-    }
-
-    fn writeBacklinkAnchor(self: *Renderer, ident: usize) Writer.Error!void {
-        try self.writer.print("<a href=\"#fnref{d}\" role=\"doc-backlink\">\u{21A9}\u{FE0E}</a>", .{ident});
-    }
-
-    fn renderNotes(self: *Renderer) RenderError!void {
-        // Render every footnote's children into a scratch buffer first
-        // (djot.js does this so out-of-order-defined notes still render in
-        // REFERENCE order, driven by `footnote_index`, not definition order).
-        var rendered = std.StringHashMapUnmanaged([]u8){};
-        defer {
-            var it = rendered.valueIterator();
-            while (it.next()) |v| self.allocator.free(v.*);
-            rendered.deinit(self.allocator);
-        }
-
-        // `Document.footnotes` is a hash map, so its iteration order is
-        // unspecified -- but djot.js's `notes` is a plain JS object, which
-        // (for string keys) iterates in INSERTION order, i.e. definition
-        // order. That matters here: a footnote can forward- or self-
-        // reference another footnote, and whichever occurrence renders
-        // FIRST claims that footnote's `id="fnrefN"` (see
-        // `fnref_id_emitted`). Node ids are assigned in creation order, and
-        // footnote nodes are created in definition order (`closeFootnote`
-        // fires as each definition closes), so sorting by node id recovers
-        // definition order without needing a separate ordered side-list.
-        const Entry = struct { key: []const u8, id: Node.Id };
-        var entries = std.ArrayList(Entry).empty;
-        defer entries.deinit(self.allocator);
-        var kit = self.doc.footnotes.iterator();
-        while (kit.next()) |entry| try entries.append(self.allocator, .{ .key = entry.key_ptr.*, .id = entry.value_ptr.* });
-        std.mem.sort(Entry, entries.items, {}, struct {
-            fn lessThan(_: void, a: Entry, b: Entry) bool {
-                return a.id < b.id;
-            }
-        }.lessThan);
-
-        for (entries.items) |entry| {
-            var buf: Writer.Allocating = .init(self.allocator);
-            defer buf.deinit();
-            // Render with `self` itself (not a fresh `Renderer`) so
-            // `footnote_index`/`next_footnote_index`/`fnref_id_emitted`
-            // stay shared across every footnote's content -- a footnote can
-            // itself reference another footnote (or itself), and that
-            // reference must get a consistent, monotonically-assigned index
-            // regardless of which footnote's content it's encountered in.
-            // Only the destination is swapped, temporarily, to capture this
-            // one footnote's rendered HTML separately.
-            const saved_writer = self.writer;
-            self.writer = &buf.writer;
-            try self.renderChildren(entry.id);
-            self.writer = saved_writer;
-            const owned = try buf.toOwnedSlice();
-            try rendered.put(self.allocator, entry.key, owned);
-        }
-
-        try self.writer.writeAll("<section role=\"doc-endnotes\">\n<hr>\n<ol>\n");
-        // Build an index -> label ordering table sized to next_footnote_index.
-        const n = self.next_footnote_index;
-        if (n > 1) {
-            const order = try self.allocator.alloc(?[]const u8, n);
-            defer self.allocator.free(order);
-            @memset(order, null);
-            var it = self.footnote_index.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.* < n) order[entry.value_ptr.*] = entry.key_ptr.*;
-            }
-            var i: usize = 1;
-            while (i < n) : (i += 1) {
-                try self.writer.print("<li id=\"fn{d}\">\n", .{i});
-                const note = if (order[i]) |lab| (rendered.get(lab) orelse "") else "";
-                try self.addBacklink(note, i);
-                try self.writer.writeAll("</li>\n");
-            }
-        }
-        try self.writer.writeAll("</ol>\n</section>\n");
-    }
-
-    // ── the big dispatch ─────────────────────────────────────────────────
-
-    pub fn renderNode(self: *Renderer, id: Node.Id) RenderError!void {
-        const node = &self.ast.nodes[id];
-        switch (node.kind) {
-            .doc => {
-                try self.renderChildren(id);
-                if (self.next_footnote_index > 1) try self.renderNotes();
-            },
-            .para => {
-                if (self.tight) {
-                    try self.renderChildren(id);
-                    try self.writer.writeByte('\n');
-                } else {
-                    try self.inTags("p", id, 1, &.{});
-                }
-            },
-            .block_quote => try self.inTags("blockquote", id, 2, &.{}),
-            .div => try self.inTags("div", id, 2, &.{}),
-            .section => try self.inTags("section", id, 2, &.{}),
-            .list_item => try self.inTags("li", id, 2, &.{}),
-            .task_list_item => |v| {
-                try self.writer.writeAll("<li>\n");
-                if (v.checked) {
-                    try self.writer.writeAll("<input disabled=\"\" type=\"checkbox\" checked=\"\"/>\n");
-                } else {
-                    try self.writer.writeAll("<input disabled=\"\" type=\"checkbox\"/>\n");
-                }
-                try self.renderChildren(id);
-                try self.renderCloseTag("li");
-                try self.writer.writeByte('\n');
-            },
-            .definition_list_item => try self.renderChildren(id),
-            .definition => try self.inTags("dd", id, 2, &.{}),
-            .term => try self.inTags("dt", id, 1, &.{}),
-            .definition_list => try self.inTags("dl", id, 2, &.{}),
-            .bullet_list => try self.inTags("ul", id, 2, &.{}),
-            .task_list => try self.inTags("ul", id, 2, &.{.{ .key = "class", .value = "task-list" }}),
-            .ordered_list => |v| {
-                var buf: [16]u8 = undefined;
-                var extra: [2]KV = undefined;
-                var n: usize = 0;
-                if (v.start) |s| {
-                    if (s != 1) {
-                        const text = std.fmt.bufPrint(&buf, "{d}", .{s}) catch "1";
-                        extra[n] = .{ .key = "start", .value = text };
-                        n += 1;
-                    }
-                }
-                if (v.style.numbering != .decimal) {
-                    extra[n] = .{ .key = "type", .value = orderedListType(v.style.numbering) };
-                    n += 1;
-                }
-                try self.inTags("ol", id, 2, extra[0..n]);
-            },
-            .heading => |v| {
-                var buf: [4]u8 = undefined;
-                const tag = std.fmt.bufPrint(&buf, "h{d}", .{v.level}) catch "h1";
-                try self.inTags(tag, id, 1, &.{});
-            },
-            .footnote_reference => |label| {
-                const idx = try self.footnoteIndexFor(label);
-                var extra_buf: [3]KV = undefined;
-                var n: usize = 0;
-                var id_buf: [24]u8 = undefined;
-                if (!self.fnref_id_emitted.contains(label)) {
-                    const id_text = std.fmt.bufPrint(&id_buf, "fnref{d}", .{idx}) catch "fnref";
-                    extra_buf[n] = .{ .key = "id", .value = id_text };
-                    n += 1;
-                    try self.fnref_id_emitted.put(self.allocator, label, {});
-                }
-                var href_buf: [24]u8 = undefined;
-                const href_text = std.fmt.bufPrint(&href_buf, "#fn{d}", .{idx}) catch "#fn";
-                extra_buf[n] = .{ .key = "href", .value = href_text };
-                n += 1;
-                extra_buf[n] = .{ .key = "role", .value = "doc-noteref" };
-                n += 1;
-                try self.renderTag("a", id, extra_buf[0..n]);
-                try self.writer.writeAll("<sup>");
-                try self.writer.print("{d}", .{idx});
-                try self.writer.writeAll("</sup></a>");
-            },
-            .table => try self.inTags("table", id, 2, &.{}),
-            .caption => {
-                var it = self.ast.children(id);
-                if (it.next() != null) try self.inTags("caption", id, 1, &.{});
-            },
-            .row => try self.inTags("tr", id, 2, &.{}),
-            .cell => |v| {
-                var extra: [1]KV = undefined;
-                var n: usize = 0;
-                if (v.alignment != .default) {
-                    extra[0] = .{ .key = "style", .value = alignStyle(v.alignment) };
-                    n = 1;
-                }
-                try self.inTags(if (v.head) "th" else "td", id, 1, extra[0..n]);
-            },
-            .thematic_break => {
-                try self.renderTag("hr", id, &.{});
-                try self.writer.writeByte('\n');
-            },
-            .code_block => |v| {
-                try self.renderTag("pre", id, &.{});
-                try self.writer.writeAll("<code");
-                if (v.lang) |lang| {
-                    try self.writer.writeAll(" class=\"language-");
-                    try self.writeEscapedAttr(lang);
-                    try self.writer.writeByte('"');
-                }
-                try self.writer.writeByte('>');
-                try self.writeEscaped(v.text);
-                try self.renderCloseTag("code");
-                try self.renderCloseTag("pre");
-                try self.writer.writeByte('\n');
-            },
-            .raw_block => |v| {
-                if (std.mem.eql(u8, v.format, "html")) try self.writer.writeAll(v.text);
-            },
-            .str => |text| {
-                if (!self.ast.attrsOf(id).isEmpty()) {
-                    try self.renderTag("span", id, &.{});
-                    try self.writeEscaped(text);
-                    try self.writer.writeAll("</span>");
-                } else {
-                    try self.writeEscaped(text);
-                }
-            },
-            .smart_punctuation => |v| try self.writer.writeAll(smartPunct(v.kind)),
-            .double_quoted => {
-                try self.writer.writeAll(smartPunct(.left_double_quote));
-                try self.renderChildren(id);
-                try self.writer.writeAll(smartPunct(.right_double_quote));
-            },
-            .single_quoted => {
-                try self.writer.writeAll(smartPunct(.left_single_quote));
-                try self.renderChildren(id);
-                try self.writer.writeAll(smartPunct(.right_single_quote));
-            },
-            .symb => |alias| {
-                try self.writer.writeByte(':');
-                try self.writeEscaped(alias);
-                try self.writer.writeByte(':');
-            },
-            .inline_math => |text| {
-                try self.renderTag("span", id, &.{.{ .key = "class", .value = "math inline" }});
-                try self.writer.writeAll("\\(");
-                try self.writeEscaped(text);
-                try self.writer.writeAll("\\)");
-                try self.renderCloseTag("span");
-            },
-            .display_math => |text| {
-                try self.renderTag("span", id, &.{.{ .key = "class", .value = "math display" }});
-                try self.writer.writeAll("\\[");
-                try self.writeEscaped(text);
-                try self.writer.writeAll("\\]");
-                try self.renderCloseTag("span");
-            },
-            .verbatim => |text| {
-                try self.renderTag("code", id, &.{});
-                try self.writeEscaped(text);
-                try self.renderCloseTag("code");
-            },
-            .raw_inline => |v| {
-                if (std.mem.eql(u8, v.format, "html")) try self.writer.writeAll(v.text);
-            },
-            .soft_break => try self.writer.writeByte('\n'),
-            .hard_break => try self.writer.writeAll("<br>\n"),
-            .non_breaking_space => try self.writer.writeAll("&nbsp;"),
-            .link => |v| try self.renderLinkOrImage(id, v, false),
-            .image => |v| try self.renderLinkOrImage(id, v, true),
-            .url => |text| try self.renderUrlOrEmail(id, text, false),
-            .email => |text| try self.renderUrlOrEmail(id, text, true),
-            .strong => try self.inTags("strong", id, 0, &.{}),
-            .emph => try self.inTags("em", id, 0, &.{}),
-            .span => try self.inTags("span", id, 0, &.{}),
-            .mark => try self.inTags("mark", id, 0, &.{}),
-            .insert => try self.inTags("ins", id, 0, &.{}),
-            .delete => try self.inTags("del", id, 0, &.{}),
-            .superscript => try self.inTags("sup", id, 0, &.{}),
-            .subscript => try self.inTags("sub", id, 0, &.{}),
-            // The generic-markup kinds can never appear in a djot parse
-            // today; render nothing rather than crash (the same degrade-
-            // gracefully choice `else` makes for the definition-only kinds
-            // below), so a hand-built or foreign tree still renders its
-            // renderable parts.
-            .element, .comment, .doctype, .processing_instruction, .cdata => {},
-            // `footnote`/`reference` definitions: rendered via the side
-            // tables (`renderNotes`/`renderLinkOrImage`), never in place.
-            else => {},
-        }
-    }
-
-    fn footnoteIndexFor(self: *Renderer, label: []const u8) Allocator.Error!usize {
-        if (self.footnote_index.get(label)) |i| return i;
-        const idx = self.next_footnote_index;
-        try self.footnote_index.put(self.allocator, label, idx);
-        self.next_footnote_index += 1;
-        return idx;
-    }
-
-    fn orderedListType(numbering: AST.OrderedListStyle.Numbering) []const u8 {
-        return switch (numbering) {
-            .decimal => "1",
-            .lower_alpha => "a",
-            .upper_alpha => "A",
-            .lower_roman => "i",
-            .upper_roman => "I",
-        };
-    }
-
-    fn alignStyle(a: AST.Alignment) []const u8 {
-        return switch (a) {
-            .left => "text-align: left;",
-            .right => "text-align: right;",
-            .center => "text-align: center;",
-            .default => "",
-        };
-    }
-
-    /// The plain-text content of a node's children (used for an image's
-    /// `alt` text) -- excludes footnote references, matching djot.js's
-    /// `getStringContent`. Returned buffer is owned by the caller.
-    fn stringContent(self: *Renderer, id: Node.Id) Allocator.Error![]u8 {
-        var buf = std.ArrayList(u8).empty;
-        errdefer buf.deinit(self.allocator);
-        try self.addStringContent(id, &buf);
-        return buf.toOwnedSlice(self.allocator);
-    }
-
-    fn addStringContent(self: *Renderer, id: Node.Id, buf: *std.ArrayList(u8)) Allocator.Error!void {
-        var it = self.ast.children(id);
-        while (it.next()) |child| {
-            switch (child.kind) {
-                .footnote_reference => {},
-                .str, .verbatim, .symb, .url, .email, .inline_math, .display_math => |t| try buf.appendSlice(self.allocator, t),
-                .raw_inline => |v| try buf.appendSlice(self.allocator, v.text),
-                .code_block => |v| try buf.appendSlice(self.allocator, v.text),
-                .raw_block => |v| try buf.appendSlice(self.allocator, v.text),
-                .smart_punctuation => |v| try buf.appendSlice(self.allocator, v.text),
-                .soft_break, .hard_break => try buf.append(self.allocator, '\n'),
-                else => try self.addStringContent(child.id, buf),
-            }
-        }
-    }
-
-    fn renderLinkOrImage(self: *Renderer, id: Node.Id, v: anytype, is_image: bool) RenderError!void {
-        var dest: ?[]const u8 = v.destination;
-        var extra = std.ArrayList(KV).empty;
-        defer extra.deinit(self.allocator);
-        var alt: ?[]u8 = null;
-        defer if (alt) |a| self.allocator.free(a);
-
-        if (v.reference) |ref| {
-            const resolved = self.doc.references.get(ref) orelse self.doc.auto_references.get(ref);
-            if (resolved) |ref_id| {
-                const ref_attrs = self.ast.attrsOf(ref_id);
-                dest = self.ast.nodes[ref_id].kind.reference.destination;
-                if (is_image) {
-                    alt = try self.stringContent(id);
-                    try extra.append(self.allocator, .{ .key = "alt", .value = alt.? });
-                    try extra.append(self.allocator, .{ .key = "src", .value = dest.? });
-                } else {
-                    try extra.append(self.allocator, .{ .key = "href", .value = dest.? });
-                }
-                const own_attrs = self.ast.attrsOf(id);
-                for (ref_attrs.entries) |kv| {
-                    // Reference-definition attrs come from djot syntax,
-                    // which can't express a bare (null-value) attribute, so
-                    // unwrapping can't fail.
-                    if (own_attrs.get(kv.key) == null) try extra.append(self.allocator, .{ .key = kv.key, .value = kv.value.? });
-                }
-            } else {
-                self.warn("reference not found");
-            }
-        } else {
-            if (is_image) {
-                alt = try self.stringContent(id);
-                try extra.append(self.allocator, .{ .key = "alt", .value = alt.? });
-                if (dest) |d| try extra.append(self.allocator, .{ .key = "src", .value = d });
-            } else if (dest) |d| {
-                try extra.append(self.allocator, .{ .key = "href", .value = d });
-            }
-        }
-
-        if (is_image) {
-            try self.renderTag("img", id, extra.items);
-        } else {
-            try self.inTags("a", id, 0, extra.items);
-        }
-    }
-
-    fn renderUrlOrEmail(self: *Renderer, id: Node.Id, text: []const u8, is_email: bool) Writer.Error!void {
-        var buf: [512]u8 = undefined;
-        const href = if (is_email)
-            std.fmt.bufPrint(&buf, "mailto:{s}", .{text}) catch text
-        else
-            text;
-        try self.renderTag("a", id, &.{.{ .key = "href", .value = href }});
-        try self.writeEscaped(text);
-        try self.renderCloseTag("a");
-    }
-};
+/// Build the shared printer's reference/footnote side tables straight from
+/// `doc`'s public fields -- same pattern `languages/html/conformance.zig`
+/// uses to drive `Html` against the djot.js corpus directly.
+fn contextFor(doc: *const Document) Html.Context {
+    return .{
+        .references = doc.references,
+        .auto_references = doc.auto_references,
+        .footnotes = doc.footnotes,
+    };
+}
 
 /// Render `doc` (rooted at `doc.ast.root`, normally a `doc` node) to HTML,
-/// writing to `writer`.
+/// writing to `writer`. Delegates to `Html.Renderer` directly (rather than
+/// `Html.serialize`) so `options.warn` can be threaded through to the
+/// printer's own `RenderOptions`, which `Html.serialize`'s convenience
+/// signature doesn't expose.
 pub fn render(allocator: Allocator, doc: *const Document, writer: *Writer, options: RenderOptions) RenderError!void {
-    var r = Renderer.init(allocator, doc, writer, options);
+    const ctx = contextFor(doc);
+    var r = Html.Renderer.init(allocator, &doc.ast, writer, &ctx, .{ .warn = options.warn });
     defer r.deinit();
     try r.renderNode(doc.ast.root);
 }
@@ -632,6 +104,7 @@ test "a bare (null-value) attribute renders as just its key" {
     // Djot can't produce a bare attribute, so build the tree by hand (the
     // way an XML/HTML parser would) and wrap it in a side-table-less
     // `Document` to reach the shared attr-rendering path.
+    const AST = Html.AST;
     var b = AST.Builder.init(testing.allocator);
     defer b.deinit();
     const text = try b.addLeaf(.{ .str = "x" });
@@ -644,4 +117,21 @@ test "a bare (null-value) attribute renders as just its key" {
     const html = try renderAlloc(testing.allocator, &doc, .{});
     defer testing.allocator.free(html);
     try testing.expectEqualStrings("<p disabled id=\"y\">x</p>\n", html);
+}
+
+test "warn fires for an unresolved reference" {
+    var doc = try djot.parse(testing.allocator, "[foo][bar]\n");
+    defer doc.deinit();
+
+    const Watcher = struct {
+        var fired: bool = false;
+        fn warn(_: []const u8) void {
+            fired = true;
+        }
+    };
+    Watcher.fired = false;
+
+    const html = try renderAlloc(testing.allocator, &doc, .{ .warn = Watcher.warn });
+    defer testing.allocator.free(html);
+    try testing.expect(Watcher.fired);
 }
