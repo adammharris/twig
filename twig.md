@@ -26,8 +26,9 @@ but Twig has different design goals:
 
 # Status
 
-Djot is the first supported format: a full parser (block + inline scanning,
-event-stream-to-AST construction) and an HTML renderer, validated against
-djot.js's own conformance suite (265/271 cases passing; the remaining 6 rely
-on an AST pretty-printer this project doesn't implement yet). See
-`src/languages/djot/`.
+The following languages are implemented:
+- Djot (265/271 cases passing;
+  the remaining 6 rely on an AST pretty-printer
+  this project doesn't implement yet)
+- Markdown
+- HTML (write-only)

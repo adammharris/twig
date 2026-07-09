@@ -66,9 +66,10 @@ pub fn runHelp(w: *Writer, binary_name: []const u8) !void {
         \\        item[2]            link[dest^="http"]  code[lang=zig]
         \\
         \\  edit [-i <format>] <file|-> <operation>
-        \\      Losslessly edit a document in place, addressing a node by its
-        \\      dot-separated index path (e.g. 0.3.1). Use `convert -o ast` to
-        \\      see the tree and read off paths. Operations:
+        \\      Losslessly edit a document in place. A <path> is either a
+        \\      dot-separated index path (e.g. 0.3.1) or a selector that matches
+        \\      exactly one node (e.g. 'heading("Status")'). Use `query` to find
+        \\      nodes and `convert -o ast` to see the whole tree. Operations:
         \\        --replace <path> <text>          replace a node's whole source
         \\        --replace-content <path> <text>  replace a container's interior
         \\        --insert-before <path> <text>    insert text before a node
@@ -275,8 +276,7 @@ fn writePreview(text: []const u8, stdout: *Writer) !void {
 /// `applyEdit`, split out so tests can drive it against an in-memory string.
 pub fn runEdit(allocator: Allocator, io: Io, stdout: *Writer, stderr: *Writer, opts: args_mod.EditOptions) ActionError!void {
     const source = try readSource(allocator, io, opts.file, stderr);
-    const path = try parsePath(allocator, opts.path_str, stderr);
-    const edited = try applyEdit(allocator, source, opts.input, opts.op, path, opts.child_index, opts.text, stderr);
+    const edited = try applyEditByLocator(allocator, source, opts.input, opts.op, opts.path_str, opts.child_index, opts.text, stderr);
 
     // stdin has no file to write back to, so it always prints; `--dry-run`
     // prints for a real file too, leaving it untouched.
@@ -315,16 +315,16 @@ fn parsePath(allocator: Allocator, path_str: []const u8, stderr: *Writer) Action
     return list.toOwnedSlice(allocator) catch error.ActionFailed;
 }
 
-/// Parse `source` as `input`, apply the one edit, and return the edited bytes
-/// (owned by `allocator`). Every failure — parse, a bad path/interior, or a
-/// reparse-breaking edit that rolls back — prints a clear message and folds
-/// into `ActionError`.
-fn applyEdit(
+/// Parse `source`, resolve `locator` to a node, apply the one edit, and return
+/// the edited bytes (owned by `allocator`). Every failure — parse, an
+/// unresolvable/ambiguous locator, a bad interior, or a reparse-breaking edit
+/// that rolls back — prints a clear message and folds into `ActionError`.
+fn applyEditByLocator(
     allocator: Allocator,
     source: []const u8,
     input: format.InputFormat,
     op: args_mod.EditOp,
-    path: []const usize,
+    locator: []const u8,
     child_index: usize,
     text: []const u8,
     stderr: *Writer,
@@ -337,18 +337,20 @@ fn applyEdit(
     };
     defer editor.deinit();
 
+    const id = try resolveLocator(allocator, editor.astView(), locator, stderr);
+
     const result = switch (op) {
-        .replace => editor.replaceNode(path, text),
-        .replace_content => editor.replaceContent(path, text),
-        .insert_before => editor.insertBefore(path, text),
-        .insert_after => editor.insertAfter(path, text),
-        .insert_child => editor.insertChild(path, child_index, text),
-        .delete => editor.deleteNode(path),
+        .replace => editor.replaceNodeById(id, text),
+        .replace_content => editor.replaceContentById(id, text),
+        .insert_before => editor.insertBeforeById(id, text),
+        .insert_after => editor.insertAfterById(id, text),
+        .insert_child => editor.insertChildById(id, child_index, text),
+        .delete => editor.deleteNodeById(id),
     };
     result catch |err| {
         switch (err) {
-            error.PathOutOfBounds => stderr.print("error: no node at that path (index out of bounds)\n", .{}) catch {},
             error.NoContentSpan => stderr.print("error: that node has no editable interior (it's a leaf, or a container the parser left without a known interior)\n", .{}) catch {},
+            error.NoNodeSpan => stderr.print("error: that node has no source span yet — spans aren't tracked for its kind (e.g. Markdown inline nodes like links/emphasis); edit its enclosing block instead\n", .{}) catch {},
             else => stderr.print("error: the edit produced a document that no longer parses ({t}); nothing was changed\n", .{err}) catch {},
         }
         stderr.flush() catch {};
@@ -356,6 +358,52 @@ fn applyEdit(
     };
 
     return allocator.dupe(u8, editor.sourceBytes()) catch return error.ActionFailed;
+}
+
+/// Resolve a locator to a single node id. A locator is EITHER an index path
+/// (all digits and dots, e.g. `0.3.1`) OR a CSS-lite selector (`heading("X")`),
+/// which must match exactly one node — on 0 or many, the candidates are listed
+/// so the user can refine (add `:nth(k)`, be more specific, or use a path).
+fn resolveLocator(allocator: Allocator, ast: *const twig.AST, locator: []const u8, stderr: *Writer) ActionError!twig.AST.Node.Id {
+    if (isIndexPath(locator)) {
+        const path = try parsePath(allocator, locator, stderr);
+        defer if (path.len > 0) allocator.free(path);
+        return ast.getIdByPath(path) catch {
+            stderr.print("error: no node at path '{s}' (index out of bounds)\n", .{locator}) catch {};
+            stderr.flush() catch {};
+            return error.ActionFailed;
+        };
+    }
+
+    var selector = twig.Select.parse(allocator, locator) catch |err| {
+        stderr.print("error: could not parse selector '{s}': {t}\n", .{ locator, err }) catch {};
+        stderr.flush() catch {};
+        return error.ActionFailed;
+    };
+    defer selector.deinit();
+
+    const matches = twig.Select.resolveAll(allocator, ast, &selector) catch return error.ActionFailed;
+    defer allocator.free(matches);
+
+    if (matches.len == 0) {
+        stderr.print("error: no node matches selector '{s}'\n", .{locator}) catch {};
+        stderr.flush() catch {};
+        return error.ActionFailed;
+    }
+    if (matches.len > 1) {
+        stderr.print("error: selector '{s}' is ambiguous — {d} nodes match. Refine it, add :nth(k), or use an index path:\n", .{ locator, matches.len }) catch {};
+        for (matches) |m| printMatchLine(allocator, ast, m.id, stderr) catch {};
+        stderr.flush() catch {};
+        return error.ActionFailed;
+    }
+    return matches[0].id;
+}
+
+/// A locator is an index path when it's made only of digits and dots (so an
+/// empty string — the root — counts); anything else is a selector.
+fn isIndexPath(s: []const u8) bool {
+    for (s) |c| if (!std.ascii.isDigit(c) and c != '.') return false;
+    return true;
 }
 
 /// Overwrite `path` with `data` (truncating create + positional write). Used
@@ -479,39 +527,64 @@ test "parsePath: dotted indices, empty = root, non-numeric errors" {
     try testing.expectError(error.ActionFailed, parsePath(testing.allocator, "0.x", &err));
 }
 
-test "applyEdit: xml replace-content, markdown insert-child, djot replace, delete" {
+test "applyEditByLocator: index paths across xml, markdown, djot" {
     var buf: [512]u8 = undefined;
     var err: Writer = .fixed(&buf);
 
-    // XML: replace <b>'s interior.
-    const xml = try applyEdit(testing.allocator, "<a><b>hi</b></a>", .xml, .replace_content, &.{ 0, 0 }, 0, "bye", &err);
+    // XML: replace <b>'s interior at path 0.0.
+    const xml = try applyEditByLocator(testing.allocator, "<a><b>hi</b></a>", .xml, .replace_content, "0.0", 0, "bye", &err);
     defer testing.allocator.free(xml);
     try testing.expectEqualStrings("<a><b>bye</b></a>", xml);
 
-    // Markdown: insert a new first list item. The list is doc's child 0; its
-    // items are the list's children.
-    const md = try applyEdit(testing.allocator, "- one\n- two\n", .markdown, .insert_child, &.{0}, 0, "- zero\n", &err);
+    // Markdown: insert a new first list item (list is doc's child 0).
+    const md = try applyEditByLocator(testing.allocator, "- one\n- two\n", .markdown, .insert_child, "0", 0, "- zero\n", &err);
     defer testing.allocator.free(md);
     try testing.expectEqualStrings("- zero\n- one\n- two\n", md);
 
-    // Djot: replace the first paragraph's whole source. deleteNode on the
-    // second one then removes it.
-    const dj = try applyEdit(testing.allocator, "one\n\ntwo\n", .djot, .replace, &.{0}, 0, "ONE", &err);
+    // Djot: replace the first paragraph's whole source at path 0.
+    const dj = try applyEditByLocator(testing.allocator, "one\n\ntwo\n", .djot, .replace, "0", 0, "ONE", &err);
     defer testing.allocator.free(dj);
     try testing.expect(std.mem.startsWith(u8, dj, "ONE"));
 }
 
-test "applyEdit: a leaf interior yields a clear NoContentSpan failure" {
+test "applyEditByLocator: a selector locator resolves to the target node" {
     var buf: [512]u8 = undefined;
     var err: Writer = .fixed(&buf);
-    try testing.expectError(error.ActionFailed, applyEdit(testing.allocator, "<a>hi</a>", .xml, .replace_content, &.{ 0, 0 }, 0, "x", &err));
+
+    // Address the second heading by its text instead of a path.
+    const md = try applyEditByLocator(testing.allocator, "# One\n\n## Two\n", .markdown, .replace, "heading(\"Two\")", 0, "## Renamed", &err);
+    defer testing.allocator.free(md);
+    try testing.expectEqualStrings("# One\n\n## Renamed\n", md);
+}
+
+test "applyEditByLocator: an ambiguous selector is refused and lists candidates" {
+    var buf: [1024]u8 = undefined;
+    var err: Writer = .fixed(&buf);
+    // Two headings match `heading` -> ambiguous.
+    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "# One\n\n# Two\n", .markdown, .replace, "heading", 0, "x", &err));
+    try testing.expect(std.mem.indexOf(u8, err.buffered(), "ambiguous") != null);
+}
+
+test "applyEditByLocator: a Markdown inline node (no span yet) is refused, not corrupted" {
+    var buf: [512]u8 = undefined;
+    var err: Writer = .fixed(&buf);
+    // The link resolves fine, but Markdown inline nodes carry no span yet, so
+    // the edit must error clearly rather than splice at offset 0.
+    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "see [x](http://a.co)\n", .markdown, .replace, "link", 0, "[y](http://b.co)", &err));
+    try testing.expect(std.mem.indexOf(u8, err.buffered(), "no source span") != null);
+}
+
+test "applyEditByLocator: a leaf interior yields a clear NoContentSpan failure" {
+    var buf: [512]u8 = undefined;
+    var err: Writer = .fixed(&buf);
+    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "<a>hi</a>", .xml, .replace_content, "0.0", 0, "x", &err));
     try testing.expect(std.mem.indexOf(u8, err.buffered(), "no editable interior") != null);
 }
 
-test "applyEdit: an edit that breaks the reparse rolls back and reports it" {
+test "applyEditByLocator: an edit that breaks the reparse rolls back and reports it" {
     var buf: [512]u8 = undefined;
     var err: Writer = .fixed(&buf);
     // Replacing <a>'s interior with "<b>" makes `<a><b></a>` — malformed.
-    try testing.expectError(error.ActionFailed, applyEdit(testing.allocator, "<a>ok</a>", .xml, .replace_content, &.{0}, 0, "<b>", &err));
+    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "<a>ok</a>", .xml, .replace_content, "0", 0, "<b>", &err));
     try testing.expect(std.mem.indexOf(u8, err.buffered(), "no longer parses") != null);
 }

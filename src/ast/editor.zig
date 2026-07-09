@@ -114,47 +114,71 @@ pub const Editor = struct {
         self.source = new_src;
     }
 
-    // ── ops (each: resolve path -> compute a span/offset -> splice) ─────────
+    // ── ops ─────────────────────────────────────────────────────────────
+    // Two flavors of each op: a `…ById` form taking a resolved `Node.Id` (what
+    // a selector match hands you), and a path form that just resolves the index
+    // path and delegates. Both converge on `replaceAtSpan`. Ids are valid only
+    // against the CURRENT `ast` (recompute after any successful edit).
+
+    /// A node's span, or `error.NoNodeSpan` if it's the degenerate `(0,0)` that
+    /// means "unset". Some parsers don't populate spans for every kind yet
+    /// (notably Markdown inline nodes — links, emphasis), and splicing at a
+    /// `(0,0)` span would silently corrupt the document at offset 0 instead of
+    /// touching the intended node. Guarding the whole-node ops turns that into
+    /// a clear error. (A real node never legitimately occupies zero bytes at
+    /// offset 0.)
+    fn nodeSpan(self: *Editor, id: Node.Id) !Span {
+        const s = self.ast.nodes[id].span;
+        if (s.start == 0 and s.end == 0) return error.NoNodeSpan;
+        return s;
+    }
 
     /// Replace the whole source of the node at `path`.
     pub fn replaceNode(self: *Editor, path: []const usize, text: []const u8) !void {
-        const id = try self.ast.getIdByPath(path);
-        try self.replaceAtSpan(self.ast.nodes[id].span, text);
+        try self.replaceNodeById(try self.ast.getIdByPath(path), text);
+    }
+    pub fn replaceNodeById(self: *Editor, id: Node.Id, text: []const u8) !void {
+        try self.replaceAtSpan(try self.nodeSpan(id), text);
     }
 
     /// Replace the interior (between-delimiters `content_span`) of the
-    /// container at `path`. `error.NoContentSpan` if it has none (a leaf, or a
-    /// djot container the parser left with a null interior — see the module
-    /// doc comment).
+    /// container. `error.NoContentSpan` if it has none (a leaf, or a djot
+    /// container the parser left with a null interior — see the module doc).
     pub fn replaceContent(self: *Editor, path: []const usize, text: []const u8) !void {
-        const id = try self.ast.getIdByPath(path);
+        try self.replaceContentById(try self.ast.getIdByPath(path), text);
+    }
+    pub fn replaceContentById(self: *Editor, id: Node.Id, text: []const u8) !void {
         const cs = self.ast.nodes[id].content_span orelse return error.NoContentSpan;
         try self.replaceAtSpan(cs, text);
     }
 
-    /// Insert `text` immediately before the node at `path` (at its span start).
-    /// The caller supplies any needed separators/newlines in `text`; the editor
+    /// Insert `text` immediately before / after the node (at its span start /
+    /// end). The caller supplies any needed separators/newlines — the editor
     /// does no whitespace guessing.
     pub fn insertBefore(self: *Editor, path: []const usize, text: []const u8) !void {
-        const id = try self.ast.getIdByPath(path);
-        const at = self.ast.nodes[id].span.start;
+        try self.insertBeforeById(try self.ast.getIdByPath(path), text);
+    }
+    pub fn insertBeforeById(self: *Editor, id: Node.Id, text: []const u8) !void {
+        const at = (try self.nodeSpan(id)).start;
         try self.replaceAtSpan(Span.init(at, at), text);
     }
-
-    /// Insert `text` immediately after the node at `path` (at its span end).
     pub fn insertAfter(self: *Editor, path: []const usize, text: []const u8) !void {
-        const id = try self.ast.getIdByPath(path);
-        const at = self.ast.nodes[id].span.end;
+        try self.insertAfterById(try self.ast.getIdByPath(path), text);
+    }
+    pub fn insertAfterById(self: *Editor, id: Node.Id, text: []const u8) !void {
+        const at = (try self.nodeSpan(id)).end;
         try self.replaceAtSpan(Span.init(at, at), text);
     }
 
-    /// Insert `text` as the `index`-th child of the container at `path`.
-    /// Anchor rules: `index == 0` -> before the current first child; an index
-    /// at or past the child count -> after the current last child; otherwise ->
-    /// before the index-th child. An *empty* container is anchored at its
-    /// `content_span` start (`error.NoContentSpan` if it has none).
+    /// Insert `text` as the `index`-th child of the container. Anchor rules:
+    /// `index == 0` -> before the current first child; an index at or past the
+    /// child count -> after the current last child; otherwise -> before the
+    /// index-th child. An *empty* container is anchored at its `content_span`
+    /// start (`error.NoContentSpan` if it has none).
     pub fn insertChild(self: *Editor, path: []const usize, index: usize, text: []const u8) !void {
-        const id = try self.ast.getIdByPath(path);
+        try self.insertChildById(try self.ast.getIdByPath(path), index, text);
+    }
+    pub fn insertChildById(self: *Editor, id: Node.Id, index: usize, text: []const u8) !void {
         const first = self.ast.nodes[id].first_child orelse {
             const cs = self.ast.nodes[id].content_span orelse return error.NoContentSpan;
             return self.replaceAtSpan(Span.init(cs.start, cs.start), text);
@@ -172,16 +196,17 @@ pub const Editor = struct {
             cur = self.ast.nodes[c].next_sibling;
             i += 1;
         }
-        // index >= child count: append after the last child.
         const at = self.ast.nodes[last].span.end;
         try self.replaceAtSpan(Span.init(at, at), text);
     }
 
-    /// Delete the node at `path` (remove exactly its span; no whitespace
-    /// cleanup — see the module doc comment).
+    /// Delete the node (remove exactly its span; no whitespace cleanup — see
+    /// the module doc comment).
     pub fn deleteNode(self: *Editor, path: []const usize) !void {
-        const id = try self.ast.getIdByPath(path);
-        try self.replaceAtSpan(self.ast.nodes[id].span, "");
+        try self.deleteNodeById(try self.ast.getIdByPath(path));
+    }
+    pub fn deleteNodeById(self: *Editor, id: Node.Id) !void {
+        try self.replaceAtSpan(try self.nodeSpan(id), "");
     }
 };
 
