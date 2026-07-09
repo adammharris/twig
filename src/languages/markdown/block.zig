@@ -68,6 +68,13 @@ const inline_mod = @import("inline.zig");
 pub const BlockResult = struct {
     ast: AST,
     link_references: std.StringHashMapUnmanaged(Node.Id),
+    /// Label (normalized via `normalizeLabel`, same as `link_references`) ->
+    /// the `footnote` definition node with that label (`self.options
+    /// .footnotes`; see this file's "footnote definitions" section). Mirrors
+    /// `link_references`'s shape and lifetime: keys are slices of the
+    /// `footnote` node's own owned `.label` string, not separately
+    /// allocated.
+    footnotes: std.StringHashMapUnmanaged(Node.Id),
 };
 
 // ── low-level line/column helpers ───────────────────────────────────────
@@ -563,7 +570,7 @@ fn normalizeLabel(allocator: Allocator, s: []const u8) Allocator.Error![]u8 {
 
 // ── container / leaf staging types ──────────────────────────────────────
 
-const ContainerKind = enum { document, block_quote, list, list_item };
+const ContainerKind = enum { document, block_quote, list, list_item, footnote_def };
 
 const Container = struct {
     kind: ContainerKind,
@@ -571,8 +578,16 @@ const Container = struct {
     start_line: usize = 0,
     end_line: usize = 0,
 
-    // .list_item
+    // .list_item / .footnote_def: the column continuation lines must be
+    // indented to at least (see `matchListItem`, reused for `.footnote_def`
+    // too -- see "footnote definitions" below).
     content_col: usize = 0,
+
+    // .footnote_def: the (not-yet-normalized) label text, a borrowed slice
+    // of `Parser.source` (stable for the whole parse) -- normalized into an
+    // owned copy only once, in `finishFootnoteDef`, right before it becomes
+    // a node's payload / a `Parser.footnotes` map key.
+    footnote_label: []const u8 = "",
     /// GFM task list items (`self.options.task_lists`): this item's content
     /// began with a `[ ]`/`[x]` checkbox marker (already stripped from the
     /// content before parsing began -- see the list-marker handling in
@@ -662,6 +677,8 @@ pub const Parser = struct {
     stack: std.ArrayList(Container),
     leaf: ?Leaf = null,
     link_references: std.StringHashMapUnmanaged(Node.Id) = .empty,
+    /// See `BlockResult.footnotes`'s doc comment.
+    footnotes: std.StringHashMapUnmanaged(Node.Id) = .empty,
     pending_inline: std.ArrayList(PendingInline) = .empty,
     options: Options,
     /// Phase 3's multi-line block extensions (GFM tables, definition lists,
@@ -735,6 +752,8 @@ pub const Parser = struct {
         // the finished `AST`'s `deinit` (on success, via `Document.deinit`)
         // owns the actual bytes.
         self.link_references.deinit(self.allocator);
+        // Same story as `link_references` above, one line up.
+        self.footnotes.deinit(self.allocator);
     }
 
     pub fn parse(self: *Parser) Allocator.Error!BlockResult {
@@ -760,7 +779,9 @@ pub const Parser = struct {
         const ast = try self.builder.finish(doc_id);
         const refs = self.link_references;
         self.link_references = .empty;
-        return .{ .ast = ast, .link_references = refs };
+        const fns = self.footnotes;
+        self.footnotes = .empty;
+        return .{ .ast = ast, .link_references = refs, .footnotes = fns };
     }
 
     /// Parse every deferred leaf text block's inline content (see
@@ -823,8 +844,13 @@ pub const Parser = struct {
     fn popContainer(self: *Parser, line_idx: usize) Allocator.Error!void {
         var c = self.stack.pop().?;
         defer c.deinit(self.allocator);
+        if (c.kind == .footnote_def) {
+            try self.finishFootnoteDef(&c, line_idx);
+            return;
+        }
         const kind: Node.Kind = switch (c.kind) {
             .document => unreachable,
+            .footnote_def => unreachable, // handled above
             .block_quote => .block_quote,
             .list_item => if (c.is_task) .{ .task_list_item = .{ .checked = c.task_checked } } else .list_item,
             .list => if (c.ordered)
@@ -966,7 +992,11 @@ pub const Parser = struct {
                     const nc = matchBlockQuote(line, cur) orelse break;
                     cur = nc;
                 },
-                .list_item => {
+                .list_item, .footnote_def => {
+                    // A footnote definition's body continues under exactly
+                    // the same "indented to at least the content column, or
+                    // blank" rule as a list item's own content -- see
+                    // `tryStartFootnoteDef`'s doc comment.
                     const nc = matchListItem(line, cur, c.content_col) orelse break;
                     cur = nc;
                 },
@@ -1205,6 +1235,14 @@ pub const Parser = struct {
             if (self.isInsideListItem()) return true;
             if (!isBlankLine(after) and (!mk.ordered or mk.start.? == 1)) return true;
         }
+        // See `isInsideFootnoteDef`'s doc comment: a fresh `[^label]:` marker
+        // ends an already-open footnote definition's own trailing paragraph
+        // (so back-to-back definitions with no blank line between them, e.g.
+        // "[^a]: x\n[^b]: y\n", each get their own `footnote` node) -- but,
+        // mirroring `tryStartTable`'s documented restriction, a footnote
+        // definition still never interrupts an ORDINARY paragraph outside
+        // that context (`tryStartFootnoteDef`'s own `!interrupting` gate).
+        if (self.options.footnotes and self.isInsideFootnoteDef() and tryFootnoteDefMarker(s) != null) return true;
         if (s.len > 0 and s[0] == '<') {
             if (detectHtmlBlockStart(s)) |t| {
                 if (t != 7) return true;
@@ -1357,6 +1395,10 @@ pub const Parser = struct {
                     if (try self.tryStartTable(line, cur, idx)) return true;
                 }
 
+                if (self.options.footnotes and !interrupting) {
+                    if (try self.tryStartFootnoteDef(line, cur, idx)) return true;
+                }
+
                 if (s.len > 0 and s[0] == '<') {
                     if (detectHtmlBlockStart(s)) |t| {
                         if (!interrupting or t != 7) {
@@ -1444,6 +1486,19 @@ pub const Parser = struct {
     /// despite neither satisfying the "non-empty"/"starts at 1" gate).
     fn isInsideListItem(self: *Parser) bool {
         return self.top().kind == .list_item;
+    }
+
+    /// The footnote-definition analog of `isInsideListItem`, used the same
+    /// way by `canInterruptParagraph`: a bare `[^b]:` line right after
+    /// `[^a]:`'s own paragraph, with NO blank line between them, must end
+    /// `[^a]`'s definition and start `[^b]`'s -- otherwise `[^b]: ...` would
+    /// be swallowed as a lazy-continuation line of `[^a]`'s open paragraph
+    /// (see `canInterruptParagraph`'s doc comment on this general class of
+    /// mismatched-container question). Only fires when a `.footnote_def` is
+    /// the CURRENT (innermost) open container, mirroring
+    /// `isInsideListItem`'s own scope.
+    fn isInsideFootnoteDef(self: *Parser) bool {
+        return self.top().kind == .footnote_def;
     }
 
     // ── Phase 3: frontmatter ─────────────────────────────────────────────
@@ -1747,6 +1802,133 @@ pub const Parser = struct {
         return true;
     }
 
+    // ── Phase 3: footnote definitions ───────────────────────────────────
+
+    /// GFM/Pandoc-style footnote definitions (`self.options.footnotes`):
+    ///
+    ///   [^label]: First line of the note's content.
+    ///       Lazily-indented continuation lines (indented to at least the
+    ///       column right after "[^label]: ", exactly like a list item's own
+    ///       content -- see `matchListItem`, reused here via
+    ///       `.footnote_def`'s `content_col`) join the SAME block; blank
+    ///       lines are tolerated mid-definition too.
+    ///
+    ///       A blank line followed by MORE indented content keeps extending
+    ///       this definition (its body can hold multiple paragraphs, nested
+    ///       lists, etc., just like a list item's body); a blank line
+    ///       followed by non-indented content ends it.
+    ///
+    /// A definition is recognized as a fresh block start (`tryStartBlocks`,
+    /// gated `!interrupting` like `tryStartTable` -- see that flag's use
+    /// here) rather than being stripped from already-accumulated paragraph
+    /// text the way link reference definitions are (`stripLinkReferenceDefinitions`):
+    /// unlike a link reference definition's single destination/title, a
+    /// footnote's body is arbitrary block content, which needs the ordinary
+    /// container-stack machinery (nested paragraphs/lists/code) rather than
+    /// a one-shot text-parse. Consequence, documented: a footnote definition
+    /// NEVER interrupts an open paragraph -- `[^a]: note` immediately
+    /// following prose with no blank line in between is read as an ordinary
+    /// lazy-continuation line of that paragraph, not a new definition
+    /// (mirroring `tryStartTable`'s own documented restriction).
+    ///
+    /// Label normalization matches link reference definitions exactly
+    /// (`normalizeLabel`: trim, collapse internal whitespace, ASCII
+    /// lowercase), so `[^A b]:`/`[^a  b]:`/`[^a b]` all key the same table
+    /// entry. Because inline parsing is deferred until the WHOLE document's
+    /// block structure is known (`pending_inline`/`resolvePendingInline`),
+    /// and `self.footnotes` is populated here at BLOCK-parse time (not
+    /// waiting for inline resolution), a forward `[^a]` reference (used
+    /// before its `[^a]:` definition appears) needs no special handling --
+    /// same story as link reference definitions.
+    ///
+    /// Like a link reference definition (and like djot's own footnotes --
+    /// see `Djot.Document.footnotes`'s doc comment), the finished `footnote`
+    /// node is NEVER appended into the enclosing container's children: it is
+    /// collected into `self.footnotes` only, to be resolved/numbered/
+    /// backlinked entirely at RENDER time by the shared HTML printer (see
+    /// `markdown/html.zig`) via `Markdown.Document.footnotes`.
+    fn tryStartFootnoteDef(self: *Parser, line: []const u8, cur: Cursor, idx: usize) Allocator.Error!bool {
+        const remainder = line[cur.pos..];
+        const s = stripUpTo3Indent(remainder);
+        const indent_bytes = remainder.len - s.len;
+        const m = tryFootnoteDefMarker(s) orelse return false;
+
+        try self.maybeCloseTopList(idx, null);
+        self.markListsLoose();
+
+        // Same "1-4 spaces after the marker sets the content column, else
+        // fall back to exactly 1" rule `tryStartBlocks`' list-marker handling
+        // uses (see its own comment for the rationale) -- kept consistent
+        // rather than inventing a second scheme.
+        const marker_col = cur.col + indent_bytes;
+        const after_marker_col = marker_col + m.marker_len;
+        const after = s[m.marker_len..];
+        const item_blank = isBlankLine(after);
+        var content_col: usize = undefined;
+        if (item_blank) {
+            content_col = after_marker_col + 1;
+        } else {
+            const spaces = indentCols(after, .{ .pos = 0, .col = after_marker_col });
+            content_col = if (spaces >= 1 and spaces <= 4) after_marker_col + spaces else after_marker_col + 1;
+        }
+
+        try self.pushContainer(.footnote_def, idx);
+        self.top().content_col = content_col;
+        self.top().footnote_label = m.label;
+
+        const after_marker_cursor: Cursor = .{ .pos = cur.pos + indent_bytes + m.marker_len, .col = after_marker_col };
+        const content_cur = skipWsToTarget(line, after_marker_cursor, content_col);
+        const final_remainder = line[content_cur.pos..];
+        if (!isBlankLine(final_remainder)) try self.openParagraph(final_remainder, idx);
+        return true;
+    }
+
+    const FootnoteDefMarker = struct { marker_len: usize, label: []const u8 };
+
+    /// `\[\^([^\]\r\n]*)\]:([ \t]|$)` -- `s` is already indent-stripped (<=3
+    /// columns). The label must contain at least one non-whitespace
+    /// character (mirrors link reference definitions' "at least one
+    /// character other than blank space" rule -- see `tryParseLinkRefDef`),
+    /// and the marker must be followed by a space/tab or the end of the
+    /// line (so `[^a]:foo`, with no separating space, is NOT read as a
+    /// footnote definition -- same shape of guard `tryParseLinkRefDef`'s
+    /// `skipLrdWs` enforces for link reference definitions).
+    fn tryFootnoteDefMarker(s: []const u8) ?FootnoteDefMarker {
+        if (s.len < 2 or s[0] != '[' or s[1] != '^') return null;
+        var i: usize = 2;
+        const label_start = i;
+        while (i < s.len and s[i] != ']' and s[i] != '\r' and s[i] != '\n') i += 1;
+        const label_end = i;
+        if (i >= s.len or s[i] != ']') return null;
+        i += 1;
+        if (i >= s.len or s[i] != ':') return null;
+        i += 1;
+        if (i < s.len and s[i] != ' ' and s[i] != '\t') return null;
+        const label = s[label_start..label_end];
+        if (std.mem.trim(u8, label, " \t\r\n").len == 0) return null;
+        return .{ .marker_len = i, .label = label };
+    }
+
+    /// Finalize a popped `.footnote_def` container into a `footnote` node
+    /// and record it in `self.footnotes` -- see `tryStartFootnoteDef`'s doc
+    /// comment for why this does NOT call `appendToTop`. A duplicate label
+    /// keeps its FIRST definition (same "first one wins" rule
+    /// `tryParseLinkRefDef` applies to `self.link_references`).
+    fn finishFootnoteDef(self: *Parser, c: *Container, line_idx: usize) Allocator.Error!void {
+        const label_owned = try normalizeLabel(self.allocator, c.footnote_label);
+        defer self.allocator.free(label_owned);
+        const id = try self.builder.addContainer(.{ .footnote = .{ .label = label_owned } }, c.children.items);
+        self.builder.setSpan(id, Span.init(self.lineStart(c.start_line), self.lineEnd(@min(c.end_line, line_idx))));
+        setContentSpanFromChildren(&self.builder, id);
+        if (!self.footnotes.contains(label_owned)) {
+            // Reuse the node's OWN (builder-owned) label string as the map
+            // key -- see `deinit`'s comment on why this map never frees its
+            // own keys.
+            const key = self.builder.nodes.items[id].kind.footnote.label;
+            try self.footnotes.put(self.allocator, key, id);
+        }
+    }
+
     // ── link reference definitions ───────────────────────────────────────
 
     /// Strip as many consecutive link reference definitions as possible
@@ -1913,6 +2095,7 @@ fn renderHtml(source: []const u8, options: Options) ![]u8 {
     var r = try parse(testing.allocator, source, options);
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
     return Html.serializeAlloc(testing.allocator, &r.ast, null);
 }
 
@@ -1920,6 +2103,7 @@ test "ATX heading" {
     var r = try parse(testing.allocator, "## Hello\n", .{});
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
     const h = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[h].kind.heading.level == 2);
     const text = r.ast.nodes[h].first_child.?;
@@ -1930,6 +2114,7 @@ test "fenced code block with a language" {
     var r = try parse(testing.allocator, "```zig\nconst x = 1;\n```\n", .{});
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
     const cb = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expectEqualStrings("zig", r.ast.nodes[cb].kind.code_block.lang.?);
     try testing.expectEqualStrings("const x = 1;\n", r.ast.nodes[cb].kind.code_block.text);
@@ -1939,6 +2124,7 @@ test "tight bullet list with two items" {
     var r = try parse(testing.allocator, "- a\n- b\n", .{});
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
     const list = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[list].kind.bullet_list.tight);
     const item1 = r.ast.nodes[list].first_child.?;
@@ -1950,6 +2136,7 @@ test "block quote" {
     var r = try parse(testing.allocator, "> foo\n> bar\n", .{});
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
     const bq = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[bq].kind == .block_quote);
     const para = r.ast.nodes[bq].first_child.?;
@@ -1960,6 +2147,7 @@ test "HTML block" {
     var r = try parse(testing.allocator, "<div>\n  <p>hi</p>\n</div>\n", .{});
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
     const rb = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[rb].kind == .raw_block);
     try testing.expectEqualStrings("html", r.ast.nodes[rb].kind.raw_block.format);
@@ -1969,6 +2157,7 @@ test "paragraph with a code span and a hard break" {
     var r = try parse(testing.allocator, "foo `bar`  \nbaz\n", .{});
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
     const para = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[para].kind == .para);
     var it = r.ast.children(para);
@@ -1983,6 +2172,7 @@ test "a link reference definition is stripped and recorded in the table" {
     var r = try parse(testing.allocator, "[foo]: /url \"title\"\n", .{});
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
     try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[r.ast.root].first_child);
     const ref_id = r.link_references.get("foo") orelse return error.TestExpectedNonNull;
     try testing.expectEqualStrings("/url", r.ast.nodes[ref_id].kind.reference.destination);
@@ -2000,6 +2190,7 @@ test "table: header/delimiter/body with per-column alignment" {
     , .{ .tables = true });
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
 
     const table = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[table].kind == .table);
@@ -2033,6 +2224,7 @@ test "table: ragged rows are padded/truncated to the header's column count" {
     , .{ .tables = true });
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
 
     const table = r.ast.nodes[r.ast.root].first_child.?;
     const caption = r.ast.nodes[table].first_child.?;
@@ -2061,6 +2253,7 @@ test "table OFF: a pipe 'table' parses as an ordinary CommonMark paragraph" {
     var r = try parse(testing.allocator, "| a | b |\n| - | - |\n", .{ .tables = false });
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
     const para = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[para].kind == .para);
     try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[para].next_sibling);
@@ -2072,6 +2265,7 @@ test "task list: unchecked and checked (case-insensitive) items" {
     var r = try parse(testing.allocator, "- [ ] todo\n- [x] done\n- [X] also done\n", .{ .task_lists = true });
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
 
     const list = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[list].kind == .task_list);
@@ -2101,6 +2295,7 @@ test "task lists OFF: '- [ ] x' is a plain bullet list item with literal text" {
     var r = try parse(testing.allocator, "- [ ] x\n", .{ .task_lists = false });
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
     const list = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[list].kind == .bullet_list);
     const item = r.ast.nodes[list].first_child.?;
@@ -2148,6 +2343,7 @@ test "definition list: a term with two definitions" {
     , .{ .definition_lists = true });
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
 
     const dl = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[dl].kind == .definition_list);
@@ -2183,6 +2379,7 @@ test "definition list: two adjacent term groups merge into one definition_list" 
     , .{ .definition_lists = true });
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
 
     const dl = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[dl].kind == .definition_list);
@@ -2205,9 +2402,90 @@ test "definition lists OFF: 'Term\\n: def' lazily continues one CommonMark parag
     var r = try parse(testing.allocator, "Term\n: def\n", .{ .definition_lists = false });
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
     const para = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[para].kind == .para);
     try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[para].next_sibling);
+}
+
+// ── Phase 3: footnote definitions ────────────────────────────────────────
+
+test "footnote definition: collected into r.footnotes, NOT emitted into the main flow" {
+    var r = try parse(testing.allocator, "para\n\n[^a]: the note\n", .{ .footnotes = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+
+    const para = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[para].kind == .para);
+    // The footnote definition is the ONLY other top-level content in the
+    // source, and it must not show up as a sibling block.
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[para].next_sibling);
+
+    const fn_id = r.footnotes.get("a") orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("a", r.ast.nodes[fn_id].kind.footnote.label);
+    const body = r.ast.nodes[fn_id].first_child.?;
+    try testing.expect(r.ast.nodes[body].kind == .para);
+}
+
+test "footnote definition: the label is normalized (trim/collapse ws/lowercase)" {
+    var r = try parse(testing.allocator, "[^ A  B ]: note\n", .{ .footnotes = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    try testing.expect(r.footnotes.contains("a b"));
+}
+
+test "footnote definition: a continuation line indented to line up with the first line's content joins the same note body" {
+    // Pandoc's own documented convention (which this mirrors -- see
+    // `tryStartFootnoteDef`'s doc comment): "subsequent paragraphs are
+    // indented to line up with the first line of the note". "[^a]: " is 6
+    // columns wide, so the continuation must be indented 6 columns to join.
+    var r = try parse(testing.allocator, "[^a]: first line\n      second line\n", .{ .footnotes = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+
+    const fn_id = r.footnotes.get("a") orelse return error.TestExpectedNonNull;
+    const body = r.ast.nodes[fn_id].first_child.?;
+    try testing.expect(r.ast.nodes[body].kind == .para);
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[body].next_sibling);
+    // The embedded newline becomes a `soft_break` (same as any other
+    // multi-line paragraph -- Phase 2 inline scanning, not this file's own
+    // logic), so the body is "first line", a soft break, then "second
+    // line", NOT one single joined `str` node.
+    const s1 = r.ast.nodes[body].first_child.?;
+    try testing.expectEqualStrings("first line", r.ast.nodes[s1].kind.str);
+    const brk = r.ast.nodes[s1].next_sibling.?;
+    try testing.expect(r.ast.nodes[brk].kind == .soft_break);
+    const s2 = r.ast.nodes[brk].next_sibling.?;
+    try testing.expectEqualStrings("second line", r.ast.nodes[s2].kind.str);
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[s2].next_sibling);
+}
+
+test "footnote definitions: back-to-back definitions with no blank line between them each get their own node" {
+    var r = try parse(testing.allocator, "[^a]: first\n[^b]: second\n", .{ .footnotes = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+
+    const a_id = r.footnotes.get("a") orelse return error.TestExpectedNonNull;
+    const b_id = r.footnotes.get("b") orelse return error.TestExpectedNonNull;
+    const a_body = r.ast.nodes[a_id].first_child.?; // the note's `para`
+    const b_body = r.ast.nodes[b_id].first_child.?;
+    try testing.expectEqualStrings("first", r.ast.nodes[r.ast.nodes[a_body].first_child.?].kind.str);
+    try testing.expectEqualStrings("second", r.ast.nodes[r.ast.nodes[b_body].first_child.?].kind.str);
+    // Neither shows up in the main flow.
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[r.ast.root].first_child);
+}
+
+test "footnotes OFF: '[^a]:' is an ordinary link reference definition, not collected as a footnote" {
+    var r = try parse(testing.allocator, "[^a]: /url\n", .{ .footnotes = false });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), r.footnotes.count());
+    try testing.expect(r.link_references.contains("^a"));
 }
 
 // ── Phase 3: frontmatter ──────────────────────────────────────────────────
@@ -2216,6 +2494,7 @@ test "frontmatter: a leading YAML block becomes a raw_block, not rendered to HTM
     var r = try parse(testing.allocator, "---\ntitle: Hi\n---\n# Heading\n", .{ .frontmatter = true });
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
 
     const fm = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[fm].kind == .raw_block);
@@ -2234,6 +2513,7 @@ test "frontmatter: a leading TOML (+++) block is tagged format=\"toml\"" {
     var r = try parse(testing.allocator, "+++\ntitle = \"Hi\"\n+++\nbody\n", .{ .frontmatter = true });
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
     const fm = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[fm].kind == .raw_block);
     try testing.expectEqualStrings("toml", r.ast.nodes[fm].kind.raw_block.format);
@@ -2244,6 +2524,7 @@ test "frontmatter: an unterminated leading '---' block falls back to ordinary pa
     var r = try parse(testing.allocator, "---\ntitle: Hi\n", .{ .frontmatter = true });
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
     // No closing `---`: the first line is just a thematic break, same as
     // with the flag off.
     const first = r.ast.nodes[r.ast.root].first_child.?;
@@ -2254,6 +2535,7 @@ test "frontmatter OFF: a leading '---' is an ordinary CommonMark thematic break"
     var r = try parse(testing.allocator, "---\nfoo\n", .{ .frontmatter = false });
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
     const first = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[first].kind == .thematic_break);
     const para = r.ast.nodes[first].next_sibling.?;

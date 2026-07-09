@@ -194,6 +194,24 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
                 i = run_end;
             },
             '[' => {
+                // GFM/Pandoc footnote reference (`self.options.footnotes`):
+                // `[^label]` takes precedence over ordinary link-bracket
+                // parsing -- resolved and consumed whole right here, before
+                // any bracket-stack state is pushed, so it never interacts
+                // with link/image bracket matching at all. With the flag off
+                // (or `[` not immediately followed by `^`), this falls
+                // through to the ordinary `[` handling below exactly as
+                // before -- see `tryFootnoteReference`'s doc comment.
+                if (sc.options.footnotes) {
+                    if (tryFootnoteReference(text, i)) |fr| {
+                        try sc.flushBuf();
+                        const norm = try normalizeRefLabel(b.allocator, fr.label);
+                        defer b.allocator.free(norm);
+                        _ = try sc.appendItem(try b.addLeaf(.{ .footnote_reference = norm }));
+                        i = fr.end;
+                        continue;
+                    }
+                }
                 try sc.flushBuf();
                 const item_idx = try sc.appendItem(try b.addLeaf(.{ .str = "[" }));
                 try sc.brackets.append(b.allocator, .{
@@ -924,6 +942,25 @@ fn scanBracketLabel(text: []const u8, start: usize) ?RawLabel {
     if (i >= text.len or text[i] != ']') return null;
     if (i - content_start > 999) return null;
     return .{ .content = text[content_start..i], .end = i + 1 };
+}
+
+// ── Phase 3: footnote references (`self.options.footnotes`) ────────────
+
+const FootnoteRefLabel = struct { label: []const u8, end: usize };
+
+/// `text[at] == '['`. `[^label]`: shares `scanBracketLabel`'s label grammar
+/// (no unescaped nested `[`, 999-character cap) minus the leading `^`, so
+/// `[^a[b]` fails to scan here for the same reason `[a[b]` fails as an
+/// ordinary link label -- falling back to literal-bracket handling, exactly
+/// like an ordinary unresolved link label does. The label must contain at
+/// least one non-whitespace character (mirrors link reference definitions'
+/// "at least one character other than blank space" rule).
+fn tryFootnoteReference(text: []const u8, at: usize) ?FootnoteRefLabel {
+    if (at + 1 >= text.len or text[at + 1] != '^') return null;
+    const raw = scanBracketLabel(text, at) orelse return null;
+    const label = raw.content[1..]; // drop the leading '^' claimed above
+    if (std.mem.trim(u8, label, " \t\r\n").len == 0) return null;
+    return .{ .label = label, .end = raw.end };
 }
 
 /// Whitespace per the inline link-tail/HTML-tag grammars: any run of
@@ -1824,6 +1861,38 @@ test "unhandled inline markup (unresolved brackets) passes through as literal te
     // exact input.
     const link = ast.nodes[ast.root].first_child.?;
     try testing.expect(ast.nodes[link].kind == .link);
+}
+
+// ── Phase 3: footnote references ────────────────────────────────────────
+
+test "footnote reference: [^label] becomes a footnote_reference node when the flag is on" {
+    var ast = try parseAndFinishWithOptions("see[^a]", .{ .footnotes = true });
+    defer ast.deinit();
+    var it = ast.children(ast.root);
+    const text = it.next().?;
+    try testing.expectEqualStrings("see", text.kind.str);
+    const ref = it.next().?;
+    try testing.expect(ref.kind == .footnote_reference);
+    try testing.expectEqualStrings("a", ref.kind.footnote_reference);
+    try testing.expectEqual(@as(?*const AST.Node, null), it.next());
+}
+
+test "footnote reference: the label is normalized (trim/collapse ws/lowercase), matching link labels" {
+    var ast = try parseAndFinishWithOptions("[^ A  B ]", .{ .footnotes = true });
+    defer ast.deinit();
+    const ref = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[ref].kind == .footnote_reference);
+    try testing.expectEqualStrings("a b", ast.nodes[ref].kind.footnote_reference);
+}
+
+test "footnote reference OFF: [^a] parses as plain CommonMark (an unresolved shortcut link falls back to literal brackets)" {
+    var ast = try parseAndFinishWithOptions("[^a]", .{ .footnotes = false });
+    defer ast.deinit();
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    var it = ast.children(ast.root);
+    while (it.next()) |n| try buf.appendSlice(testing.allocator, n.kind.str);
+    try testing.expectEqualStrings("[^a]", buf.items);
 }
 
 // ── Phase 3: strikethrough ────────────────────────────────────────────────

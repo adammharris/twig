@@ -94,11 +94,23 @@ fn renderHtmlDjot(allocator: Allocator, doc: *const ParsedDoc, writer: *Writer) 
     try twig.Djot.html.render(allocator, &doc.djot, writer, .{});
 }
 
-/// Every other language (markdown today; xml; a future html parse) has no
-/// side tables to resolve, so the shared, language-neutral printer
+/// Every other language (xml; a future html parse) has no side tables to
+/// resolve, so the shared, language-neutral printer
 /// (`languages/html/serializer.zig`) is the whole story — `ctx = null`.
 fn renderHtmlGeneric(allocator: Allocator, doc: *const ParsedDoc, writer: *Writer) anyerror!void {
     try twig.Html.serialize(allocator, doc.ast(), writer, null);
+}
+
+/// Markdown needs its own HTML rendering path (`Markdown.html.render`)
+/// rather than the generic printer for the same reason djot does
+/// (`renderHtmlDjot`'s doc comment): footnotes (`self.options.footnotes`)
+/// resolve/number/backlink entirely at RENDER time, against
+/// `Document.footnotes` — see `markdown/html.zig`'s module doc comment.
+/// Using the generic printer here would silently drop footnotes (every
+/// `link`/`image`, by contrast, is already fully resolved at PARSE time, so
+/// those are unaffected either way).
+fn renderHtmlMarkdown(allocator: Allocator, doc: *const ParsedDoc, writer: *Writer) anyerror!void {
+    try twig.Markdown.html.render(allocator, &doc.markdown, writer, .{});
 }
 
 fn serializeCanonicalXml(allocator: Allocator, doc: *const ParsedDoc) anyerror![]u8 {
@@ -142,7 +154,7 @@ pub const registry = [_]FormatEntry{
         .extensions = &.{ "md", "markdown" },
         .aliases = &.{"md"},
         .parse = parseMarkdown,
-        .renderHtml = renderHtmlGeneric,
+        .renderHtml = renderHtmlMarkdown,
     },
     .{
         .id = .xml,

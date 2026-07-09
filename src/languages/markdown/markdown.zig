@@ -28,15 +28,21 @@
 //! implemented" — see that file's doc comment.
 //!
 //! ── Rendering ────────────────────────────────────────────────────────────
-//! No bespoke Markdown->HTML renderer: `Markdown.parse` targets the same
-//! shared `AST` every other language module does, so MD->HTML goes through
-//! the existing generic printer, `Html.serialize`/`Html.serializeAlloc`
+//! `Markdown.parse` targets the same shared `AST` every other language
+//! module does. For everything EXCEPT footnotes, that means MD->HTML can go
+//! straight through the generic printer, `Html.serialize`/`Html.serializeAlloc`
 //! (`languages/html/serializer.zig`), the same way `languages/html/conformance.zig`
-//! proves it works for djot. Markdown produces no djot-style footnote/
-//! reference-in-prose rendering need beyond what `Document.link_references`
-//! captures, and even that never needs to be consulted by the renderer
-//! (unlike djot's `Html.Context.references`) since Phase 2 resolves every
-//! reference link/image at PARSE time — see this file's module doc comment.
+//! proves it works for djot: Phase 2 resolves every reference link/image at
+//! PARSE time, so (unlike djot's `Html.Context.references`) `Document
+//! .link_references` never needs to be consulted by the renderer at all.
+//! Footnotes (`self.options.footnotes`) are the one exception — like djot's
+//! footnotes, they're resolved/numbered/backlinked entirely at RENDER time
+//! (see `Document.footnotes`'s doc comment below), which the shared printer
+//! only does when handed an `Html.Context` — so `Markdown.parse` output
+//! should be rendered via THIS package's own `html.zig` (`Markdown.html
+//! .render`/`.renderAlloc`, mirroring `Djot.html`), not the bare generic
+//! printer, whenever footnotes might be in play (`cli/format.zig`'s
+//! registry does exactly this).
 //!
 //! ── `Document` ───────────────────────────────────────────────────────────
 //! Like djot (and unlike XML, which needs no side tables), Markdown needs a
@@ -45,7 +51,9 @@
 //! by `block.zig` (see its module doc comment), but their labels only
 //! become useful once Phase 2 resolves `link`/`image` nodes against them —
 //! so, exactly like djot's `Document.references`, they're carried
-//! alongside the `AST` rather than folded into it.
+//! alongside the `AST` rather than folded into it. Footnote definitions
+//! (`Document.footnotes`) are carried the same way, for the render-time
+//! reason described above.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -55,6 +63,7 @@ const inline_mod = @import("inline.zig");
 
 pub const AST = @import("../../ast/ast.zig");
 pub const ParseOptions = @import("options.zig");
+pub const html = @import("html.zig");
 
 pub const Parser = block.Parser;
 
@@ -87,8 +96,25 @@ pub const Document = struct {
     /// only needs to free the map structure itself.
     link_references: std.StringHashMapUnmanaged(AST.Node.Id) = .empty,
 
+    /// Label (normalized, same rule as `link_references`) -> the `footnote`
+    /// definition node with that label (`block.zig`'s `[^label]: ...`
+    /// handling, gated on `self.options.footnotes`). Unlike
+    /// `link_references`, the shared HTML printer DOES need to consult this
+    /// one: a `footnote_reference`'s label, like djot's, is resolved,
+    /// numbered, and backlinked entirely at RENDER time (djot.js-style),
+    /// never at parse time — see `html.zig` (this package's thin adapter
+    /// over the shared printer's `Html.Context`, mirroring
+    /// `Djot.Document.footnotes`/`djot/html.zig` exactly) and this file's
+    /// module doc comment.
+    ///
+    /// This map's KEYS are slices of `ast.owned_strings` (the same string as
+    /// its `footnote` node's own `.label` field), so `deinit` only needs to
+    /// free the map structure itself — same story as `link_references`.
+    footnotes: std.StringHashMapUnmanaged(AST.Node.Id) = .empty,
+
     pub fn deinit(self: *Document) void {
         self.link_references.deinit(self.ast.allocator);
+        self.footnotes.deinit(self.ast.allocator);
         self.ast.deinit();
     }
 };
@@ -98,13 +124,14 @@ pub const Document = struct {
 /// string it needs) and must be freed with `doc.deinit()`.
 pub fn parse(allocator: Allocator, source: []const u8, options: ParseOptions) Allocator.Error!Document {
     const result = try block.parse(allocator, source, options);
-    return .{ .ast = result.ast, .link_references = result.link_references };
+    return .{ .ast = result.ast, .link_references = result.link_references, .footnotes = result.footnotes };
 }
 
 test {
     _ = @import("entities.zig");
     _ = inline_mod;
     _ = block;
+    _ = @import("html.zig");
     _ = @import("conformance.zig");
 }
 
