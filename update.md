@@ -68,7 +68,7 @@ project to `fig` (which does the same for config formats).
 
 ## Test status
 
-`zig build test --summary all` → **201/201**.
+`zig build test --summary all` → **223/223**.
 Conformance: **djot 265/271**, **html printer 265/271** (both skip the same 6
 AST-print-mode cases), **markdown 496/652** (`BASELINE=496` in
 `markdown/conformance.zig`; harness uses the `.commonmark` preset, so extensions
@@ -90,11 +90,14 @@ divergences from issues #1/#3 below — i.e. remaining markdown work is render-s
 4. **Pre-existing `zig fmt` failures** in `djot/inline.zig` and `djot/block.zig`
    (predate this work) — worth a standalone cleanup commit.
 5. XML deviations from strict 1.0 are documented in `xml.zig`'s header.
-6. **Markdown inline nodes carry no source span** (link/emph/strong/etc. are
-   `(0,0)`) — so selector/path edits of them are refused by the editor's
-   `nodeSpan` guard (`error.NoNodeSpan`) rather than silently splicing at offset
-   0. Block-level and djot-inline editing are unaffected. Making the Markdown
-   inline scanner set spans is the fix — see next steps.
+6. **Markdown inline node spans: DONE** (commit `4d127c8`). `inline.zig`/`block
+   .zig` thread a buffer→source segment map so inline nodes (link/emph/strong/
+   code span/autolink/…) get byte-accurate absolute spans covering the full
+   construct (delimiters included), with `content_span` = the interior. Editing
+   links/emphasis by selector now works. Contract is accurate-or-unset: a
+   construct that straddles a multi-line-paragraph line-join is left `(0,0)` and
+   the editor guard refuses it cleanly (never a wrong span). GFM extended email
+   autolinks after an escaped/entity run are the other intentional unset case.
 
 ## Next steps
 
@@ -109,18 +112,15 @@ divergences from issues #1/#3 below — i.e. remaining markdown work is render-s
 2. **HTML parser** (deferred "HTML phase") — forked tokenizer (RCDATA/RAWTEXT,
    entity refs), implicit tag closing (`<li>`/`<p>`), conservative tree
    construction. Then upgrade markdown's raw-HTML nodes to parsed `element`s.
-3. **Markdown inline spans** (unblocks the headline `link[dest^=…]` / emphasis
-   edits) — make `markdown/inline.zig` set each inline node's source span so the
-   `NoNodeSpan` guard stops firing. High value, self-contained.
-4. **`section("Title")` selector** — "edit everything under a heading"; layers on
+3. **`section("Title")` selector** — "edit everything under a heading"; layers on
    `ast/select.zig` (heading → section span) plus a small CLI change so the edit
    uses the Match's section span rather than the heading node's own. (Descendant/
    child combinators already landed.)
-5. **Editor increment 2** — the original motivation is now landed (increment 1:
+4. **Editor increment 2** — the original motivation is now landed (increment 1:
    index-path splice ops + `twig edit`; plus content-based selectors). Next:
    per-field spans (so a `link` destination or `code_block`
    lang is editable without whole-node replace); smart delete (whitespace/
    separator cleanup); move/reorder ops; richer container interiors so
    empty-container inserts work everywhere.
-6. **CLI follow-ups** — wire Markdown into `-o canonical` once a markdown
+5. **CLI follow-ups** — wire Markdown into `-o canonical` once a markdown
    serializer exists; add HTML as an input format once the parser lands.
