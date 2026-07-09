@@ -6,8 +6,11 @@
 //! Twig is a queryable/editable document AST, and the CLI is a thin skin over
 //! this).
 //!
-//! ── Grammar (this file: the single-step core) ──────────────────────────────
-//!   selector  := kind predicate*
+//! ── Grammar ──────────────────────────────────────────────────────────────
+//!   selector  := step (combinator step)*
+//!   combinator := ">"                          direct child
+//!              |  (whitespace)                 descendant (any depth)
+//!   step      := kind predicate*
 //!   kind      := ident        e.g. heading, para, link, item, list, code,
 //!                             emph, strong, table, cell, div, section, text;
 //!                             friendly aliases (h/p/a/img/em/bold/quote…) and
@@ -18,11 +21,18 @@
 //!              | "[" key (op value)? "]"       attribute/payload test
 //!   op        := "="  "^="  "$="  "*="         eq / prefix / suffix / substring
 //! Examples: `heading`, `heading[level=2]`, `heading("Status")`, `item[2]`,
-//! `link[dest^="http"]`, `code[lang=zig]`, `list[ordered]`.
+//! `link[dest^="http"]`, `code[lang=zig]`, `list[ordered]`, `list > item`,
+//! `list:nth(2) > item("dishes")`, `blockquote para`.
 //!
-//! Descendant/child combinators (`a b`, `a > b`) and the `section("Title")`
-//! form are deliberately NOT here yet — they layer on top of this same engine
-//! without changing the `parse`/`resolve*` surface. See the module's tests for
+//! Each step's `:nth`/`[k]` applies *within that step's scope* — it picks the
+//! k-th candidate matched under the current scope, and that pick becomes the
+//! scope for the next step. So `list:nth(2) > item` first narrows to the 2nd
+//! list in the document, then matches only items that are direct children of
+//! *that* list.
+//!
+//! The `section("Title")` form is deliberately NOT here yet — it needs
+//! separate CLI span-wiring and layers on top of this same engine without
+//! changing the `parse`/`resolve*` surface. See the module's tests for
 //! exactly what's covered today.
 
 const std = @import("std");
@@ -55,11 +65,26 @@ pub const Matcher = struct {
     attrs: []const AttrPred = &.{},
 };
 
-/// A parsed selector. Owns all its strings via a private arena; free with
-/// `deinit`. Opaque by convention — go through `parse`/`resolve*`.
+/// How a step relates to the scope established by the previous step.
+/// `descendant` (plain whitespace, `a b`) means "anywhere under the prior
+/// scope"; `child` (`a > b`) means "an immediate child of the prior scope".
+/// The first step's combinator is always `.descendant`, meaning "anywhere
+/// under the document root" — reproducing single-step matching.
+pub const Combinator = enum { descendant, child };
+
+/// One link in a selector chain: how it's scoped relative to the previous
+/// step, plus its own predicate set.
+pub const Step = struct {
+    combinator: Combinator,
+    matcher: Matcher,
+};
+
+/// A parsed selector: a chain of one or more `Step`s. Owns all its strings
+/// via a private arena; free with `deinit`. Opaque by convention — go
+/// through `parse`/`resolve*`.
 pub const Selector = struct {
     arena: std.heap.ArenaAllocator,
-    matcher: Matcher,
+    steps: []Step,
 
     pub fn deinit(self: *Selector) void {
         self.arena.deinit();
@@ -222,51 +247,131 @@ fn parseAttr(a: Allocator, inner: []const u8) ParseError!AttrPred {
     return .{ .key = try a.dupe(u8, key), .op = op, .value = try a.dupe(u8, val) };
 }
 
-/// Parse `text` into a `Selector` (freed with `.deinit()`).
+/// Parse `text` into a `Selector` (freed with `.deinit()`). A chain of
+/// whitespace-separated steps, e.g. `list > item("dishes")`: a `>` between
+/// steps (optionally space-padded) means `.child`; plain whitespace means
+/// `.descendant`. A single-step selector (no combinator) parses to a
+/// one-element chain with `.descendant`, so existing single-step behavior is
+/// unchanged.
 pub fn parse(gpa: Allocator, text: []const u8) ParseError!Selector {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
-    var p = Parser{ .text = text, .a = arena.allocator() };
+    const a = arena.allocator();
+    var p = Parser{ .text = text, .a = a };
+    var steps: std.ArrayList(Step) = .empty;
+
     p.skipSpaces();
-    const m = try p.parseMatcher();
+    const first = try p.parseMatcher();
+    try steps.append(a, .{ .combinator = .descendant, .matcher = first });
     p.skipSpaces();
-    if (p.i != text.len) return error.InvalidSelector; // no combinators yet
-    return .{ .arena = arena, .matcher = m };
+
+    while (p.i < text.len) {
+        var comb: Combinator = .descendant;
+        if (text[p.i] == '>') {
+            comb = .child;
+            p.i += 1;
+            p.skipSpaces();
+        }
+        // A dangling `>` (nothing left to match) or any other trailing junk
+        // that isn't a valid step start is an error.
+        if (p.i >= text.len) return error.InvalidSelector;
+        const m = try p.parseMatcher();
+        try steps.append(a, .{ .combinator = comb, .matcher = m });
+        p.skipSpaces();
+    }
+
+    return .{ .arena = arena, .steps = try steps.toOwnedSlice(a) };
 }
 
 // ── resolving ──────────────────────────────────────────────────────────────
 
-/// Every node (in document order) the selector matches. Caller frees the
-/// returned slice.
+/// Every node (in document order) the selector's step chain matches. Caller
+/// frees the returned slice.
+///
+/// Walks the chain one step at a time, scoping each step to the *current
+/// set* left by the previous step (seeded with just the root, so the first
+/// step — always `.descendant` — matches anywhere under it, reproducing
+/// single-step behavior). Each step's `:nth`/`[k]` is applied to that step's
+/// document-ordered candidates before the surviving picks become the current
+/// set for the next step — so `list:nth(2) > item` narrows to the 2nd list
+/// first, then matches only items that are direct children of *that* list.
 pub fn resolveAll(gpa: Allocator, ast: *const AST, selector: *const Selector) Allocator.Error![]Match {
+    // Membership in the "current set" established by the previous step.
+    // Sized by node id since ids are build order, not source order.
+    const current = try gpa.alloc(bool, ast.nodes.len);
+    defer gpa.free(current);
+    @memset(current, false);
+    current[ast.root] = true;
+
+    // Document-ordered candidates of the step currently being resolved;
+    // after the loop this holds the final step's surviving (nth-filtered)
+    // matches, already in document order.
+    var ordered: std.ArrayList(Node.Id) = .empty;
+    defer ordered.deinit(gpa);
+
+    for (selector.steps) |step| {
+        ordered.clearRetainingCapacity();
+        // Document order = pre-order DFS (node ids are build order, not
+        // source order, so we must traverse rather than sort by id).
+        try collectStep(gpa, ast, ast.root, false, current, &step, &ordered);
+
+        // Apply this step's `:nth`/`[k]` over its document-ordered
+        // candidates, before they become the scope for the next step.
+        if (step.matcher.nth) |k| {
+            if (k >= 1 and k <= ordered.items.len) {
+                const picked = ordered.items[k - 1];
+                ordered.clearRetainingCapacity();
+                try ordered.append(gpa, picked);
+            } else {
+                ordered.clearRetainingCapacity();
+            }
+        }
+
+        @memset(current, false);
+        for (ordered.items) |id| current[id] = true;
+    }
+
     var out: std.ArrayList(Match) = .empty;
     errdefer out.deinit(gpa);
-    // Document order = pre-order DFS (node ids are build order, not source
-    // order, so we must traverse rather than sort by id).
-    try collect(gpa, ast, ast.root, true, &selector.matcher, &out);
-
-    // Apply `:nth`/`[k]` after collecting, over the document-ordered matches.
-    if (selector.matcher.nth) |k| {
-        if (k >= 1 and k <= out.items.len) {
-            const picked = out.items[k - 1];
-            out.clearRetainingCapacity();
-            try out.append(gpa, picked);
-        } else {
-            out.clearRetainingCapacity();
-        }
+    for (ordered.items) |id| {
+        const node = ast.nodes[id];
+        try out.append(gpa, .{ .id = id, .span = node.span, .content_span = node.content_span });
     }
     return out.toOwnedSlice(gpa);
 }
 
-fn collect(gpa: Allocator, ast: *const AST, id: Node.Id, is_root: bool, m: *const Matcher, out: *std.ArrayList(Match)) Allocator.Error!void {
-    // The root `doc` node is a scope, never itself a match.
-    if (!is_root and try matches(gpa, ast, id, m)) {
-        const node = ast.nodes[id];
-        try out.append(gpa, .{ .id = id, .span = node.span, .content_span = node.content_span });
-    }
+/// Pre-order DFS that walks `id`'s subtree looking for candidates of `step`.
+/// `ancestor_in_current` is true when some strict ancestor of `id` is in
+/// `current` (the previous step's surviving set); together with `current`
+/// itself this gives, for each child `cid` of `id`, both flags the spec
+/// needs: `parent_in_current` is just `current[id]` (`id` *is* `cid`'s
+/// parent), and `ancestor_in_current` for `cid` is `ancestor_in_current(id)
+/// or current[id]`. A child is a candidate iff its scope flag — the parent
+/// one for `.child`, the ancestor one for `.descendant` — is true and it
+/// matches `step.matcher`. Only children are ever tested, so the root `doc`
+/// node (passed as the initial `id`) is a scope but never itself a
+/// candidate.
+fn collectStep(
+    gpa: Allocator,
+    ast: *const AST,
+    id: Node.Id,
+    ancestor_in_current: bool,
+    current: []const bool,
+    step: *const Step,
+    out: *std.ArrayList(Node.Id),
+) Allocator.Error!void {
+    const parent_in_current = current[id];
+    const child_ancestor_in_current = ancestor_in_current or parent_in_current;
     var c = ast.nodes[id].first_child;
     while (c) |cid| {
-        try collect(gpa, ast, cid, false, m, out);
+        const scoped = switch (step.combinator) {
+            .child => parent_in_current,
+            .descendant => child_ancestor_in_current,
+        };
+        if (scoped and try matches(gpa, ast, cid, &step.matcher)) {
+            try out.append(gpa, cid);
+        }
+        try collectStep(gpa, ast, cid, child_ancestor_in_current, current, step, out);
         c = ast.nodes[cid].next_sibling;
     }
 }
@@ -407,31 +512,68 @@ fn parseMd(a: Allocator, src: []const u8) !AST {
 }
 
 test "parse: kind, contains shorthand, :nth, and attribute predicates" {
+    // Single-step selectors parse to a one-element chain with `.descendant`
+    // — the shape existing (pre-combinator) callers rely on.
     var s1 = try parse(testing.allocator, "heading");
     defer s1.deinit();
-    try testing.expectEqualStrings("heading", s1.matcher.kind_name);
+    try testing.expectEqual(@as(usize, 1), s1.steps.len);
+    try testing.expectEqual(Combinator.descendant, s1.steps[0].combinator);
+    try testing.expectEqualStrings("heading", s1.steps[0].matcher.kind_name);
 
     var s2 = try parse(testing.allocator, "heading[level=2]");
     defer s2.deinit();
-    try testing.expectEqual(@as(usize, 1), s2.matcher.attrs.len);
-    try testing.expectEqualStrings("level", s2.matcher.attrs[0].key);
-    try testing.expectEqual(Op.eq, s2.matcher.attrs[0].op);
-    try testing.expectEqualStrings("2", s2.matcher.attrs[0].value);
+    try testing.expectEqual(@as(usize, 1), s2.steps[0].matcher.attrs.len);
+    try testing.expectEqualStrings("level", s2.steps[0].matcher.attrs[0].key);
+    try testing.expectEqual(Op.eq, s2.steps[0].matcher.attrs[0].op);
+    try testing.expectEqualStrings("2", s2.steps[0].matcher.attrs[0].value);
 
     var s3 = try parse(testing.allocator, "item[2]");
     defer s3.deinit();
-    try testing.expectEqual(@as(?usize, 2), s3.matcher.nth);
+    try testing.expectEqual(@as(?usize, 2), s3.steps[0].matcher.nth);
 
     var s4 = try parse(testing.allocator, "link[dest^=\"http\"]");
     defer s4.deinit();
-    try testing.expectEqual(Op.prefix, s4.matcher.attrs[0].op);
-    try testing.expectEqualStrings("http", s4.matcher.attrs[0].value);
+    try testing.expectEqual(Op.prefix, s4.steps[0].matcher.attrs[0].op);
+    try testing.expectEqualStrings("http", s4.steps[0].matcher.attrs[0].value);
 
     var s5 = try parse(testing.allocator, "heading(\"Status\")");
     defer s5.deinit();
-    try testing.expectEqualStrings("Status", s5.matcher.contains.?);
+    try testing.expectEqualStrings("Status", s5.steps[0].matcher.contains.?);
 
     try testing.expectError(error.InvalidSelector, parse(testing.allocator, ""));
+}
+
+test "parse: multi-step chains distinguish descendant and child combinators" {
+    var s1 = try parse(testing.allocator, "list > item");
+    defer s1.deinit();
+    try testing.expectEqual(@as(usize, 2), s1.steps.len);
+    try testing.expectEqual(Combinator.descendant, s1.steps[0].combinator);
+    try testing.expectEqual(Combinator.child, s1.steps[1].combinator);
+    try testing.expectEqualStrings("list", s1.steps[0].matcher.kind_name);
+    try testing.expectEqualStrings("item", s1.steps[1].matcher.kind_name);
+
+    var s2 = try parse(testing.allocator, "blockquote para");
+    defer s2.deinit();
+    try testing.expectEqual(@as(usize, 2), s2.steps.len);
+    try testing.expectEqual(Combinator.descendant, s2.steps[1].combinator);
+
+    // `>` needs no surrounding spaces.
+    var s3 = try parse(testing.allocator, "list>item");
+    defer s3.deinit();
+    try testing.expectEqual(@as(usize, 2), s3.steps.len);
+    try testing.expectEqual(Combinator.child, s3.steps[1].combinator);
+
+    // Per-step predicates still parse inside a chain.
+    var s4 = try parse(testing.allocator, "list:nth(2) > item(\"dishes\")");
+    defer s4.deinit();
+    try testing.expectEqual(@as(?usize, 2), s4.steps[0].matcher.nth);
+    try testing.expectEqualStrings("dishes", s4.steps[1].matcher.contains.?);
+}
+
+test "parse: dangling '>' and trailing junk are rejected" {
+    try testing.expectError(error.InvalidSelector, parse(testing.allocator, "list >"));
+    try testing.expectError(error.InvalidSelector, parse(testing.allocator, "list > "));
+    try testing.expectError(error.InvalidSelector, parse(testing.allocator, "list !bad"));
 }
 
 test "resolveAll: matches by kind across a real markdown tree" {
@@ -500,4 +642,80 @@ test "resolveAll: link destination prefix predicate" {
     defer testing.allocator.free(ms);
     try testing.expectEqual(@as(usize, 1), ms.len);
     try testing.expect(ast.nodes[ms[0].id].kind == .link);
+}
+
+test "resolveAll: descendant chain matches items nested at any depth under a list" {
+    // A list item can itself contain a nested list — `list item` must reach
+    // through that nesting, not just the outer list's direct children.
+    var ast = try parseMd(testing.allocator, "- a\n  - b\n- c\n");
+    defer ast.deinit();
+
+    var sel = try parse(testing.allocator, "list item");
+    defer sel.deinit();
+    const ms = try resolveAll(testing.allocator, &ast, &sel);
+    defer testing.allocator.free(ms);
+    try testing.expectEqual(@as(usize, 3), ms.len);
+
+    var texts: [3][]u8 = undefined;
+    for (ms, 0..) |m, i| texts[i] = try textOf(testing.allocator, &ast, m.id);
+    defer for (texts) |t| testing.allocator.free(t);
+    // `textOf` concatenates ALL descendant text, so item "a" (which contains
+    // the nested item "b") reads "ab"; only "b" and "c" are their own leaf.
+    try testing.expectEqualStrings("ab", texts[0]);
+    try testing.expectEqualStrings("b", texts[1]);
+    try testing.expectEqualStrings("c", texts[2]);
+}
+
+test "resolveAll: child combinator requires the immediate parent, unlike descendant" {
+    // `> - x` is a blockquote containing a list containing an item
+    // containing a paragraph: the paragraph's immediate parent is the list
+    // item, not the blockquote, so only the descendant form should reach it.
+    var ast = try parseMd(testing.allocator, "> - x\n");
+    defer ast.deinit();
+
+    var child_sel = try parse(testing.allocator, "blockquote > para");
+    defer child_sel.deinit();
+    const child_ms = try resolveAll(testing.allocator, &ast, &child_sel);
+    defer testing.allocator.free(child_ms);
+    try testing.expectEqual(@as(usize, 0), child_ms.len);
+
+    var desc_sel = try parse(testing.allocator, "blockquote para");
+    defer desc_sel.deinit();
+    const desc_ms = try resolveAll(testing.allocator, &ast, &desc_sel);
+    defer testing.allocator.free(desc_ms);
+    try testing.expectEqual(@as(usize, 1), desc_ms.len);
+    const txt = try textOf(testing.allocator, &ast, desc_ms[0].id);
+    defer testing.allocator.free(txt);
+    try testing.expectEqualStrings("x", txt);
+}
+
+test "resolveAll: per-step :nth scopes a later step to one specific ancestor" {
+    // Two lists; `list:nth(2) > item("dishes")` must pick "dishes" out of
+    // the SECOND list only, even though the word also could only appear once
+    // — the point is that step 1's nth narrows the scope step 2 searches in.
+    var ast = try parseMd(testing.allocator, "# Groceries\n\n- milk\n- eggs\n\n# Chores\n\n- dishes\n- laundry\n");
+    defer ast.deinit();
+
+    var sel = try parse(testing.allocator, "list:nth(2) > item(\"dishes\")");
+    defer sel.deinit();
+    const ms = try resolveAll(testing.allocator, &ast, &sel);
+    defer testing.allocator.free(ms);
+    try testing.expectEqual(@as(usize, 1), ms.len);
+    const txt = try textOf(testing.allocator, &ast, ms[0].id);
+    defer testing.allocator.free(txt);
+    try testing.expectEqualStrings("dishes", txt);
+
+    // Scoping to the FIRST list instead means "dishes" isn't there to find.
+    var none_sel = try parse(testing.allocator, "list:nth(1) > item(\"dishes\")");
+    defer none_sel.deinit();
+    const none_ms = try resolveAll(testing.allocator, &ast, &none_sel);
+    defer testing.allocator.free(none_ms);
+    try testing.expectEqual(@as(usize, 0), none_ms.len);
+
+    // Unscoped (no nth on step 1) still finds it via either list.
+    var any_sel = try parse(testing.allocator, "list > item(\"dishes\")");
+    defer any_sel.deinit();
+    const any_ms = try resolveAll(testing.allocator, &ast, &any_sel);
+    defer testing.allocator.free(any_ms);
+    try testing.expectEqual(@as(usize, 1), any_ms.len);
 }
