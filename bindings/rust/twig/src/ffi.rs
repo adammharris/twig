@@ -24,6 +24,14 @@ pub enum TwigFormat {
 
 pub enum TwigDocument {}
 
+/// C ABI mirror of Zig's `TwigSpan` — a byte range `[start, end)`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TwigSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
 unsafe extern "C" {
     pub fn twig_version() -> u32;
     pub fn twig_version_string() -> *const c_char;
@@ -37,6 +45,11 @@ unsafe extern "C" {
     pub fn twig_document_render_html(
         doc: *mut TwigDocument,
         out_ptr: *mut *const u8,
+        out_len: *mut usize,
+    ) -> TwigStatus;
+    pub fn twig_document_code_spans(
+        doc: *mut TwigDocument,
+        out_ptr: *mut *const TwigSpan,
         out_len: *mut usize,
     ) -> TwigStatus;
 }

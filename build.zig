@@ -73,7 +73,16 @@ pub fn build(b: *std.Build) void {
 
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // The C ABI (`src/c_abi.zig`) isn't imported by `mod` or `exe`, so it
+    // needs its own test artifact to be covered by `zig build test`.
+    const c_lib_tests = b.addTest(.{
+        .root_module = c_lib.root_module,
+    });
+
+    const run_c_lib_tests = b.addRunArtifact(c_lib_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_c_lib_tests.step);
 }

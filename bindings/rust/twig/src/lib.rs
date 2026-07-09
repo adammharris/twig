@@ -1,9 +1,11 @@
 mod error;
 mod ffi;
 
+use std::ops::Range;
 use std::ptr::NonNull;
 
 pub use error::Error;
+pub use ffi::TwigSpan as Span;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Format {
@@ -78,6 +80,26 @@ impl Document {
         let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
         Ok(bytes.to_vec())
     }
+
+    /// The byte ranges in this document's source that are code, not prose:
+    /// inline code spans, fenced/indented code blocks, and raw inline/block
+    /// escapes. Meant for filtering a caller's own plain-text scan for
+    /// link-like constructs (e.g. a wikilink `[[...]]`) down to the matches
+    /// that are not actually inside code.
+    pub fn code_spans(&mut self) -> Result<Vec<Range<usize>>, Error> {
+        let mut ptr = std::ptr::null();
+        let mut len = 0usize;
+        let status = unsafe { ffi::twig_document_code_spans(self.raw.as_ptr(), &mut ptr, &mut len) };
+        Error::from_status(status)?;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        if ptr.is_null() {
+            return Err(Error::Internal);
+        }
+        let spans = unsafe { std::slice::from_raw_parts(ptr, len) };
+        Ok(spans.iter().map(|s| s.start..s.end).collect())
+    }
 }
 
 impl Drop for Document {
@@ -95,5 +117,19 @@ mod tests {
         let mut doc = Document::parse_str("# hi\n", Format::Markdown).expect("parse markdown");
         let html = doc.render_html().expect("render html");
         assert_eq!(String::from_utf8_lossy(&html), "<h1>hi</h1>\n");
+    }
+
+    #[test]
+    fn code_spans_cover_verbatim_and_code_blocks_but_not_prose() {
+        let source = "prose `code` more prose\n\n```\nblock\n```\n\ntail prose\n";
+        let mut doc = Document::parse_str(source, Format::Markdown).expect("parse markdown");
+        let spans = doc.code_spans().expect("code spans");
+
+        assert_eq!(spans.len(), 2, "one inline code span, one fenced code block");
+        for span in &spans {
+            let text = &source[span.clone()];
+            assert!(!text.contains("prose"), "span {span:?} unexpectedly covers prose: {text:?}");
+        }
+        assert!(spans.iter().any(|s| &source[s.clone()] == "`code`"));
     }
 }
