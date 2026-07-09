@@ -61,9 +61,10 @@ project to `fig` (which does the same for config formats).
   `resolveAll`/`resolveOne`/`textOf` + `AST.pathOf` (id → path). `twig query`
   lists matches as `[path] kind "preview"`; `twig edit` accepts a selector
   anywhere it takes a path (auto-detected — all-digits-and-dots = index path,
-  else selector), refusing an ambiguous match with a candidate list. NOT yet:
-  combinators (`a b`, `a > b`) and `section("Title")` — both layer on this same
-  engine next.
+  else selector), refusing an ambiguous match with a candidate list. Descendant
+  (`a b`) and child (`a > b`) combinators work, with per-step `:nth` scoping
+  (`list:nth(2) > item("dishes")` = that bullet in the 2nd list only). NOT yet:
+  `section("Title")` — layers on this same engine (needs a small CLI span-wire).
 
 ## Test status
 
@@ -111,8 +112,10 @@ divergences from issues #1/#3 below — i.e. remaining markdown work is render-s
 3. **Markdown inline spans** (unblocks the headline `link[dest^=…]` / emphasis
    edits) — make `markdown/inline.zig` set each inline node's source span so the
    `NoNodeSpan` guard stops firing. High value, self-contained.
-4. **Selector combinators + `section("Title")`** — descendant/child combinators
-   (`a b`, `a > b`) and the section form, both layering on `ast/select.zig`.
+4. **`section("Title")` selector** — "edit everything under a heading"; layers on
+   `ast/select.zig` (heading → section span) plus a small CLI change so the edit
+   uses the Match's section span rather than the heading node's own. (Descendant/
+   child combinators already landed.)
 5. **Editor increment 2** — the original motivation is now landed (increment 1:
    index-path splice ops + `twig edit`; plus content-based selectors). Next:
    per-field spans (so a `link` destination or `code_block`
