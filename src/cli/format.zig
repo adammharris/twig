@@ -17,6 +17,8 @@ const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 
 const twig = @import("twig");
+const djot_serializer = twig.Djot.serializer;
+const markdown_serializer = twig.Markdown.serializer;
 
 /// Every language Twig can PARSE. This is the `-i`/`--input` vocabulary and
 /// the enum `ParsedDoc` is tagged by — see `registry` below for what each
@@ -41,6 +43,30 @@ pub const OutputMode = enum { html, ast, canonical };
 
 pub fn parseOutputMode(name: []const u8) ?OutputMode {
     return std.meta.stringToEnum(OutputMode, name);
+}
+
+/// What `-o`/`--output` resolved to: `mode` is always one of the three
+/// `OutputMode`s, plus (only ever set alongside `.canonical`) an explicit
+/// TARGET language when `-o` named one directly (e.g. `-o djot`) rather than
+/// the literal word `canonical` — which means "serialize back to whatever
+/// `-i` was", same format in, same format out. `-o <format-name>` is
+/// `.canonical` plus "but serialize as `<format-name>` even if that's not
+/// the input format", the cross-format `convert` path (`actions.zig`'s
+/// `convertSource`).
+pub const OutputTarget = struct {
+    mode: OutputMode,
+    format: ?InputFormat = null,
+};
+
+/// Parse an `-o`/`--output` value against both vocabularies it accepts:
+/// `OutputMode`'s own names (`html`, `ast`, `canonical`) first, then every
+/// `registry` entry's format name/aliases (`djot`/`dj`, `markdown`/`md`,
+/// `xml`) as a request to convert TO that format. Returns `null` when `name`
+/// matches neither, so the caller can print a diagnostic listing both.
+pub fn parseOutputTarget(name: []const u8) ?OutputTarget {
+    if (parseOutputMode(name)) |mode| return .{ .mode = mode };
+    if (parseFormatName(name)) |fmt| return .{ .mode = .canonical, .format = fmt };
+    return null;
 }
 
 /// A parsed document, tagged by which `InputFormat` produced it. Exists
@@ -145,6 +171,24 @@ fn serializeCanonicalXml(allocator: Allocator, doc: *const ParsedDoc) anyerror![
     return twig.Xml.serializeAlloc(allocator, doc.ast());
 }
 
+fn serializeCanonicalDjot(allocator: Allocator, doc: *const ParsedDoc) anyerror![]u8 {
+    return djot_serializer.serializeAlloc(allocator, &doc.djot);
+}
+
+fn serializeCanonicalMarkdown(allocator: Allocator, doc: *const ParsedDoc) anyerror![]u8 {
+    return markdown_serializer.serializeAlloc(allocator, &doc.markdown);
+}
+
+
+
+fn serializeFromAstDjot(allocator: Allocator, ast: *const twig.AST) anyerror![]u8 {
+    return djot_serializer.serializeAstAlloc(allocator, ast);
+}
+
+fn serializeFromAstMarkdown(allocator: Allocator, ast: *const twig.AST) anyerror![]u8 {
+    return markdown_serializer.serializeAstAlloc(allocator, ast);
+}
+
 /// One entry per `InputFormat`. This IS the extensibility point the CLI is
 /// built around: a new language is a new `parse`/`renderHtml` adapter pair
 /// (plus `serializeCanonical` if it has a serializer) and one more line here
@@ -168,10 +212,18 @@ pub const FormatEntry = struct {
     renderHtml: *const fn (Allocator, *const ParsedDoc, *Writer) anyerror!void,
     /// Round-trip serializer back to this format's own source syntax —
     /// `convert -o canonical`'s implementation. `null` means the language has
-    /// no serializer yet (djot, markdown today); `actions.zig` turns that
-    /// into a clear "not supported yet" error rather than a crash, and
-    /// wiring one up later is exactly one field here, no dispatch changes.
+    /// no serializer yet; `actions.zig` turns that into a clear "not supported
+    /// yet" error rather than a crash.
     serializeCanonical: ?*const fn (Allocator, *const ParsedDoc) anyerror![]u8 = null,
+    /// Serialize a BARE shared `AST` (regardless of which format parsed it)
+    /// as this format's own source syntax — `convert -o <format>`'s
+    /// cross-format implementation (e.g. `-i markdown -o djot`). Unlike
+    /// `serializeCanonical`, this never needs a matching `ParsedDoc` variant:
+    /// it's handed whatever `ParsedDoc.ast()` returns and builds any side
+    /// tables it needs from that bare tree (see `Djot.serializer
+    /// .serializeAstAlloc`/`Markdown.serializer.serializeAstAlloc`). `null`
+    /// means the language has no serializer yet, same as `serializeCanonical`.
+    serializeFromAst: ?*const fn (Allocator, *const twig.AST) anyerror![]u8 = null,
 };
 
 pub const registry = [_]FormatEntry{
@@ -182,6 +234,8 @@ pub const registry = [_]FormatEntry{
         .parse = parseDjot,
         .parseToAst = parseToAstDjot,
         .renderHtml = renderHtmlDjot,
+        .serializeCanonical = serializeCanonicalDjot,
+        .serializeFromAst = serializeFromAstDjot,
     },
     .{
         .id = .markdown,
@@ -190,6 +244,8 @@ pub const registry = [_]FormatEntry{
         .parse = parseMarkdown,
         .parseToAst = parseToAstMarkdown,
         .renderHtml = renderHtmlMarkdown,
+        .serializeCanonical = serializeCanonicalMarkdown,
+        .serializeFromAst = serializeFromAstMarkdown,
     },
     .{
         .id = .xml,
@@ -198,6 +254,13 @@ pub const registry = [_]FormatEntry{
         .parseToAst = parseToAstXml,
         .renderHtml = renderHtmlGeneric,
         .serializeCanonical = serializeCanonicalXml,
+        // No `serializeFromAst`: XML's serializer only understands the
+        // generic-markup kinds (`element`/`comment`/`doctype`/...) its own
+        // parser produces (see `xml/serializer.zig`'s `else => unreachable`);
+        // it has no mapping for djot/Markdown's semantic kinds
+        // (`heading`/`emph`/`link`/...), so cross-format conversion INTO xml
+        // from another format isn't meaningful yet — same-format `-o
+        // canonical`/`-o xml` (via `serializeCanonical` above) still works.
     },
 };
 

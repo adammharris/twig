@@ -1,0 +1,506 @@
+//! `Markdown.Document` -> canonical-ish Markdown text.
+//!
+//! This is a structural printer from the shared `AST`, not a source-preserving
+//! re-emitter: it writes one stable representation for each node kind.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Writer = std.Io.Writer;
+const markdown = @import("markdown.zig");
+const Document = markdown.Document;
+const AST = markdown.AST;
+const Node = AST.Node;
+
+const Ctx = struct {
+    indent: usize = 0,
+    quote_depth: usize = 0,
+};
+
+const Renderer = struct {
+    allocator: Allocator,
+    doc: *const Document,
+    ast: *const AST,
+    writer: *Writer,
+
+    fn writePrefix(self: *Renderer, ctx: Ctx) Writer.Error!void {
+        var i: usize = 0;
+        while (i < ctx.quote_depth) : (i += 1) try self.writer.writeAll("> ");
+        i = 0;
+        while (i < ctx.indent) : (i += 1) try self.writer.writeByte(' ');
+    }
+
+    fn renderBlocks(self: *Renderer, parent: Node.Id, ctx: Ctx, blank_between: bool) Writer.Error!void {
+        var it = self.ast.children(parent);
+        try self.renderBlocksFrom(&it, ctx, blank_between, true);
+    }
+
+    /// Like `renderBlocks`, but driven by an already-positioned iterator
+    /// (e.g. one seeded past a list item's first child — see
+    /// `renderListItem`) rather than always starting from a parent's first
+    /// child. `first` marks whether the NEXT node `it` yields is the first
+    /// block of the item/container overall: when it isn't (the list-item
+    /// case, where a leading paragraph was already written on the marker's
+    /// line), `blank_between` still puts a blank line before it, matching a
+    /// loose list's spacing.
+    fn renderBlocksFrom(self: *Renderer, it: *AST.ChildIterator, ctx: Ctx, blank_between: bool, first: bool) Writer.Error!void {
+        var is_first = first;
+        while (it.next()) |child| {
+            if (!is_first and blank_between) try self.writer.writeByte('\n');
+            try self.renderBlock(child.id, ctx);
+            is_first = false;
+        }
+    }
+
+    fn renderInlineChildren(self: *Renderer, parent: Node.Id) Writer.Error!void {
+        var it = self.ast.children(parent);
+        while (it.next()) |child| try self.renderInline(child.id);
+    }
+
+    fn fenceTicks(text: []const u8, min: usize) usize {
+        var best = min;
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            if (text[i] != '`') continue;
+            var j = i;
+            while (j < text.len and text[j] == '`') : (j += 1) {}
+            const run = j - i;
+            if (run >= best) best = run + 1;
+            i = j;
+        }
+        return best;
+    }
+
+    fn writeCodeFence(self: *Renderer, ctx: Ctx, info: ?[]const u8, text: []const u8) Writer.Error!void {
+        const ticks = fenceTicks(text, 3);
+        try self.writePrefix(ctx);
+        var i: usize = 0;
+        while (i < ticks) : (i += 1) try self.writer.writeByte('`');
+        if (info) |s| {
+            if (s.len > 0) {
+                try self.writer.writeByte(' ');
+                try self.writer.writeAll(s);
+            }
+        }
+        try self.writer.writeByte('\n');
+        if (text.len > 0) try self.writer.writeAll(text);
+        if (text.len == 0 or text[text.len - 1] != '\n') try self.writer.writeByte('\n');
+        try self.writePrefix(ctx);
+        i = 0;
+        while (i < ticks) : (i += 1) try self.writer.writeByte('`');
+        try self.writer.writeByte('\n');
+    }
+
+    fn renderListItem(self: *Renderer, item_id: Node.Id, marker: []const u8, ctx: Ctx, tight: bool) Writer.Error!void {
+        try self.writePrefix(ctx);
+        try self.writer.writeAll(marker);
+
+        const first = self.ast.nodes[item_id].first_child orelse {
+            try self.writer.writeByte('\n');
+            return;
+        };
+        const item_ctx: Ctx = .{ .indent = ctx.indent + 2, .quote_depth = ctx.quote_depth };
+        // A leading paragraph always starts on the marker's own line (`- text`,
+        // never `- \n  text`), whether the list is tight or loose. Tight
+        // lists with exactly that one paragraph stop right there; everything
+        // else (a loose list's first paragraph, or any later sibling block)
+        // falls through to `renderBlocksFrom`.
+        if (self.ast.nodes[first].kind == .para) {
+            try self.renderInlineChildren(first);
+            try self.writer.writeByte('\n');
+            if (tight and self.ast.nodes[first].next_sibling == null) return;
+            var it: AST.ChildIterator = .{ .ast = self.ast, .next_id = self.ast.nodes[first].next_sibling };
+            try self.renderBlocksFrom(&it, item_ctx, !tight, false);
+            return;
+        }
+
+        try self.writer.writeByte('\n');
+        try self.renderBlocks(item_id, item_ctx, !tight);
+    }
+
+    fn renderReferenceDefs(self: *Renderer) Writer.Error!void {
+        var saw_any = false;
+        for (self.ast.nodes) |n| {
+            if (n.kind != .reference) continue;
+            const lab = n.kind.reference.label;
+            const id = self.doc.link_references.get(lab) orelse continue;
+            if (id != n.id) continue;
+            if (!saw_any) saw_any = true else try self.writer.writeByte('\n');
+            try self.writer.print("[{s}]: {s}", .{ lab, n.kind.reference.destination });
+            if (self.ast.attrsOf(id).get("title")) |title| {
+                try self.writer.print(" \"{s}\"", .{title});
+            }
+            try self.writer.writeByte('\n');
+        }
+    }
+
+    fn renderFootnoteDefs(self: *Renderer) Writer.Error!void {
+        var saw_any = false;
+        for (self.ast.nodes) |n| {
+            if (n.kind != .footnote) continue;
+            const lab = n.kind.footnote.label;
+            const id = self.doc.footnotes.get(lab) orelse continue;
+            if (id != n.id) continue;
+            if (!saw_any) saw_any = true else try self.writer.writeByte('\n');
+            try self.writer.print("[^{s}]: ", .{lab});
+            const first = n.first_child;
+            if (first) |_| {
+                // Keep definitions parseable while staying simple.
+                var out: Writer.Allocating = .init(self.allocator);
+                defer out.deinit();
+                var inner = Renderer{
+                    .allocator = self.allocator,
+                    .doc = self.doc,
+                    .ast = self.ast,
+                    .writer = &out.writer,
+                };
+                try inner.renderBlocks(n.id, .{}, false);
+                const body = out.written();
+                const trimmed = std.mem.trimEnd(u8, body, "\n");
+                try self.writer.writeAll(trimmed);
+            }
+            try self.writer.writeByte('\n');
+        }
+    }
+
+    fn renderBlock(self: *Renderer, id: Node.Id, ctx: Ctx) Writer.Error!void {
+        const node = self.ast.nodes[id];
+        switch (node.kind) {
+            .doc => try self.renderBlocks(id, ctx, true),
+            .section => try self.renderBlocks(id, ctx, true),
+            .para => {
+                try self.writePrefix(ctx);
+                try self.renderInlineChildren(id);
+                try self.writer.writeByte('\n');
+            },
+            .heading => |h| {
+                try self.writePrefix(ctx);
+                var i: u32 = 0;
+                while (i < h.level) : (i += 1) try self.writer.writeByte('#');
+                try self.writer.writeByte(' ');
+                try self.renderInlineChildren(id);
+                try self.writer.writeByte('\n');
+            },
+            .thematic_break => {
+                try self.writePrefix(ctx);
+                try self.writer.writeAll("---\n");
+            },
+            .block_quote => try self.renderBlocks(id, .{ .indent = ctx.indent, .quote_depth = ctx.quote_depth + 1 }, true),
+            .bullet_list => |bl| {
+                const marker: []const u8 = switch (bl.style) {
+                    .dash => "- ",
+                    .plus => "+ ",
+                    .star => "* ",
+                };
+                var it = self.ast.children(id);
+                var first = true;
+                while (it.next()) |item| {
+                    if (!first and !bl.tight) try self.writer.writeByte('\n');
+                    try self.renderListItem(item.id, marker, ctx, bl.tight);
+                    first = false;
+                }
+            },
+            .ordered_list => |ol| {
+                var n: u32 = ol.start orelse 1;
+                var it = self.ast.children(id);
+                var first = true;
+                while (it.next()) |item| {
+                    if (!first and !ol.tight) try self.writer.writeByte('\n');
+                    var buf: [24]u8 = undefined;
+                    const num = std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable;
+                    var marker_buf: [32]u8 = undefined;
+                    const marker = switch (ol.style.delim) {
+                        .period => std.fmt.bufPrint(&marker_buf, "{s}. ", .{num}) catch unreachable,
+                        .paren_after => std.fmt.bufPrint(&marker_buf, "{s}) ", .{num}) catch unreachable,
+                        .paren_both => std.fmt.bufPrint(&marker_buf, "({s}) ", .{num}) catch unreachable,
+                    };
+                    try self.renderListItem(item.id, marker, ctx, ol.tight);
+                    n += 1;
+                    first = false;
+                }
+            },
+            .task_list => |tl| {
+                var it = self.ast.children(id);
+                var first = true;
+                while (it.next()) |item| {
+                    if (!first and !tl.tight) try self.writer.writeByte('\n');
+                    const checked = switch (self.ast.nodes[item.id].kind) {
+                        .task_list_item => |v| v.checked,
+                        else => false,
+                    };
+                    const marker = if (checked) "- [x] " else "- [ ] ";
+                    try self.renderListItem(item.id, marker, ctx, tl.tight);
+                    first = false;
+                }
+            },
+            .definition_list => {
+                var it = self.ast.children(id);
+                while (it.next()) |dli| {
+                    var kid = self.ast.nodes[dli.id].first_child;
+                    while (kid) |cid| : (kid = self.ast.nodes[cid].next_sibling) {
+                        switch (self.ast.nodes[cid].kind) {
+                            .term => {
+                                try self.writePrefix(ctx);
+                                try self.renderInlineChildren(cid);
+                                try self.writer.writeByte('\n');
+                            },
+                            .definition => {
+                                try self.writePrefix(ctx);
+                                try self.writer.writeAll(": ");
+                                const first = self.ast.nodes[cid].first_child;
+                                if (first) |f| {
+                                    if (self.ast.nodes[f].kind == .para and self.ast.nodes[f].next_sibling == null) {
+                                        try self.renderInlineChildren(f);
+                                        try self.writer.writeByte('\n');
+                                    } else {
+                                        try self.writer.writeByte('\n');
+                                        try self.renderBlocks(cid, .{ .indent = ctx.indent + 2, .quote_depth = ctx.quote_depth }, true);
+                                    }
+                                } else try self.writer.writeByte('\n');
+                            },
+                            else => {},
+                        }
+                    }
+                }
+            },
+            .table => {
+                var row_it = self.ast.children(id);
+                var saw_header = false;
+                while (row_it.next()) |row| {
+                    if (self.ast.nodes[row.id].kind == .caption) continue;
+                    try self.writePrefix(ctx);
+                    try self.writer.writeByte('|');
+                    var cell_it = self.ast.children(row.id);
+                    while (cell_it.next()) |cell| {
+                        try self.writer.writeByte(' ');
+                        try self.renderInlineChildren(cell.id);
+                        try self.writer.writeAll(" |");
+                    }
+                    try self.writer.writeByte('\n');
+
+                    if (!saw_header and self.ast.nodes[row.id].kind.row.head) {
+                        saw_header = true;
+                        try self.writePrefix(ctx);
+                        try self.writer.writeByte('|');
+                        var ac_it = self.ast.children(row.id);
+                        while (ac_it.next()) |cell| {
+                            const al = self.ast.nodes[cell.id].kind.cell.alignment;
+                            const delim: []const u8 = switch (al) {
+                                .left => ":---",
+                                .right => "---:",
+                                .center => ":---:",
+                                .default => "---",
+                            };
+                            try self.writer.print(" {s} |", .{delim});
+                        }
+                        try self.writer.writeByte('\n');
+                    }
+                }
+            },
+            .code_block => |cb| try self.writeCodeFence(ctx, cb.lang, cb.text),
+            .raw_block => |rb| try self.writeCodeFence(ctx, rb.format, rb.text),
+            .div => {
+                try self.writePrefix(ctx);
+                try self.writer.writeAll("::: \n");
+                try self.renderBlocks(id, .{ .indent = ctx.indent + 2, .quote_depth = ctx.quote_depth }, true);
+                try self.writePrefix(ctx);
+                try self.writer.writeAll(":::\n");
+            },
+            .reference => {},
+            .footnote => {},
+            .element => |e| {
+                try self.writePrefix(ctx);
+                try self.writer.print("<{s}>", .{e.name});
+                try self.renderBlocks(id, ctx, false);
+                try self.writer.print("</{s}>\n", .{e.name});
+            },
+            .comment => |c| {
+                try self.writePrefix(ctx);
+                try self.writer.print("<!--{s}-->\n", .{c});
+            },
+            .doctype => |d| {
+                try self.writePrefix(ctx);
+                try self.writer.print("<!DOCTYPE{s}>\n", .{d});
+            },
+            .processing_instruction => |pi| {
+                try self.writePrefix(ctx);
+                if (pi.data.len == 0) try self.writer.print("<?{s}?>\n", .{pi.target}) else try self.writer.print("<?{s} {s}?>\n", .{ pi.target, pi.data });
+            },
+            .cdata => |cd| {
+                try self.writePrefix(ctx);
+                try self.writer.print("<![CDATA[{s}]]>\n", .{cd});
+            },
+            .list_item, .task_list_item, .definition_list_item, .term, .definition, .row, .cell, .caption => {
+                try self.renderBlocks(id, ctx, false);
+            },
+            else => {
+                try self.writePrefix(ctx);
+                try self.renderInline(id);
+                try self.writer.writeByte('\n');
+            },
+        }
+    }
+
+    fn renderInline(self: *Renderer, id: Node.Id) Writer.Error!void {
+        const node = self.ast.nodes[id];
+        switch (node.kind) {
+            .str => |s| try self.writer.writeAll(s),
+            .soft_break => try self.writer.writeByte('\n'),
+            .hard_break => try self.writer.writeAll("  \n"),
+            .non_breaking_space => try self.writer.writeAll("&nbsp;"),
+            .symb => |s| try self.writer.print(":{s}:", .{s}),
+            .verbatim => |v| {
+                const ticks = fenceTicks(v, 1);
+                var i: usize = 0;
+                while (i < ticks) : (i += 1) try self.writer.writeByte('`');
+                try self.writer.writeAll(v);
+                i = 0;
+                while (i < ticks) : (i += 1) try self.writer.writeByte('`');
+            },
+            .raw_inline => |r| try self.writer.writeAll(r.text),
+            .inline_math => |m| try self.writer.print("${s}$", .{m}),
+            .display_math => |m| try self.writer.print("$$\n{s}\n$$", .{m}),
+            .url => |u| try self.writer.print("<{s}>", .{u}),
+            .email => |e| try self.writer.print("<{s}>", .{e}),
+            .footnote_reference => |lab| try self.writer.print("[^{s}]", .{lab}),
+            .smart_punctuation => |sp| try self.writer.writeAll(sp.text),
+            .emph => {
+                try self.writer.writeByte('*');
+                try self.renderInlineChildren(id);
+                try self.writer.writeByte('*');
+            },
+            .strong => {
+                try self.writer.writeAll("**");
+                try self.renderInlineChildren(id);
+                try self.writer.writeAll("**");
+            },
+            .link => |l| {
+                try self.writer.writeByte('[');
+                try self.renderInlineChildren(id);
+                try self.writer.writeByte(']');
+                if (l.destination) |dest| try self.writer.print("({s})", .{dest}) else if (l.reference) |lab| try self.writer.print("[{s}]", .{lab});
+            },
+            .image => |im| {
+                try self.writer.writeAll("![");
+                try self.renderInlineChildren(id);
+                try self.writer.writeByte(']');
+                if (im.destination) |dest| try self.writer.print("({s})", .{dest}) else if (im.reference) |lab| try self.writer.print("[{s}]", .{lab});
+            },
+            .span => try self.renderInlineChildren(id),
+            .mark => {
+                try self.writer.writeAll("==");
+                try self.renderInlineChildren(id);
+                try self.writer.writeAll("==");
+            },
+            .superscript => {
+                try self.writer.writeByte('^');
+                try self.renderInlineChildren(id);
+                try self.writer.writeByte('^');
+            },
+            .subscript => {
+                try self.writer.writeByte('~');
+                try self.renderInlineChildren(id);
+                try self.writer.writeByte('~');
+            },
+            .insert => {
+                try self.writer.writeAll("{+");
+                try self.renderInlineChildren(id);
+                try self.writer.writeAll("+}");
+            },
+            .delete => {
+                try self.writer.writeAll("~~");
+                try self.renderInlineChildren(id);
+                try self.writer.writeAll("~~");
+            },
+            .double_quoted => {
+                try self.writer.writeByte('"');
+                try self.renderInlineChildren(id);
+                try self.writer.writeByte('"');
+            },
+            .single_quoted => {
+                try self.writer.writeByte('\'');
+                try self.renderInlineChildren(id);
+                try self.writer.writeByte('\'');
+            },
+            else => try self.renderInlineChildren(id),
+        }
+    }
+};
+
+pub fn serialize(allocator: Allocator, doc: *const Document, writer: *Writer) Writer.Error!void {
+    var r = Renderer{ .allocator = allocator, .doc = doc, .ast = &doc.ast, .writer = writer };
+    try r.renderBlock(doc.ast.root, .{});
+
+    var out: Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var defs = Renderer{ .allocator = allocator, .doc = doc, .ast = &doc.ast, .writer = &out.writer };
+    try defs.renderReferenceDefs();
+    try defs.renderFootnoteDefs();
+    const tail = out.written();
+    if (tail.len != 0) {
+        if (doc.ast.nodes[doc.ast.root].first_child != null) try writer.writeByte('\n');
+        try writer.writeAll(tail);
+    }
+}
+
+pub fn serializeAlloc(allocator: Allocator, doc: *const Document) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    serialize(allocator, doc, &out.writer) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    return out.toOwnedSlice();
+}
+
+/// Serialize a bare, language-agnostic `AST` (e.g. one produced by a
+/// DIFFERENT format's parser, for `twig convert -o markdown` cross-format
+/// conversion) as Markdown text. Mirrors `djot/serializer.zig`'s
+/// `serializeAstAlloc`: no `Document` with Markdown's side tables to
+/// consult, so this builds a throwaway one by scanning `ast` directly for
+/// `reference`/`footnote`-kind nodes and keying them by their own `.label`
+/// payload. `ast` is only shallow-copied into the temporary `Document`
+/// (never `deinit`'d through it) — the caller keeps owning it.
+pub fn serializeAstAlloc(allocator: Allocator, ast: *const AST) Allocator.Error![]u8 {
+    var link_references: std.StringHashMapUnmanaged(AST.Node.Id) = .empty;
+    defer link_references.deinit(allocator);
+    var footnotes: std.StringHashMapUnmanaged(AST.Node.Id) = .empty;
+    defer footnotes.deinit(allocator);
+
+    for (ast.nodes) |n| {
+        switch (n.kind) {
+            .reference => |r| try link_references.put(allocator, r.label, n.id),
+            .footnote => |f| try footnotes.put(allocator, f.label, n.id),
+            else => {},
+        }
+    }
+
+    const doc: Document = .{ .ast = ast.*, .link_references = link_references, .footnotes = footnotes };
+    return serializeAlloc(allocator, &doc);
+}
+
+const testing = std.testing;
+
+test "serializeAlloc renders basic markdown blocks" {
+    var doc = try markdown.parse(testing.allocator, "# hi\n\ntext\n", .commonmark);
+    defer doc.deinit();
+    const out = try serializeAlloc(testing.allocator, &doc);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "# hi") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "text") != null);
+}
+
+test "serializeAlloc includes detached link-reference definitions" {
+    var doc = try markdown.parse(testing.allocator, "[x][a]\n\n[a]: /u \"t\"\n", .commonmark);
+    defer doc.deinit();
+    const out = try serializeAlloc(testing.allocator, &doc);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "[a]: /u") != null);
+}
+
+test "serializeAlloc: a loose bullet list's first paragraph starts on the marker's line, not a bare marker + newline" {
+    var doc = try markdown.parse(testing.allocator, "- one\n  two\n\n- three\n", .commonmark);
+    defer doc.deinit();
+    const out = try serializeAlloc(testing.allocator, &doc);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "- one\ntwo\n\n- three\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "- \n") == null);
+}

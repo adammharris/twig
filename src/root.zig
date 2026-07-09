@@ -14,7 +14,7 @@ pub const AST = @import("ast/ast.zig");
 
 /// Djot support: `Djot.parse(allocator, source) !Djot.Document` (the shared
 /// `AST` plus djot's reference/footnote side tables) plus `Djot.html` for
-/// rendering. See `languages/djot/djot.zig`'s module doc comment.
+/// HTML rendering. See `languages/djot/djot.zig`'s module doc comment.
 pub const Djot = @import("languages/djot/djot.zig");
 
 /// XML support: `Xml.parse(allocator, source) !AST` (well-formed XML 1.0, no
@@ -34,10 +34,9 @@ pub const Html = @import("languages/html/html.zig");
 
 /// Markdown support: `Markdown.parse(allocator, source, options) !Markdown.Document`
 /// (the shared `AST` plus Markdown's link-reference-definition side table)
-/// plus `Markdown.ParseOptions` for the (currently Phase-1-only) feature
-/// flags. Rendering reuses `Html`, the same shared printer XML/djot prove
-/// against. See `languages/markdown/markdown.zig`'s module doc comment for
-/// the Phase 1/2/3 scope split.
+/// plus `Markdown.ParseOptions` feature flags. Rendering uses
+/// `Markdown.html` (an adapter over the shared `Html` printer). See
+/// `languages/markdown/markdown.zig`'s module doc comment for scope details.
 pub const Markdown = @import("languages/markdown/markdown.zig");
 
 /// The span-splice editor: lossless, in-place edits to a parsed document via

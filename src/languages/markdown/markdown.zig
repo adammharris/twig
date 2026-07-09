@@ -64,6 +64,7 @@ const inline_mod = @import("inline.zig");
 pub const AST = @import("../../ast/ast.zig");
 pub const ParseOptions = @import("options.zig");
 pub const html = @import("html.zig");
+pub const serializer = @import("serializer.zig");
 
 pub const Parser = block.Parser;
 

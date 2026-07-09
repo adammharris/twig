@@ -42,7 +42,7 @@ project to `fig` (which does the same for config formats).
   canonical] <file|->`, `twig identify`, and `twig edit`. Extension inference +
   `-i` override; extensible format registry (one entry per language — `parse`,
   `parseToAst`, `renderHtml`, optional `serializeCanonical`). `-o ast` = pretty
-  JSON dump; `-o canonical` = round-trip (XML only so far).
+  JSON dump; `-o canonical` = round-trip serializer (XML, Djot, Markdown).
 - **Editor** (`src/ast/editor.zig`, reader path-nav, `twig edit`) — the
   span-splice layer: lossless in-place edits via index paths. Primitive
   `replaceAtSpan` (splice → reparse → byte-for-byte rollback on failure); ops
@@ -122,5 +122,4 @@ divergences from issues #1/#3 below — i.e. remaining markdown work is render-s
    lang is editable without whole-node replace); smart delete (whitespace/
    separator cleanup); move/reorder ops; richer container interiors so
    empty-container inserts work everywhere.
-5. **CLI follow-ups** — wire Markdown into `-o canonical` once a markdown
-   serializer exists; add HTML as an input format once the parser lands.
+5. **CLI follow-ups** — add HTML as an input format once the parser lands.

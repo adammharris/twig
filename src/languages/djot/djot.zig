@@ -23,6 +23,7 @@ const parser = @import("parser.zig");
 
 pub const AST = @import("../../ast/ast.zig");
 pub const html = @import("html.zig");
+pub const serializer = @import("serializer.zig");
 
 /// A parsed djot document: the language-neutral `AST` plus the label ->
 /// definition-node maps djot's render-time reference resolution needs.

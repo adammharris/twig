@@ -117,12 +117,17 @@ pub fn runIdentify(stdout: *Writer, opts: args_mod.IdentifyOptions) !void {
 ///                    adapters.
 ///   - `.ast`       — `ast_json.encode`, a stable pretty-printed JSON dump
 ///                    of the shared `AST`.
-///   - `.canonical` — the format's own round-trip serializer
-///                    (`format.FormatEntry.serializeCanonical`), or a clear
-///                    "not supported yet" error when the format has none.
+///   - `.canonical` — by default, the INPUT format's own round-trip
+///                    serializer (`format.FormatEntry.serializeCanonical`);
+///                    when `opts.output_format` names a different format
+///                    (`-o djot`/`-o markdown`/`-o xml` rather than the bare
+///                    word `canonical`), cross-format conversion through
+///                    that format's `serializeFromAst` instead — either way,
+///                    a clear "not supported yet" error when the target
+///                    format has no serializer.
 pub fn runConvert(allocator: Allocator, io: Io, stdout: *Writer, stderr: *Writer, opts: args_mod.ConvertOptions) ActionError!void {
     const source = try readSource(allocator, io, opts.file, stderr);
-    try convertSource(allocator, source, opts.file, opts.input, opts.output, stdout, stderr);
+    try convertSource(allocator, source, opts.file, opts.input, opts.output, opts.output_format, stdout, stderr);
     stdout.flush() catch |err| {
         stderr.print("error: failed to write output: {t}\n", .{err}) catch {};
         stderr.flush() catch {};
@@ -141,6 +146,7 @@ fn convertSource(
     display_name: []const u8,
     input: format.InputFormat,
     output: format.OutputMode,
+    output_format: ?format.InputFormat,
     stdout: *Writer,
     stderr: *Writer,
 ) ActionError!void {
@@ -165,18 +171,41 @@ fn convertSource(
             return error.ActionFailed;
         },
         .canonical => {
-            const serializeFn = entry.serializeCanonical orelse {
-                stderr.print(
-                    "error: canonical output is not supported for {s} yet: no serializer\n",
-                    .{@tagName(input)},
-                ) catch {};
-                stderr.flush() catch {};
-                return error.ActionFailed;
-            };
-            const out = serializeFn(allocator, &doc) catch |err| {
-                stderr.print("error: failed to serialize '{s}' to canonical form: {t}\n", .{ display_name, err }) catch {};
-                stderr.flush() catch {};
-                return error.ActionFailed;
+            // Plain `-o canonical` (or `-o <input's own format>`): round-trip
+            // through the INPUT format's own `Document`-aware serializer.
+            // `-o <a different format>`: cross-format conversion through
+            // that format's `serializeFromAst`, fed the bare shared `AST`
+            // (see `format.FormatEntry.serializeFromAst`'s doc comment).
+            const target = output_format orelse input;
+            const out = if (target == input) blk: {
+                const serializeFn = entry.serializeCanonical orelse {
+                    stderr.print(
+                        "error: canonical output is not supported for {s} yet: no serializer\n",
+                        .{@tagName(input)},
+                    ) catch {};
+                    stderr.flush() catch {};
+                    return error.ActionFailed;
+                };
+                break :blk serializeFn(allocator, &doc) catch |err| {
+                    stderr.print("error: failed to serialize '{s}' to canonical form: {t}\n", .{ display_name, err }) catch {};
+                    stderr.flush() catch {};
+                    return error.ActionFailed;
+                };
+            } else blk: {
+                const target_entry = format.entryFor(target);
+                const serializeFn = target_entry.serializeFromAst orelse {
+                    stderr.print(
+                        "error: conversion to {s} is not supported yet: no serializer\n",
+                        .{@tagName(target)},
+                    ) catch {};
+                    stderr.flush() catch {};
+                    return error.ActionFailed;
+                };
+                break :blk serializeFn(allocator, doc.ast()) catch |err| {
+                    stderr.print("error: failed to convert '{s}' from {s} to {s}: {t}\n", .{ display_name, @tagName(input), @tagName(target), err }) catch {};
+                    stderr.flush() catch {};
+                    return error.ActionFailed;
+                };
             };
             // Safe to free unconditionally: in the real CLI, `allocator` is
             // the process-lifetime arena (`main.zig`'s `init.arena`), where
@@ -470,7 +499,7 @@ test "convertSource: html output for djot goes through Djot.html.render (footnot
     var out: Writer = .fixed(&out_buf);
     var err: Writer = .fixed(&err_buf);
 
-    try convertSource(testing.allocator, "hi[^1]\n\n[^1]: a note\n", "-", .djot, .html, &out, &err);
+    try convertSource(testing.allocator, "hi[^1]\n\n[^1]: a note\n", "-", .djot, .html, null, &out, &err);
     // `role="doc-endnotes"`/`id="fn1"` only appear when the djot-specific
     // side-table-aware render path (`Djot.html.render`) actually resolved the
     // footnote reference — the generic `Html.serialize(..., null)` path
@@ -487,7 +516,7 @@ test "convertSource: ast output is JSON starting with a doc-kind object" {
     var out: Writer = .fixed(&out_buf);
     var err: Writer = .fixed(&err_buf);
 
-    try convertSource(testing.allocator, "hello\n", "-", .djot, .ast, &out, &err);
+    try convertSource(testing.allocator, "hello\n", "-", .djot, .ast, null, &out, &err);
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"kind\": \"doc\"") != null);
 }
 
@@ -497,20 +526,51 @@ test "convertSource: xml canonical output round-trips through Xml.serializeAlloc
     var out: Writer = .fixed(&out_buf);
     var err: Writer = .fixed(&err_buf);
 
-    try convertSource(testing.allocator, "<a><b/></a>", "-", .xml, .canonical, &out, &err);
+    try convertSource(testing.allocator, "<a><b/></a>", "-", .xml, .canonical, null, &out, &err);
     try testing.expectEqualStrings("<a><b/></a>", out.buffered());
 }
 
-test "convertSource: canonical output on a format with no serializer fails clearly" {
+test "convertSource: djot canonical output uses Djot.serializeAlloc" {
     var out_buf: [256]u8 = undefined;
-    var err_buf: [512]u8 = undefined;
+    var err_buf: [256]u8 = undefined;
     var out: Writer = .fixed(&out_buf);
     var err: Writer = .fixed(&err_buf);
 
-    // djot has no serializer yet: this must fail with `ActionFailed` and a
-    // message naming djot and "no serializer", not crash or emit nothing.
-    try testing.expectError(error.ActionFailed, convertSource(testing.allocator, "hello\n", "-", .djot, .canonical, &out, &err));
-    try testing.expect(std.mem.indexOf(u8, err.buffered(), "no serializer") != null);
+    try convertSource(testing.allocator, "hello *world*\n", "-", .djot, .canonical, null, &out, &err);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "*world*") != null);
+}
+
+test "convertSource: markdown canonical output uses Markdown.serializeAlloc" {
+    var out_buf: [512]u8 = undefined;
+    var err_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var err: Writer = .fixed(&err_buf);
+
+    try convertSource(testing.allocator, "[x][a]\n\n[a]: /u\n", "-", .markdown, .canonical, null, &out, &err);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "[a]: /u") != null);
+}
+
+test "convertSource: -o djot with markdown input cross-converts via Djot.serializer.serializeAstAlloc" {
+    var out_buf: [512]u8 = undefined;
+    var err_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var err: Writer = .fixed(&err_buf);
+
+    try convertSource(testing.allocator, "This is *markdown*.\n", "-", .markdown, .canonical, .djot, &out, &err);
+    // Markdown's `*markdown*` (emph) round-trips through the shared `AST`
+    // as an `emph` node, which the Djot serializer renders djot-style, with
+    // underscores rather than asterisks.
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "_markdown_") != null);
+}
+
+test "convertSource: -o markdown with djot input cross-converts via Markdown.serializer.serializeAstAlloc" {
+    var out_buf: [512]u8 = undefined;
+    var err_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var err: Writer = .fixed(&err_buf);
+
+    try convertSource(testing.allocator, "This is _djot emphasis_.\n", "-", .djot, .canonical, .markdown, &out, &err);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "*djot emphasis*") != null);
 }
 
 test "parsePath: dotted indices, empty = root, non-numeric errors" {
