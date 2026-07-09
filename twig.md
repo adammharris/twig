@@ -1,7 +1,8 @@
 ```fig
 title = Twig
 author = adammharris
-created = 2026-07-07T17:27:37-06:00
+created = 2026-07-08T22:39:41-07:00
+updated = 2026-07-08T22:40:04-07:00
 ```
 
 # Twig
@@ -27,8 +28,6 @@ but Twig has different design goals:
 # Status
 
 The following languages are implemented:
-- Djot (265/271 cases passing;
-  the remaining 6 rely on an AST pretty-printer
-  this project doesn't implement yet)
-- Markdown
+- Djot (265/271 cases passing; the remaining 6 rely on an AST pretty-printer this project doesn't implement yet)
+- Markdown (~150 CommonMark tests remaining)
 - HTML (write-only)
