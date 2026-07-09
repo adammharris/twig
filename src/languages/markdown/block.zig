@@ -55,6 +55,30 @@
 //!     backtrack-and-retry-without-a-title.
 //!   - Label/link-reference normalization case-folds ASCII only (not full
 //!     Unicode case folding).
+//!
+//! ── Inline spans ─────────────────────────────────────────────────────────
+//! Block nodes get their `span` directly from `lineStart`/`lineEnd` (this
+//! file always knows a line's absolute source offset). Inline nodes are
+//! trickier: `resolvePendingInline` hands `inline.zig`'s `parseInline` an
+//! already-ASSEMBLED text buffer (`PendingInline.text`) -- indentation and
+//! block markers stripped, multiple lines joined with a synthetic `\n` --
+//! that no longer has a fixed offset from the source. Every place this file
+//! builds such a buffer (`Leaf.text`/`.text_segs` for paragraphs and setext
+//! headings; the local `content`/`content_segs` in
+//! `tryStartDefinitionList`'s definition-body loop) tracks, alongside the
+//! text itself, a list of `Segment`s recording which run of the assembled
+//! buffer came from which run of the ORIGINAL source (`appendMappedSource`
+//! records one; a synthetic separator byte, e.g. the line-join `\n`, is
+//! appended with `appendUnmappedByte` and simply isn't covered by any
+//! segment). `PendingInline.segments` carries these through to
+//! `parseInline`, which -- via `Scanner.mapSpan` -- can then give a node an
+//! exact absolute span whenever its whole local extent falls within ONE
+//! segment, and must leave it unset (`(0,0)`) otherwise (typically: a
+//! construct that straddles a multi-line block's line join). Single-line
+//! constructs (ATX headings, GFM table cells, most definition-list terms)
+//! skip the segment-list machinery entirely and just hand `parseInline` one
+//! segment covering the whole (always-single-line, hence always-contiguous)
+//! text -- see `singleSegment`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -64,6 +88,11 @@ const Builder = AST.Builder;
 const Span = @import("../../span.zig");
 const Options = @import("options.zig");
 const inline_mod = @import("inline.zig");
+
+/// Re-exported for readability at this file's own call sites -- see
+/// `inline_mod.Segment`'s doc comment for what it means and this file's
+/// module doc comment section on inline spans for how it's built here.
+const Segment = inline_mod.Segment;
 
 pub const BlockResult = struct {
     ast: AST,
@@ -80,6 +109,14 @@ pub const BlockResult = struct {
 // ── low-level line/column helpers ───────────────────────────────────────
 
 const Cursor = struct { pos: usize = 0, col: usize = 0 };
+
+/// The degenerate `(0,0)` span `AST.Builder.addNode`/`addLeaf`/`addContainer`
+/// default every node to, meaning "never explicitly set" -- mirrors
+/// `ast/editor.zig`'s own `nodeSpan` check (the span-splice editor's
+/// definition of "this node has no usable span").
+fn isUnsetSpan(s: Span) bool {
+    return s.start == 0 and s.end == 0;
+}
 
 fn isBlankLine(s: []const u8) bool {
     for (s) |c| {
@@ -621,6 +658,13 @@ const LeafKind = enum { paragraph, indented_code, fenced_code, html_block };
 const Leaf = struct {
     kind: LeafKind,
     text: std.ArrayList(u8) = .empty,
+    /// `.paragraph` only (see this file's module doc comment's "Inline
+    /// spans" section): every mapped run appended to `text` so far, in the
+    /// same order -- built alongside `text` by `openParagraph`/
+    /// `appendParagraphLine` via `appendMappedSource`/`appendUnmappedByte`.
+    /// Left empty (and simply ignored) for every other `LeafKind`, whose
+    /// `text` never reaches `parseInline`.
+    text_segs: std.ArrayList(Segment) = .empty,
     start_line: usize = 0,
     end_line: usize = 0,
 
@@ -648,6 +692,7 @@ const Leaf = struct {
 
     fn deinit(self: *Leaf, allocator: Allocator) void {
         self.text.deinit(allocator);
+        self.text_segs.deinit(allocator);
         if (self.lang) |l| allocator.free(l);
     }
 };
@@ -666,6 +711,12 @@ const PendingInline = struct {
     /// from (typically a `Leaf.text` buffer) is freed as soon as its block
     /// closes, long before `resolvePendingInline` runs.
     text: []u8,
+    /// Owned copy of `text`'s source mapping -- see this file's module doc
+    /// comment's "Inline spans" section. Possibly empty (never `null`;
+    /// `parseInline`/`Scanner.mapSpan` treat an empty slice the same as "no
+    /// mapping available", so every node built from this text simply keeps
+    /// its default unset `(0,0)` span).
+    segments: []Segment,
 };
 
 pub const Parser = struct {
@@ -742,7 +793,10 @@ pub const Parser = struct {
         // via `resolvePendingInline` before returning -- but freed
         // defensively here too in case `deinit` is ever reached without a
         // completed `parse` (e.g. a future early-return error path).
-        for (self.pending_inline.items) |p| self.allocator.free(p.text);
+        for (self.pending_inline.items) |p| {
+            self.allocator.free(p.text);
+            self.allocator.free(p.segments);
+        }
         self.pending_inline.deinit(self.allocator);
         self.builder.deinit();
         // Keys are slices into the builder's `owned_strings` (see
@@ -794,7 +848,8 @@ pub const Parser = struct {
         }
         for (self.pending_inline.items) |p| {
             defer self.allocator.free(p.text);
-            const kids = try inline_mod.parseInline(&self.builder, p.text, &self.link_references, self.options);
+            defer self.allocator.free(p.segments);
+            const kids = try inline_mod.parseInline(&self.builder, p.text, p.segments, &self.link_references, self.options);
             defer self.allocator.free(kids);
             self.builder.setChildren(p.id, kids);
             setContentSpanFromChildren(&self.builder, p.id);
@@ -810,10 +865,90 @@ pub const Parser = struct {
         return self.line_starts[idx] + self.lines[idx].len;
     }
 
+    /// Append `slice` -- a genuine BORROWED slice of `self.source` (e.g.
+    /// some line's content with leading indentation/markers already
+    /// stripped off the front via ordinary sub-slicing; never a copy) -- to
+    /// `buf`, recording a `Segment` in `segs` that maps the newly-appended
+    /// run back to its exact source position. The source offset is found
+    /// via pointer arithmetic against `self.source`, which works no matter
+    /// how many times `slice` was itself further sliced from some line/
+    /// remainder first -- slicing narrows a slice's bounds but never moves
+    /// what address its bytes live at. A no-op for an empty `slice`
+    /// (nothing to map, and an empty segment would just be dead weight).
+    /// See this file's module doc comment's "Inline spans" section.
+    fn appendMappedSource(self: *Parser, buf: *std.ArrayList(u8), segs: *std.ArrayList(Segment), slice: []const u8) Allocator.Error!void {
+        if (slice.len == 0) return;
+        const buf_offset = buf.items.len;
+        try buf.appendSlice(self.allocator, slice);
+        const src_offset = @intFromPtr(slice.ptr) - @intFromPtr(self.source.ptr);
+        try segs.append(self.allocator, .{ .buf_offset = buf_offset, .src_offset = src_offset, .len = slice.len });
+    }
+
+    /// Append one synthetic byte (e.g. the `\n` line-join separator between
+    /// two joined paragraph/definition lines) to `buf` WITHOUT recording a
+    /// segment: this byte has no single corresponding source position
+    /// (indentation/block markers may have been stripped from the source
+    /// between the two lines it joins), so any inline node whose span would
+    /// need to cross it is correctly left unmapped -- see this file's
+    /// module doc comment's "Inline spans" section.
+    fn appendUnmappedByte(self: *Parser, buf: *std.ArrayList(u8), byte: u8) Allocator.Error!void {
+        try buf.append(self.allocator, byte);
+    }
+
+    /// One `Segment` covering the whole of `slice` -- a genuine borrowed
+    /// slice of `self.source` -- for the common single-line case (ATX
+    /// headings, GFM table cells, most definition-list terms) where the
+    /// text handed to `parseInline` is already exactly one contiguous run
+    /// of source bytes, with no need for `appendMappedSource`'s fuller
+    /// segment-LIST bookkeeping (which exists only to handle a
+    /// potentially-multi-line, potentially-noncontiguous `Leaf.text`).
+    fn singleSegment(self: *Parser, slice: []const u8) [1]Segment {
+        const src_offset = if (slice.len == 0) 0 else @intFromPtr(slice.ptr) - @intFromPtr(self.source.ptr);
+        return .{.{ .buf_offset = 0, .src_offset = src_offset, .len = slice.len }};
+    }
+
+    /// Re-express `segs` (offsets relative to `orig`) as segments relative
+    /// to `sub`, a sub-slice of `orig` obtained via ordinary Zig slicing
+    /// (`std.mem.trim`, `stripLinkReferenceDefinitions`'s prefix-consuming
+    /// re-slices, ...) -- found via pointer arithmetic rather than asking
+    /// every caller to track the offset explicitly, since a plain slicing
+    /// operation already IS that offset, just implicitly. A segment
+    /// entirely outside `sub`'s bounds is dropped; one straddling either
+    /// edge is clipped to it (its `src_offset` shifted to match whatever
+    /// front portion got clipped away). Caller owns the returned slice.
+    fn rebaseSegments(allocator: Allocator, segs: []const Segment, orig: []const u8, sub: []const u8) Allocator.Error![]Segment {
+        const k = @intFromPtr(sub.ptr) - @intFromPtr(orig.ptr);
+        var out = std.ArrayList(Segment).empty;
+        errdefer out.deinit(allocator);
+        for (segs) |seg| {
+            const seg_end = seg.buf_offset + seg.len;
+            const lo = @max(seg.buf_offset, k);
+            const hi = @min(seg_end, k + sub.len);
+            if (lo >= hi) continue;
+            const front_trim = lo - seg.buf_offset;
+            try out.append(allocator, .{
+                .buf_offset = lo - k,
+                .src_offset = seg.src_offset + front_trim,
+                .len = hi - lo,
+            });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     fn setContentSpanFromChildren(b: *Builder, id: Node.Id) void {
         const first = b.nodes.items[id].first_child orelse return;
         var last = first;
         while (b.nodes.items[last].next_sibling) |next| last = next;
+        // A child's span may be unset (`(0,0)`, e.g. an inline node whose
+        // local extent couldn't be mapped back to source -- see this file's
+        // module doc comment's "Inline spans" section) -- computing a
+        // content span from an unset ENDPOINT would silently fabricate a
+        // wrong one (typically starting/ending at absolute offset 0), so
+        // bail out and leave `id`'s own content_span unset too rather than
+        // risk that. Blocks (this function's original use case, before
+        // inline nodes got spans) never hit this: every block child always
+        // gets a real span.
+        if (isUnsetSpan(b.nodes.items[first].span) or isUnsetSpan(b.nodes.items[last].span)) return;
         b.setContentSpan(id, Span.init(b.nodes.items[first].span.start, b.nodes.items[last].span.end));
     }
 
@@ -904,17 +1039,21 @@ pub const Parser = struct {
         const remaining = try self.stripLinkReferenceDefinitions(lf.text.items);
         const trimmed = std.mem.trim(u8, remaining, " \t\r\n");
         if (trimmed.len == 0) return;
-        try self.emitTextBlock(.para, trimmed, lf.start_line, lf.end_line);
+        const segs = try rebaseSegments(self.allocator, lf.text_segs.items, lf.text.items, trimmed);
+        defer self.allocator.free(segs);
+        try self.emitTextBlock(.para, trimmed, segs, lf.start_line, lf.end_line);
     }
 
     /// Adds a leaf text block (paragraph/heading) node with `text` as its
     /// eventual inline content -- eventual, because parsing that content is
     /// deferred (see `PendingInline`) until the whole document's link
-    /// reference definitions are known. `text` is duped here since its
-    /// backing storage (typically a soon-to-be-`deinit`'d `Leaf.text`
-    /// buffer) will not outlive this call.
-    fn emitTextBlock(self: *Parser, kind: Node.Kind, text: []const u8, start_line: usize, end_line: usize) Allocator.Error!void {
-        const id = try self.addDeferredTextNode(kind, text, start_line, end_line);
+    /// reference definitions are known. `text` and `segs` (`text`'s source
+    /// mapping -- see this file's module doc comment's "Inline spans"
+    /// section) are both duped here since their backing storage (typically
+    /// a soon-to-be-`deinit`'d `Leaf.text`/`.text_segs`) won't outlive this
+    /// call.
+    fn emitTextBlock(self: *Parser, kind: Node.Kind, text: []const u8, segs: []const Segment, start_line: usize, end_line: usize) Allocator.Error!void {
+        const id = try self.addDeferredTextNode(kind, text, segs, start_line, end_line);
         try self.appendToTop(id);
     }
 
@@ -925,12 +1064,14 @@ pub const Parser = struct {
     /// themselves via `self.builder.addContainer` before the whole thing
     /// gets appended to the currently open container in one shot, rather
     /// than each leaf attaching itself as it's created.
-    fn addDeferredTextNode(self: *Parser, kind: Node.Kind, text: []const u8, start_line: usize, end_line: usize) Allocator.Error!Node.Id {
+    fn addDeferredTextNode(self: *Parser, kind: Node.Kind, text: []const u8, segs: []const Segment, start_line: usize, end_line: usize) Allocator.Error!Node.Id {
         const id = try self.builder.addNode(kind);
         self.builder.setSpan(id, Span.init(self.lineStart(start_line), self.lineEnd(end_line)));
         const owned_text = try self.allocator.dupe(u8, text);
         errdefer self.allocator.free(owned_text);
-        try self.pending_inline.append(self.allocator, .{ .id = id, .text = owned_text });
+        const owned_segs = try self.allocator.dupe(Segment, segs);
+        errdefer self.allocator.free(owned_segs);
+        try self.pending_inline.append(self.allocator, .{ .id = id, .text = owned_text, .segments = owned_segs });
         return id;
     }
 
@@ -1140,14 +1281,14 @@ pub const Parser = struct {
         try self.maybeCloseTopList(idx, null);
         self.markListsLoose();
         var lf: Leaf = .{ .kind = .paragraph, .start_line = idx, .end_line = idx };
-        try lf.text.appendSlice(self.allocator, trimLeadingWs(remainder));
+        try self.appendMappedSource(&lf.text, &lf.text_segs, trimLeadingWs(remainder));
         self.leaf = lf;
     }
 
     fn appendParagraphLine(self: *Parser, remainder: []const u8, idx: usize) Allocator.Error!void {
         var lf = &self.leaf.?;
-        try lf.text.append(self.allocator, '\n');
-        try lf.text.appendSlice(self.allocator, trimLeadingWs(remainder));
+        try self.appendUnmappedByte(&lf.text, '\n');
+        try self.appendMappedSource(&lf.text, &lf.text_segs, trimLeadingWs(remainder));
         lf.end_line = idx;
     }
 
@@ -1157,7 +1298,9 @@ pub const Parser = struct {
         defer lf.deinit(self.allocator);
         const trimmed = std.mem.trim(u8, lf.text.items, " \t\r\n");
         if (trimmed.len > 0) {
-            try self.emitTextBlock(.{ .heading = .{ .level = level } }, trimmed, lf.start_line, idx);
+            const segs = try rebaseSegments(self.allocator, lf.text_segs.items, lf.text.items, trimmed);
+            defer self.allocator.free(segs);
+            try self.emitTextBlock(.{ .heading = .{ .level = level } }, trimmed, segs, lf.start_line, idx);
         }
     }
 
@@ -1305,7 +1448,13 @@ pub const Parser = struct {
                     if (interrupting) try self.closeLeaf(idx);
                     try self.maybeCloseTopList(idx, null);
                     self.markListsLoose();
-                    try self.emitTextBlock(.{ .heading = .{ .level = h.level } }, std.mem.trim(u8, h.content, " \t"), idx, idx);
+                    // A single-line construct (`s`, hence `h.content`, is
+                    // this one `line`'s own content) -- `singleSegment`
+                    // maps the whole trimmed text directly, no
+                    // `Leaf`/segment-list bookkeeping needed.
+                    const heading_text = std.mem.trim(u8, h.content, " \t");
+                    const seg = self.singleSegment(heading_text);
+                    try self.emitTextBlock(.{ .heading = .{ .level = h.level } }, heading_text, &seg, idx, idx);
                     return true;
                 }
 
@@ -1648,8 +1797,14 @@ pub const Parser = struct {
         var cell_ids = std.ArrayList(Node.Id).empty;
         defer cell_ids.deinit(self.allocator);
         for (aligns, 0..) |al, i| {
+            // Every `cells[i]` is a genuine (trimmed) slice of this row's
+            // OWN line -- `splitTableRow`/`stripEdgePipes` only ever
+            // sub-slice, never copy -- so, like an ATX heading's content,
+            // one `singleSegment` maps it directly; a ragged row's missing
+            // trailing cell (`""`) just gets an empty (harmless) mapping.
             const text = if (i < cells.len) cells[i] else "";
-            const cell_id = try self.addDeferredTextNode(.{ .cell = .{ .head = head, .alignment = al } }, text, start_line, end_line);
+            const seg = self.singleSegment(text);
+            const cell_id = try self.addDeferredTextNode(.{ .cell = .{ .head = head, .alignment = al } }, text, &seg, start_line, end_line);
             try cell_ids.append(self.allocator, cell_id);
         }
         const row_id = try self.builder.addContainer(.{ .row = .{ .head = head } }, cell_ids.items);
@@ -1691,6 +1846,16 @@ pub const Parser = struct {
         if (trimmed_term.len == 0) return false;
         const term_text = try self.allocator.dupe(u8, trimmed_term);
         defer self.allocator.free(term_text);
+        // "A term is a single-line paragraph" (this function's own doc
+        // comment) -- but it's STILL built via the ordinary paragraph
+        // `Leaf`/`appendMappedSource` machinery (`openParagraph`), so it
+        // gets its span the same way a one-line paragraph would, rather
+        // than a fresh `singleSegment` (`lf.text.items` is a COPY, not a
+        // source slice, so `singleSegment` -- which needs a genuine source
+        // slice -- isn't available here; `rebaseSegments` against
+        // `lf.text_segs` is).
+        const term_segs = try rebaseSegments(self.allocator, lf.text_segs.items, lf.text.items, trimmed_term);
+        defer self.allocator.free(term_segs);
         var term_start_line = lf.start_line;
         // Free the paragraph leaf's own buffer FIRST (while `lf` -- a
         // pointer into `self.leaf`'s payload -- is still valid), THEN null
@@ -1710,11 +1875,14 @@ pub const Parser = struct {
         var scan = idx;
         var last_idx = idx;
         var current_term = term_text;
+        var current_term_segs: []const Segment = term_segs;
         var owned_term: ?[]u8 = null;
         defer if (owned_term) |t| self.allocator.free(t);
+        var owned_term_segs: ?[]Segment = null;
+        defer if (owned_term_segs) |seg| self.allocator.free(seg);
 
         while (true) {
-            const term_id = try self.addDeferredTextNode(.term, current_term, term_start_line, term_start_line);
+            const term_id = try self.addDeferredTextNode(.term, current_term, current_term_segs, term_start_line, term_start_line);
             var def_ids = std.ArrayList(Node.Id).empty;
             defer def_ids.deinit(self.allocator);
 
@@ -1725,9 +1893,16 @@ pub const Parser = struct {
                 const ds = stripUpTo3Indent(dline[dm.cur.pos..]);
                 if (!isDefinitionMarkerLine(ds)) break;
 
+                // Built the same "mapped source runs + unmapped line-join
+                // separators" way `Leaf.text`/`.text_segs` are (see this
+                // file's module doc comment's "Inline spans" section) --
+                // a definition's body can span multiple (lazily-indented)
+                // lines exactly like a paragraph's can.
                 var content = std.ArrayList(u8).empty;
                 defer content.deinit(self.allocator);
-                try content.appendSlice(self.allocator, trimLeadingWs(ds[1..]));
+                var content_segs = std.ArrayList(Segment).empty;
+                defer content_segs.deinit(self.allocator);
+                try self.appendMappedSource(&content, &content_segs, trimLeadingWs(ds[1..]));
                 const def_start = scan;
                 var def_end = scan;
                 scan += 1;
@@ -1740,12 +1915,12 @@ pub const Parser = struct {
                     const cs = stripUpTo3Indent(crem);
                     if (isDefinitionMarkerLine(cs)) break;
                     if (looksLikeNewBlockStart(cs)) break;
-                    try content.append(self.allocator, '\n');
-                    try content.appendSlice(self.allocator, trimLeadingWs(crem));
+                    try self.appendUnmappedByte(&content, '\n');
+                    try self.appendMappedSource(&content, &content_segs, trimLeadingWs(crem));
                     def_end = scan;
                     scan += 1;
                 }
-                const def_id = try self.addDeferredTextNode(.definition, content.items, def_start, def_end);
+                const def_id = try self.addDeferredTextNode(.definition, content.items, content_segs.items, def_start, def_end);
                 try def_ids.append(self.allocator, def_id);
                 last_idx = def_end;
             }
@@ -1787,9 +1962,19 @@ pub const Parser = struct {
             const ds2 = stripUpTo3Indent(dl2[dm2.cur.pos..]);
             if (!isDefinitionMarkerLine(ds2)) break;
 
+            // Unlike the FIRST term (which came from an already-open
+            // paragraph `Leaf`, hence `rebaseSegments` above), `ts` here is
+            // a genuine slice of `self.lines[next_idx]` -- straight off
+            // this loop's own line scan, never routed through a `Leaf` --
+            // so `singleSegment` applies directly, same as an ATX heading.
+            const next_term_text = std.mem.trim(u8, ts, " \t\r\n");
             if (owned_term) |t| self.allocator.free(t);
-            owned_term = try self.allocator.dupe(u8, std.mem.trim(u8, ts, " \t\r\n"));
+            owned_term = try self.allocator.dupe(u8, next_term_text);
             current_term = owned_term.?;
+            if (owned_term_segs) |seg| self.allocator.free(seg);
+            const next_seg = self.singleSegment(next_term_text);
+            owned_term_segs = try self.allocator.dupe(Segment, &next_seg);
+            current_term_segs = owned_term_segs.?;
             term_start_line = next_idx;
             scan = next_idx + 1;
         }
@@ -2108,6 +2293,103 @@ test "ATX heading" {
     try testing.expect(r.ast.nodes[h].kind.heading.level == 2);
     const text = r.ast.nodes[h].first_child.?;
     try testing.expectEqualStrings("Hello", r.ast.nodes[text].kind.str);
+}
+
+// ── inline spans (byte-accurate, delimiters included) ───────────────────
+// See this file's module doc comment's "Inline spans" section: unlike
+// `inline.zig`'s own span tests (which fabricate a `Segment` mapping a bare
+// string onto itself), these run the FULL pipeline -- real source, real
+// `lineStart`/`lineEnd`-derived offsets, real indentation/marker stripping
+// -- and slice the ORIGINAL source with a resolved node's span, which is the
+// mission's actual correctness bar.
+
+test "span: a link in a single-line paragraph covers '[x](url)', content_span the link text" {
+    const src = "see [x](http://a.co) now\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const para = r.ast.nodes[r.ast.root].first_child.?;
+    const first = r.ast.nodes[para].first_child.?; // "see "
+    const link = r.ast.nodes[first].next_sibling.?;
+    try testing.expect(r.ast.nodes[link].kind == .link);
+    try testing.expectEqualStrings("[x](http://a.co)", Span.of(u8, r.ast.nodes[link].span, src));
+    try testing.expectEqualStrings("x", Span.of(u8, r.ast.nodes[link].content_span.?, src));
+}
+
+test "span: a link inside a heading is byte-accurate" {
+    const src = "## see [x](http://a.co) now\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const h = r.ast.nodes[r.ast.root].first_child.?;
+    const first = r.ast.nodes[h].first_child.?; // "see "
+    const link = r.ast.nodes[first].next_sibling.?;
+    try testing.expect(r.ast.nodes[link].kind == .link);
+    try testing.expectEqualStrings("[x](http://a.co)", Span.of(u8, r.ast.nodes[link].span, src));
+}
+
+test "span: emphasis in a single-line paragraph covers its own delimiters" {
+    const src = "hi *abc* there\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const para = r.ast.nodes[r.ast.root].first_child.?;
+    const first = r.ast.nodes[para].first_child.?; // "hi "
+    const em = r.ast.nodes[first].next_sibling.?;
+    try testing.expect(r.ast.nodes[em].kind == .emph);
+    try testing.expectEqualStrings("*abc*", Span.of(u8, r.ast.nodes[em].span, src));
+    try testing.expectEqualStrings("abc", Span.of(u8, r.ast.nodes[em].content_span.?, src));
+}
+
+test "span: a code span includes its own backticks" {
+    const src = "x `code` y\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const para = r.ast.nodes[r.ast.root].first_child.?;
+    const first = r.ast.nodes[para].first_child.?; // "x "
+    const code = r.ast.nodes[first].next_sibling.?;
+    try testing.expect(r.ast.nodes[code].kind == .verbatim);
+    try testing.expectEqualStrings("`code`", Span.of(u8, r.ast.nodes[code].span, src));
+}
+
+test "span: a str leaf's span is its own exact source bytes, even nested in a block quote" {
+    const src = "> hello world\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const bq = r.ast.nodes[r.ast.root].first_child.?;
+    const para = r.ast.nodes[bq].first_child.?;
+    const str = r.ast.nodes[para].first_child.?;
+    try testing.expectEqualStrings("hello world", Span.of(u8, r.ast.nodes[str].span, src));
+}
+
+test "span: a multi-line paragraph's inline nodes are left unset when they'd cross the line join" {
+    // See this file's module doc comment's "Inline spans" section: a
+    // paragraph joined from more than one source line is only mapped
+    // per-segment (one per source line); an inline construct entirely
+    // within ONE of those lines still gets an accurate span (checked
+    // below), but one that straddles the synthetic line-join `\n` (the
+    // emphasis run here opens on line 1 and closes on line 2) can't be
+    // mapped accurately, so it's deliberately left unset (`(0,0)`) rather
+    // than risk a wrong one.
+    const src = "a *b\nc* d\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const para = r.ast.nodes[r.ast.root].first_child.?;
+    const first = r.ast.nodes[para].first_child.?; // "a "
+    try testing.expectEqualStrings("a ", Span.of(u8, r.ast.nodes[first].span, src));
+    const em = r.ast.nodes[first].next_sibling.?;
+    try testing.expect(r.ast.nodes[em].kind == .emph);
+    try testing.expectEqual(@as(usize, 0), r.ast.nodes[em].span.start);
+    try testing.expectEqual(@as(usize, 0), r.ast.nodes[em].span.end);
 }
 
 test "fenced code block with a language" {

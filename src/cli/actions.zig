@@ -565,12 +565,26 @@ test "applyEditByLocator: an ambiguous selector is refused and lists candidates"
     try testing.expect(std.mem.indexOf(u8, err.buffered(), "ambiguous") != null);
 }
 
-test "applyEditByLocator: a Markdown inline node (no span yet) is refused, not corrupted" {
+test "applyEditByLocator: a Markdown inline link node has an accurate span and edits in place" {
+    // Markdown inline nodes (links, emphasis, code spans, ...) now carry
+    // real source spans (see `languages/markdown/inline.zig`'s `Segment`),
+    // so this splices at the link's own `[x](http://a.co)` extent rather
+    // than erroring with `NoNodeSpan`.
+    var err: Writer = .fixed(&.{});
+    const out = try applyEditByLocator(testing.allocator, "see [x](http://a.co)\n", .markdown, .replace, "link", 0, "[y](http://b.co)", &err);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("see [y](http://b.co)\n", out);
+}
+
+test "applyEditByLocator: a Markdown inline node with no mapped span is still refused, not corrupted" {
     var buf: [512]u8 = undefined;
     var err: Writer = .fixed(&buf);
-    // The link resolves fine, but Markdown inline nodes carry no span yet, so
-    // the edit must error clearly rather than splice at offset 0.
-    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "see [x](http://a.co)\n", .markdown, .replace, "link", 0, "[y](http://b.co)", &err));
+    // A multi-line paragraph's inline nodes fall outside the single-segment
+    // mapping `block.zig` can build for them (see that file's module doc
+    // comment's "Inline spans" section) -- the emphasis run here straddles
+    // the line join, so it's left with no span, and the edit must error
+    // clearly rather than splice at offset 0.
+    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "a *b\nc* d\n", .markdown, .replace, "emph", 0, "*x*", &err));
     try testing.expect(std.mem.indexOf(u8, err.buffered(), "no source span") != null);
 }
 

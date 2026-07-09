@@ -69,8 +69,29 @@ const Allocator = std.mem.Allocator;
 const AST = @import("../../ast/ast.zig");
 const Node = AST.Node;
 const Builder = AST.Builder;
+const Span = @import("../../span.zig");
 const entities = @import("entities.zig");
 const Options = @import("options.zig");
+
+/// One contiguous run of a leaf block's assembled `text` that maps 1:1 onto
+/// real source bytes: `text[buf_offset..buf_offset+len]` is byte-for-byte
+/// identical to `source[src_offset..src_offset+len]`. `block.zig` builds a
+/// leaf block's `text` by copying/joining possibly-noncontiguous source runs
+/// (indentation/markers stripped, lines joined with a synthetic `\n`
+/// separator) — this is how `parseInline` maps a byte offset in ITS `text`
+/// back to an absolute offset in the original source (`Scanner.mapSpan`),
+/// when that's even possible. A `text` byte not covered by any segment (e.g.
+/// a synthetic line-join separator, or one that came from a multi-line join
+/// whose two sides land in different segments) simply has no source mapping
+/// — `mapSpan` returns `null` for any request that isn't fully contained in
+/// ONE segment, and the caller leaves that node's span unset (`(0,0)`)
+/// rather than risk an inaccurate one. See `block.zig`'s module doc comment
+/// section on inline spans for how these are built.
+pub const Segment = struct {
+    buf_offset: usize,
+    src_offset: usize,
+    len: usize,
+};
 
 /// Parse `text` (a single leaf block's already-assembled content — see this
 /// file's module doc comment) into a flat sequence of inline children, added
@@ -84,28 +105,39 @@ const Options = @import("options.zig");
 /// inline-level extensions (strikethrough, math, GFM extended autolinks —
 /// see the "Phase 3" section below); every extension this file recognizes
 /// checks `sc.options.<flag>` at its own dispatch point, so `options ==
-/// .commonmark` reproduces Phase 2's behavior exactly. Returns the ordered
-/// list of child ids (caller's to free; typically immediately handed to
-/// `b.setChildren`).
-pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHashMapUnmanaged(Node.Id), options: Options) Allocator.Error![]Node.Id {
-    var sc: Scanner = .{ .b = b, .link_refs = link_refs, .options = options };
+/// .commonmark` reproduces Phase 2's behavior exactly. `segments` maps
+/// `text` offsets back to absolute source offsets (see `Segment`'s doc
+/// comment) — every node this scan creates gets its `span` (and, for
+/// containers with a meaningful interior, `content_span`) set from it when
+/// the mapping is available, left unset (`(0,0)`) otherwise. Returns the
+/// ordered list of child ids (caller's to free; typically immediately
+/// handed to `b.setChildren`).
+pub fn parseInline(b: *Builder, text: []const u8, segments: []const Segment, link_refs: *const std.StringHashMapUnmanaged(Node.Id), options: Options) Allocator.Error![]Node.Id {
+    var sc: Scanner = .{ .b = b, .link_refs = link_refs, .options = options, .segments = segments };
     defer sc.deinit();
 
     var i: usize = 0;
     while (i < text.len) {
+        if (sc.buf.items.len == 0) {
+            sc.buf_start = i;
+            sc.buf_pure = true;
+        }
         const c = text[i];
         switch (c) {
             '\\' => {
                 if (i + 1 < text.len and text[i + 1] == '\n') {
                     // Backslash immediately before a line ending: hard break.
-                    try sc.flushBuf();
-                    _ = try sc.appendItem(try b.addLeaf(.hard_break));
+                    try sc.flushBuf(i);
+                    const id = try b.addLeaf(.hard_break);
+                    sc.setSpanIfMapped(id, i, i + 2);
+                    _ = try sc.appendItem(id);
                     i += 2;
                     i = skipLeadingLineSpace(text, i);
                     continue;
                 }
                 if (i + 1 < text.len and isAsciiPunct(text[i + 1])) {
                     try sc.buf.append(b.allocator, text[i + 1]);
+                    sc.buf_pure = false; // 2 source bytes -> 1 buf byte
                     i += 2;
                     continue;
                 }
@@ -115,18 +147,22 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
             '\n' => {
                 const hard = trailingHardBreakSpaces(sc.buf.items);
                 sc.buf.items.len -= hard;
-                try sc.flushBuf();
+                try sc.flushBuf(i - hard);
                 const kind: Node.Kind = if (hard >= 2) .hard_break else .soft_break;
-                _ = try sc.appendItem(try b.addLeaf(kind));
+                const id = try b.addLeaf(kind);
+                sc.setSpanIfMapped(id, i - hard, i + 1);
+                _ = try sc.appendItem(id);
                 i += 1;
                 i = skipLeadingLineSpace(text, i);
             },
             '`' => {
                 if (scanCodeSpan(text, i)) |span| {
-                    try sc.flushBuf();
+                    try sc.flushBuf(i);
                     const content = try normalizeCodeSpan(b.allocator, text[span.content_start..span.content_end]);
                     defer b.allocator.free(content);
-                    _ = try sc.appendItem(try b.addLeaf(.{ .verbatim = content }));
+                    const id = try b.addLeaf(.{ .verbatim = content });
+                    sc.setSpanIfMapped(id, i, span.end);
+                    _ = try sc.appendItem(id);
                     i = span.end;
                 } else {
                     // No closing run of the SAME length as this opening run
@@ -143,6 +179,7 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
                 if (try decodeCharRef(b.allocator, text, i)) |ref| {
                     try sc.buf.appendSlice(b.allocator, ref.text);
                     b.allocator.free(ref.text);
+                    sc.buf_pure = false; // decoded reference -> not a verbatim copy
                     i = ref.end;
                 } else {
                     try sc.buf.append(b.allocator, '&');
@@ -151,16 +188,22 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
             },
             '<' => {
                 if (scanAutolinkUri(text, i)) |end| {
-                    try sc.flushBuf();
-                    _ = try sc.appendItem(try b.addLeaf(.{ .url = text[i + 1 .. end - 1] }));
+                    try sc.flushBuf(i);
+                    const id = try b.addLeaf(.{ .url = text[i + 1 .. end - 1] });
+                    sc.setSpanIfMapped(id, i, end);
+                    _ = try sc.appendItem(id);
                     i = end;
                 } else if (scanAutolinkEmail(text, i)) |end| {
-                    try sc.flushBuf();
-                    _ = try sc.appendItem(try b.addLeaf(.{ .email = text[i + 1 .. end - 1] }));
+                    try sc.flushBuf(i);
+                    const id = try b.addLeaf(.{ .email = text[i + 1 .. end - 1] });
+                    sc.setSpanIfMapped(id, i, end);
+                    _ = try sc.appendItem(id);
                     i = end;
                 } else if (scanHtmlTag(text, i)) |end| {
-                    try sc.flushBuf();
-                    _ = try sc.appendItem(try b.addLeaf(.{ .raw_inline = .{ .format = "html", .text = text[i..end] } }));
+                    try sc.flushBuf(i);
+                    const id = try b.addLeaf(.{ .raw_inline = .{ .format = "html", .text = text[i..end] } });
+                    sc.setSpanIfMapped(id, i, end);
+                    _ = try sc.appendItem(id);
                     i = end;
                 } else {
                     try sc.buf.append(b.allocator, '<');
@@ -179,14 +222,18 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
                     // literal-text buffer like any other character, which
                     // also keeps the AST from fragmenting into a fresh `str`
                     // node at every non-flanking `*`/`_` (e.g. `a_b_c`).
-                    try sc.flushBuf();
-                    const item_idx = try sc.appendItem(try b.addLeaf(.{ .str = text[i..run_end] }));
+                    try sc.flushBuf(i);
+                    const run_id = try b.addLeaf(.{ .str = text[i..run_end] });
+                    sc.setSpanIfMapped(run_id, i, run_end);
+                    const item_idx = try sc.appendItem(run_id);
                     try sc.delims.append(b.allocator, .{
                         .item = item_idx,
                         .char = c,
                         .count = run_end - i,
                         .can_open = flank.can_open,
                         .can_close = flank.can_close,
+                        .range_start = i,
+                        .range_end = run_end,
                     });
                 } else {
                     try sc.buf.appendSlice(b.allocator, text[i..run_end]);
@@ -204,20 +251,25 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
                 // before -- see `tryFootnoteReference`'s doc comment.
                 if (sc.options.footnotes) {
                     if (tryFootnoteReference(text, i)) |fr| {
-                        try sc.flushBuf();
+                        try sc.flushBuf(i);
                         const norm = try normalizeRefLabel(b.allocator, fr.label);
                         defer b.allocator.free(norm);
-                        _ = try sc.appendItem(try b.addLeaf(.{ .footnote_reference = norm }));
+                        const id = try b.addLeaf(.{ .footnote_reference = norm });
+                        sc.setSpanIfMapped(id, i, fr.end);
+                        _ = try sc.appendItem(id);
                         i = fr.end;
                         continue;
                     }
                 }
-                try sc.flushBuf();
-                const item_idx = try sc.appendItem(try b.addLeaf(.{ .str = "[" }));
+                try sc.flushBuf(i);
+                const open_id = try b.addLeaf(.{ .str = "[" });
+                sc.setSpanIfMapped(open_id, i, i + 1);
+                const item_idx = try sc.appendItem(open_id);
                 try sc.brackets.append(b.allocator, .{
                     .item = item_idx,
                     .is_image = false,
                     .active = true,
+                    .open_start = i,
                     .content_start = i + 1,
                     .delim_stack_len = sc.delims.items.len,
                     .tilde_stack_len = sc.tilde_delims.items.len,
@@ -226,12 +278,15 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
             },
             '!' => {
                 if (i + 1 < text.len and text[i + 1] == '[') {
-                    try sc.flushBuf();
-                    const item_idx = try sc.appendItem(try b.addLeaf(.{ .str = "![" }));
+                    try sc.flushBuf(i);
+                    const open_id = try b.addLeaf(.{ .str = "![" });
+                    sc.setSpanIfMapped(open_id, i, i + 2);
+                    const item_idx = try sc.appendItem(open_id);
                     try sc.brackets.append(b.allocator, .{
                         .item = item_idx,
                         .is_image = true,
                         .active = true,
+                        .open_start = i,
                         .content_start = i + 2,
                         .delim_stack_len = sc.delims.items.len,
                         .tilde_stack_len = sc.tilde_delims.items.len,
@@ -243,7 +298,7 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
                 }
             },
             ']' => {
-                try sc.flushBuf();
+                try sc.flushBuf(i);
                 i = try handleCloseBracket(&sc, text, i);
             },
             '~' => {
@@ -263,13 +318,17 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
                 const run_len = run_end - i;
                 const flank = if (sc.options.strikethrough) computeFlanking(text, i, run_end, '~') else Flank{ .can_open = false, .can_close = false };
                 if (run_len <= 2 and (flank.can_open or flank.can_close)) {
-                    try sc.flushBuf();
-                    const item_idx = try sc.appendItem(try b.addLeaf(.{ .str = text[i..run_end] }));
+                    try sc.flushBuf(i);
+                    const run_id = try b.addLeaf(.{ .str = text[i..run_end] });
+                    sc.setSpanIfMapped(run_id, i, run_end);
+                    const item_idx = try sc.appendItem(run_id);
                     try sc.tilde_delims.append(b.allocator, .{
                         .item = item_idx,
                         .count = run_len,
                         .can_open = flank.can_open,
                         .can_close = flank.can_close,
+                        .range_start = i,
+                        .range_end = run_end,
                     });
                 } else {
                     try sc.buf.appendSlice(b.allocator, text[i..run_end]);
@@ -296,8 +355,10 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
                     }
                 }
                 if (matched) |m| {
-                    try sc.flushBuf();
-                    _ = try sc.appendItem(try b.addLeaf(m.kind));
+                    try sc.flushBuf(i);
+                    const id = try b.addLeaf(m.kind);
+                    sc.setSpanIfMapped(id, i, m.end);
+                    _ = try sc.appendItem(id);
                     i = m.end;
                 } else {
                     try sc.buf.append(b.allocator, '$');
@@ -343,7 +404,7 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
             },
         }
     }
-    try sc.flushBuf();
+    try sc.flushBuf(text.len);
     // Resolve whatever emphasis/strikethrough delimiters are left over the
     // WHOLE stack.
     try sc.processEmphasis(0);
@@ -425,6 +486,17 @@ const Delim = struct {
     count: usize,
     can_open: bool,
     can_close: bool,
+    /// The CURRENT remaining sub-range, in `text` coordinates, of this
+    /// delimiter run -- starts as the whole run `[i, run_end)` at push time
+    /// and shrinks from whichever edge gets consumed each time
+    /// `processEmphasis` matches this delimiter as an opener (shrinks from
+    /// `range_end`, since an opener's content-adjacent edge is its RIGHT
+    /// one) or closer (shrinks from `range_start`, its LEFT edge being
+    /// content-adjacent) -- see `processEmphasis`'s span-computation
+    /// comment. Used to give the resulting `emph`/`strong` node (and any
+    /// leftover placeholder run `spliceEmphasis` creates) an accurate span.
+    range_start: usize,
+    range_end: usize,
 };
 
 /// One `[`/`![` opener currently eligible to close into a link/image,
@@ -438,10 +510,15 @@ const Bracket = struct {
     item: ItemIdx,
     is_image: bool,
     active: bool,
+    /// Byte offset of the opening `[` (or, for an image, the `!` right
+    /// before it) -- the start of this bracket's own span once it resolves
+    /// into a `link`/`image` node (see `finishLinkOrImage`).
+    open_start: usize,
     /// Byte offset into the scanned text right after the opening `[`/`![`
     /// token -- the start of this bracket's own raw content, used both for
     /// the shortcut-reference fallback (the bracket's own text as the
-    /// label) and to slice that text once the closing `]` is found.
+    /// label) and to slice that text once the closing `]` is found, and as
+    /// the resolved node's `content_span` start.
     content_start: usize,
     /// `Scanner.delims.items.len` at the moment this bracket was pushed --
     /// the `stack_bottom` boundary `finishLinkOrImage` passes to
@@ -464,13 +541,44 @@ const StrikeDelim = struct {
     count: usize,
     can_open: bool,
     can_close: bool,
+    /// The whole run's `text` bounds -- see `Delim.range_start`/`.range_end`'s
+    /// doc comment; unlike CommonMark emphasis, GFM strikethrough never
+    /// partially consumes a run (`processStrikethrough`), so, unlike
+    /// `Delim`'s, this never shrinks.
+    range_start: usize,
+    range_end: usize,
 };
 
 const Scanner = struct {
     b: *Builder,
     link_refs: *const std.StringHashMapUnmanaged(Node.Id),
     options: Options = .{},
+    /// Maps `text` offsets back to absolute source offsets -- see
+    /// `Segment`'s doc comment. Empty (the default) means "no mapping is
+    /// available at all", which every span-setting call below already
+    /// handles correctly (`mapSpan` just always returns `null`), so tests
+    /// that construct a `Scanner`/call `parseInline` without real source
+    /// segments get the same unset-span behavior as before this feature
+    /// existed.
+    segments: []const Segment = &.{},
     buf: std.ArrayList(u8) = .empty,
+    /// The `text` offset where `buf`'s current run started accumulating
+    /// (reset every time `buf` goes from empty to non-empty -- see
+    /// `parseInline`'s main loop). Combined with whatever offset a flush
+    /// call is told the run ends at, this gives a flushed `str` node's
+    /// exact source extent regardless of any entity/backslash-escape
+    /// decoding that happened along the way (decoding can shrink `buf`
+    /// relative to the `text` bytes it came from, but never changes where
+    /// the run STARTS or ENDS in `text`).
+    buf_start: usize = 0,
+    /// Whether `buf`'s current run is a byte-for-byte copy of
+    /// `text[buf_start..buf_start+buf.items.len]` (no entity/backslash-
+    /// escape decoding happened within it yet). Needed only by
+    /// `tryExtEmailAutolink`, which reaches BACKWARD into `buf` by INDEX to
+    /// claim a trailing run as an email's local part -- turning that index
+    /// into a `text` offset (`buf_start + index`) is only valid while this
+    /// holds; see that function's doc comment.
+    buf_pure: bool = true,
     items: std.ArrayList(Item) = .empty,
     head: ?ItemIdx = null,
     tail: ?ItemIdx = null,
@@ -486,10 +594,50 @@ const Scanner = struct {
         self.brackets.deinit(self.b.allocator);
     }
 
+    /// `text[local_start..local_end)`'s absolute source span, or `null` if
+    /// that range isn't fully covered by one mapped `Segment` -- see
+    /// `Segment`'s doc comment on why a request straddling two segments
+    /// (typically: a construct that crosses a multi-line block's synthetic
+    /// line-join) is refused rather than approximated.
+    fn mapSpan(self: *const Scanner, local_start: usize, local_end: usize) ?Span {
+        if (local_end < local_start) return null;
+        for (self.segments) |seg| {
+            if (local_start >= seg.buf_offset and local_end <= seg.buf_offset + seg.len) {
+                const delta = local_start - seg.buf_offset;
+                return Span.init(seg.src_offset + delta, seg.src_offset + delta + (local_end - local_start));
+            }
+        }
+        return null;
+    }
+
+    fn setSpanIfMapped(self: *Scanner, id: Node.Id, local_start: usize, local_end: usize) void {
+        if (self.mapSpan(local_start, local_end)) |sp| self.b.setSpan(id, sp);
+    }
+
+    fn setContentSpanIfMapped(self: *Scanner, id: Node.Id, local_start: usize, local_end: usize) void {
+        if (self.mapSpan(local_start, local_end)) |sp| self.b.setContentSpan(id, sp);
+    }
+
     /// Flush accumulated plain-text `buf` into a single `str` item, if any
-    /// is pending. Called before every non-literal item is pushed, so plain
-    /// runs stay coalesced into one node exactly like Phase 1 did.
-    fn flushBuf(self: *Scanner) Allocator.Error!void {
+    /// is pending, spanning `[self.buf_start, end)` in `text` -- `end` is
+    /// always the caller's current scan position except in the one case
+    /// (`'\n'`, for trailing hard-break spaces already trimmed off `buf`)
+    /// where the run's true end precedes it. Called before every non-
+    /// literal item is pushed, so plain runs stay coalesced into one node
+    /// exactly like Phase 1 did.
+    fn flushBuf(self: *Scanner, end: usize) Allocator.Error!void {
+        if (self.buf.items.len == 0) return;
+        const id = try self.b.addLeaf(.{ .str = self.buf.items });
+        self.setSpanIfMapped(id, self.buf_start, end);
+        _ = try self.appendItem(id);
+        self.buf.clearRetainingCapacity();
+    }
+
+    /// Like `flushBuf`, but never sets a span -- for the one case
+    /// (`tryExtEmailAutolink`'s backward buf split when `!buf_pure`) where
+    /// there's no source offset we can safely attribute to the flushed
+    /// remainder; see that function's doc comment.
+    fn flushBufNoSpan(self: *Scanner) Allocator.Error!void {
         if (self.buf.items.len == 0) return;
         const id = try self.b.addLeaf(.{ .str = self.buf.items });
         _ = try self.appendItem(id);
@@ -587,12 +735,39 @@ const Scanner = struct {
                 }
                 const new_node = try self.b.addContainer(if (use_delims == 2) .strong else .emph, kids.items);
 
+                // The exact source bytes THIS match consumes: the opener's
+                // innermost (content-adjacent, i.e. rightmost) `use_delims`
+                // characters through the closer's innermost (leftmost)
+                // `use_delims` characters -- see `Delim.range_start`/
+                // `.range_end`'s doc comment. `content_*` is the interior
+                // (between the matched delimiters); `match_*` extends that
+                // by `use_delims` on each side to cover the delimiters
+                // themselves too.
+                const content_start = self.delims.items[oi].range_end;
+                const content_end = self.delims.items[closer_idx].range_start;
+
                 self.delims.items[oi].count -= use_delims;
                 self.delims.items[closer_idx].count -= use_delims;
+                self.delims.items[oi].range_end -= use_delims;
+                self.delims.items[closer_idx].range_start += use_delims;
                 const opener_count = self.delims.items[oi].count;
                 const closer_count = self.delims.items[closer_idx].count;
 
-                try self.spliceEmphasis(opener_item, opener_count, closer_item, closer_count, ch, new_node);
+                self.setSpanIfMapped(new_node, self.delims.items[oi].range_end, self.delims.items[closer_idx].range_start);
+                self.setContentSpanIfMapped(new_node, content_start, content_end);
+
+                try self.spliceEmphasis(
+                    opener_item,
+                    opener_count,
+                    self.delims.items[oi].range_start,
+                    self.delims.items[oi].range_end,
+                    closer_item,
+                    closer_count,
+                    self.delims.items[closer_idx].range_start,
+                    self.delims.items[closer_idx].range_end,
+                    ch,
+                    new_node,
+                );
 
                 const del_start = if (opener_count > 0) oi + 1 else oi;
                 const del_end = if (closer_count > 0) closer_idx else closer_idx + 1;
@@ -654,6 +829,12 @@ const Scanner = struct {
                     cur = self.items.items[ci].next;
                 }
                 const new_node = try self.b.addContainer(.delete, kids.items);
+                // Unlike emphasis, strikethrough always consumes a matched
+                // pair's runs WHOLE (see this function's doc comment), so
+                // the span is simply the two runs' own (never-shrunk)
+                // bounds, with the interior between them as `content_span`.
+                self.setSpanIfMapped(new_node, self.tilde_delims.items[oi].range_start, self.tilde_delims.items[closer_idx].range_end);
+                self.setContentSpanIfMapped(new_node, self.tilde_delims.items[oi].range_end, self.tilde_delims.items[closer_idx].range_start);
                 const left = self.items.items[opener_item].prev;
                 const right = self.items.items[closer_item].next;
                 _ = try self.insertItemBetween(left, right, new_node);
@@ -679,20 +860,38 @@ const Scanner = struct {
     /// `use_delims` delimiters' worth of content) in place of the matched
     /// portion of the opener/closer runs. If either run has leftover
     /// (unconsumed) delimiters, its placeholder item's text is shrunk in
-    /// place to just the leftover characters and kept adjacent to
-    /// `new_node`; if fully consumed, the item is dropped from the sequence
-    /// entirely.
-    fn spliceEmphasis(self: *Scanner, opener_item: ItemIdx, opener_count: usize, closer_item: ItemIdx, closer_count: usize, ch: u8, new_node: Node.Id) Allocator.Error!void {
+    /// place to just the leftover characters (spanning
+    /// `[*_range_start, *_range_end)` -- the delimiter's own current
+    /// remaining sub-range, already updated by the caller) and kept
+    /// adjacent to `new_node`; if fully consumed, the item is dropped from
+    /// the sequence entirely.
+    fn spliceEmphasis(
+        self: *Scanner,
+        opener_item: ItemIdx,
+        opener_count: usize,
+        opener_range_start: usize,
+        opener_range_end: usize,
+        closer_item: ItemIdx,
+        closer_count: usize,
+        closer_range_start: usize,
+        closer_range_end: usize,
+        ch: u8,
+        new_node: Node.Id,
+    ) Allocator.Error!void {
         var left: ?ItemIdx = undefined;
         if (opener_count > 0) {
-            self.items.items[opener_item].node = try makeRunStr(self.b, ch, opener_count);
+            const run_id = try makeRunStr(self.b, ch, opener_count);
+            self.setSpanIfMapped(run_id, opener_range_start, opener_range_end);
+            self.items.items[opener_item].node = run_id;
             left = opener_item;
         } else {
             left = self.items.items[opener_item].prev;
         }
         var right: ?ItemIdx = undefined;
         if (closer_count > 0) {
-            self.items.items[closer_item].node = try makeRunStr(self.b, ch, closer_count);
+            const run_id = try makeRunStr(self.b, ch, closer_count);
+            self.setSpanIfMapped(run_id, closer_range_start, closer_range_end);
+            self.items.items[closer_item].node = run_id;
             right = closer_item;
         } else {
             right = self.items.items[closer_item].next;
@@ -702,12 +901,15 @@ const Scanner = struct {
 
     /// Resolve a just-matched link/image: `br` is the bracket being closed
     /// (already known active), `dest`/`title` its (already decoded)
-    /// destination/title. Runs emphasis matching over the bracket's own
-    /// contents first (so nested `*`/`_` bind INSIDE the link text, not
-    /// across its boundary), gathers that content as the new node's
-    /// children, splices the node in over the whole `[`/`![...]` span, and
-    /// applies the "links cannot contain links" deactivation.
-    fn finishLinkOrImage(self: *Scanner, br: Bracket, dest: []const u8, title: ?[]const u8) Allocator.Error!void {
+    /// destination/title, `close_i` the position of the closing `]`, and
+    /// `end` one past the whole construct's last byte (the closing `)` for
+    /// an inline link/image, or the closing `]` of a reference form -- see
+    /// `handleCloseBracket`'s call sites. Runs emphasis matching over the
+    /// bracket's own contents first (so nested `*`/`_` bind INSIDE the link
+    /// text, not across its boundary), gathers that content as the new
+    /// node's children, splices the node in over the whole `[`/`![...]`
+    /// span, and applies the "links cannot contain links" deactivation.
+    fn finishLinkOrImage(self: *Scanner, br: Bracket, dest: []const u8, title: ?[]const u8, close_i: usize, end: usize) Allocator.Error!void {
         try self.processEmphasis(br.delim_stack_len);
         try self.processStrikethrough(br.tilde_stack_len);
 
@@ -724,6 +926,12 @@ const Scanner = struct {
         else
             .{ .link = .{ .destination = dest, .reference = null } };
         const node_id = try self.b.addContainer(kind, kids.items);
+        // Full source extent (`[`/`![` through the closing `)`/`]`
+        // inclusive); `content_span` is just the bracketed text between
+        // `[`/`![` and `]` -- see this file's/`block.zig`'s module doc
+        // comments on the "delimiters included" span convention.
+        self.setSpanIfMapped(node_id, br.open_start, end);
+        self.setContentSpanIfMapped(node_id, br.content_start, close_i);
         if (title) |t| {
             try self.b.setAttrs(node_id, .{ .entries = &.{.{ .key = "title", .value = t }} });
         }
@@ -813,7 +1021,7 @@ fn handleCloseBracket(sc: *Scanner, text: []const u8, close_i: usize) Allocator.
             defer sc.b.allocator.free(dest);
             const title = if (raw.title_raw) |t| try decodeText(sc.b.allocator, t) else null;
             defer if (title) |t| sc.b.allocator.free(t);
-            try sc.finishLinkOrImage(br, dest, title);
+            try sc.finishLinkOrImage(br, dest, title, close_i, raw.end);
             return raw.end;
         }
     }
@@ -837,7 +1045,7 @@ fn handleCloseBracket(sc: *Scanner, text: []const u8, close_i: usize) Allocator.
         if (sc.link_refs.get(norm)) |ref_id| {
             const dest = sc.b.nodes.items[ref_id].kind.reference.destination;
             const title = builderAttrsOf(sc.b, ref_id).get("title");
-            try sc.finishLinkOrImage(br, dest, title);
+            try sc.finishLinkOrImage(br, dest, title, close_i, ref_end);
             return ref_end;
         }
     }
@@ -1165,8 +1373,10 @@ fn tryExtHttpAutolink(sc: *Scanner, text: []const u8, i: usize) Allocator.Error!
     const trimmed = trimTrailingAutolinkPunct(text[i..raw_end]);
     if (trimmed.len <= prefix.len) return null;
     const final_end = i + trimmed.len;
-    try sc.flushBuf();
-    _ = try sc.appendItem(try sc.b.addLeaf(.{ .url = text[i..final_end] }));
+    try sc.flushBuf(i);
+    const id = try sc.b.addLeaf(.{ .url = text[i..final_end] });
+    sc.setSpanIfMapped(id, i, final_end);
+    _ = try sc.appendItem(id);
     return final_end;
 }
 
@@ -1183,13 +1393,15 @@ fn tryExtWwwAutolink(sc: *Scanner, text: []const u8, i: usize) Allocator.Error!?
     const trimmed = trimTrailingAutolinkPunct(text[i..raw_end]);
     if (trimmed.len <= 4) return null;
     const final_end = i + trimmed.len;
-    try sc.flushBuf();
+    try sc.flushBuf(i);
     var dest = std.ArrayList(u8).empty;
     defer dest.deinit(sc.b.allocator);
     try dest.appendSlice(sc.b.allocator, "http://");
     try dest.appendSlice(sc.b.allocator, text[i..final_end]);
     const text_node = try sc.b.addLeaf(.{ .str = text[i..final_end] });
+    sc.setSpanIfMapped(text_node, i, final_end);
     const link_node = try sc.b.addContainer(.{ .link = .{ .destination = dest.items, .reference = null } }, &.{text_node});
+    sc.setSpanIfMapped(link_node, i, final_end);
     _ = try sc.appendItem(link_node);
     return final_end;
 }
@@ -1208,6 +1420,14 @@ fn isExtEmailLocalChar(c: u8) bool {
 /// at least one `.`) so a bare `user@host` doesn't autolink. On success,
 /// `buf`'s claimed suffix is dropped (so it isn't ALSO flushed as plain
 /// text) and an `email` leaf is appended in its place.
+///
+/// Span note: `local_start` is an INDEX into `buf`, not a `text` offset --
+/// turning it into one (`sc.buf_start + local_start`) is only valid while
+/// `sc.buf_pure` holds (no entity/backslash-escape decoding happened
+/// earlier in this run, which would make `buf` shorter than the `text` span
+/// it came from -- see `Scanner.buf_pure`'s doc comment). When it doesn't
+/// hold, this deliberately leaves BOTH the split-off leftover `str` and the
+/// `email` node's spans unset rather than risk computing a wrong one.
 fn tryExtEmailAutolink(sc: *Scanner, text: []const u8, at: usize) Allocator.Error!?usize {
     const buf = sc.buf.items;
     var local_start = buf.len;
@@ -1239,9 +1459,16 @@ fn tryExtEmailAutolink(sc: *Scanner, text: []const u8, at: usize) Allocator.Erro
     try email.append(sc.b.allocator, '@');
     try email.appendSlice(sc.b.allocator, text[at + 1 .. final_end]);
 
+    const local_part_src_start: ?usize = if (sc.buf_pure) sc.buf_start + local_start else null;
     sc.buf.items.len = local_start;
-    try sc.flushBuf();
-    _ = try sc.appendItem(try sc.b.addLeaf(.{ .email = email.items }));
+    if (local_part_src_start) |lps| {
+        try sc.flushBuf(lps);
+    } else {
+        try sc.flushBufNoSpan();
+    }
+    const email_id = try sc.b.addLeaf(.{ .email = email.items });
+    if (local_part_src_start) |lps| sc.setSpanIfMapped(email_id, lps, final_end);
+    _ = try sc.appendItem(email_id);
     return final_end;
 }
 
@@ -1606,7 +1833,25 @@ fn parseAndFinish(text: []const u8) !AST {
 fn parseAndFinishWithOptions(text: []const u8, options: Options) !AST {
     var b = Builder.init(testing.allocator);
     errdefer b.deinit();
-    const children = try parseInline(&b, text, &empty_refs, options);
+    const children = try parseInline(&b, text, &.{}, &empty_refs, options);
+    defer b.allocator.free(children);
+    const root = try b.addContainer(.para, children);
+    return b.finish(root);
+}
+
+/// Like `parseAndFinishWithOptions`, but treats `text` itself as "the
+/// source" (a single `Segment` mapping the whole buffer onto itself 1:1),
+/// so a test can slice `text` directly with a resulting node's `span` and
+/// expect an exact match -- see this file's span tests below. Real callers
+/// (`block.zig`) build `Segment`s mapping back into an actual document's
+/// source instead; this is just the degenerate "the leaf text IS the
+/// source" case, valid whenever `text` has no line joins/stripped markers
+/// of its own (true for every single-line case these tests use).
+fn parseAndFinishMapped(text: []const u8, options: Options) !AST {
+    var b = Builder.init(testing.allocator);
+    errdefer b.deinit();
+    const segs = [_]Segment{.{ .buf_offset = 0, .src_offset = 0, .len = text.len }};
+    const children = try parseInline(&b, text, &segs, &empty_refs, options);
     defer b.allocator.free(children);
     const root = try b.addContainer(.para, children);
     return b.finish(root);
@@ -1806,7 +2051,7 @@ fn parseWithOneReference(text: []const u8, label: []const u8, dest: []const u8) 
     defer refs.deinit(testing.allocator);
     try refs.put(testing.allocator, b.nodes.items[ref_id].kind.reference.label, ref_id);
 
-    const children = try parseInline(&b, text, &refs, .{});
+    const children = try parseInline(&b, text, &.{}, &refs, .{});
     defer b.allocator.free(children);
     const root = try b.addContainer(.para, children);
     return b.finish(root);
@@ -1861,6 +2106,128 @@ test "unhandled inline markup (unresolved brackets) passes through as literal te
     // exact input.
     const link = ast.nodes[ast.root].first_child.?;
     try testing.expect(ast.nodes[link].kind == .link);
+}
+
+// ── span accuracy (byte-accurate, delimiters included) ──────────────────
+// See `Segment`'s doc comment: these use `parseAndFinishMapped`, which
+// treats the `text` argument as its own source (a single identity segment),
+// so a node's resolved `span`/`content_span` can be sliced directly out of
+// the very same string and compared byte-for-byte.
+
+test "span: a str leaf's span is its own exact bytes" {
+    var ast = try parseAndFinishMapped("hello world", .{});
+    defer ast.deinit();
+    const s = "hello world";
+    const child = ast.nodes[ast.root].first_child.?;
+    try testing.expectEqualStrings(s, Span.of(u8, ast.nodes[child].span, s));
+}
+
+test "span: emphasis covers the delimiters, content_span covers just the interior" {
+    var ast = try parseAndFinishMapped("*abc*", .{});
+    defer ast.deinit();
+    const s = "*abc*";
+    const em = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[em].kind == .emph);
+    try testing.expectEqualStrings("*abc*", Span.of(u8, ast.nodes[em].span, s));
+    try testing.expectEqualStrings("abc", Span.of(u8, ast.nodes[em].content_span.?, s));
+}
+
+test "span: strong emphasis covers its own delimiters" {
+    var ast = try parseAndFinishMapped("**abc**", .{});
+    defer ast.deinit();
+    const s = "**abc**";
+    const strong = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[strong].kind == .strong);
+    try testing.expectEqualStrings("**abc**", Span.of(u8, ast.nodes[strong].span, s));
+    try testing.expectEqualStrings("abc", Span.of(u8, ast.nodes[strong].content_span.?, s));
+}
+
+test "span: a partially-consumed delimiter run's leftover placeholder still gets an accurate span" {
+    // "*a **b***": the inner "**"+"***" pair stack-matches as a `strong`
+    // covering "**b**" (2 of the closer's 3 delimiters used), leaving the
+    // OUTER single "*" on each side unmatched -- neither the leading nor
+    // the trailing single "*" ever pairs with anything, so both stay
+    // literal `str` leaves (see `spliceEmphasis`'s leftover-placeholder
+    // case) rather than forming an outer `emph`. Every one of these four
+    // top-level nodes -- including the two single-`*` leftovers -- must
+    // still get its own byte-accurate span.
+    var ast = try parseAndFinishMapped("*a **b***", .{});
+    defer ast.deinit();
+    const s = "*a **b***";
+
+    const lead_star = ast.nodes[ast.root].first_child.?;
+    try testing.expectEqualStrings("*", Span.of(u8, ast.nodes[lead_star].span, s));
+
+    const a_space = ast.nodes[lead_star].next_sibling.?;
+    try testing.expectEqualStrings("a ", Span.of(u8, ast.nodes[a_space].span, s));
+
+    const strong = ast.nodes[a_space].next_sibling.?;
+    try testing.expect(ast.nodes[strong].kind == .strong);
+    try testing.expectEqualStrings("**b**", Span.of(u8, ast.nodes[strong].span, s));
+    try testing.expectEqualStrings("b", Span.of(u8, ast.nodes[strong].content_span.?, s));
+
+    const trail_star = ast.nodes[strong].next_sibling.?;
+    try testing.expectEqualStrings("*", Span.of(u8, ast.nodes[trail_star].span, s));
+    try testing.expectEqual(@as(?Node.Id, null), ast.nodes[trail_star].next_sibling);
+}
+
+test "span: an inline link covers '[text](dest)', content_span covers just the text" {
+    var ast = try parseAndFinishMapped("[x](http://a.co)", .{});
+    defer ast.deinit();
+    const s = "[x](http://a.co)";
+    const link = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[link].kind == .link);
+    try testing.expectEqualStrings("[x](http://a.co)", Span.of(u8, ast.nodes[link].span, s));
+    try testing.expectEqualStrings("x", Span.of(u8, ast.nodes[link].content_span.?, s));
+}
+
+test "span: an inline image covers '![alt](dest)'" {
+    var ast = try parseAndFinishMapped("![alt](/a.png)", .{});
+    defer ast.deinit();
+    const s = "![alt](/a.png)";
+    const img = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[img].kind == .image);
+    try testing.expectEqualStrings("![alt](/a.png)", Span.of(u8, ast.nodes[img].span, s));
+    try testing.expectEqualStrings("alt", Span.of(u8, ast.nodes[img].content_span.?, s));
+}
+
+test "span: a code span covers its own backticks" {
+    var ast = try parseAndFinishMapped("a `bc` d", .{});
+    defer ast.deinit();
+    const s = "a `bc` d";
+    const first = ast.nodes[ast.root].first_child.?; // "a "
+    const code = ast.nodes[first].next_sibling.?; // the verbatim node
+    try testing.expect(ast.nodes[code].kind == .verbatim);
+    try testing.expectEqualStrings("`bc`", Span.of(u8, ast.nodes[code].span, s));
+}
+
+test "span: a strikethrough delete node covers '~~text~~'" {
+    var ast = try parseAndFinishMapped("~~gone~~", .{ .strikethrough = true });
+    defer ast.deinit();
+    const s = "~~gone~~";
+    const del = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[del].kind == .delete);
+    try testing.expectEqualStrings("~~gone~~", Span.of(u8, ast.nodes[del].span, s));
+    try testing.expectEqualStrings("gone", Span.of(u8, ast.nodes[del].content_span.?, s));
+}
+
+test "span: an autolink covers '<...>' including the angle brackets" {
+    var ast = try parseAndFinishMapped("<http://a.co>", .{});
+    defer ast.deinit();
+    const s = "<http://a.co>";
+    const url = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[url].kind == .url);
+    try testing.expectEqualStrings(s, Span.of(u8, ast.nodes[url].span, s));
+}
+
+test "span: a node with no segment map is left unset (0,0)" {
+    // The plain (unmapped) helper -- no `Segment`s at all -- must never
+    // fabricate a span.
+    var ast = try parseAndFinish("*abc*");
+    defer ast.deinit();
+    const em = ast.nodes[ast.root].first_child.?;
+    try testing.expectEqual(@as(usize, 0), ast.nodes[em].span.start);
+    try testing.expectEqual(@as(usize, 0), ast.nodes[em].span.end);
 }
 
 // ── Phase 3: footnote references ────────────────────────────────────────
