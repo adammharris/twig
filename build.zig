@@ -1,12 +1,22 @@
 const std = @import("std");
+const version = std.SemanticVersion.parse(@import("build.zig.zon").version) catch
+    @compileError("invalid `.version` in build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const options = b.addOptions();
+    options.addOption(u8, "version_major", @intCast(version.major));
+    options.addOption(u8, "version_minor", @intCast(version.minor));
+    options.addOption(u8, "version_patch", @intCast(version.patch));
+    const options_mod = options.createModule();
+
     const mod = b.addModule("twig", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+
     const exe = b.addExecutable(.{
         .name = "twig",
         .root_module = b.createModule(.{
@@ -20,6 +30,26 @@ pub fn build(b: *std.Build) void {
     });
 
     b.installArtifact(exe);
+
+    const c_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "twig",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/c_abi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = !target.result.cpu.arch.isWasm(),
+        }),
+    });
+    c_lib.root_module.addImport("build_options", options_mod);
+    const install_c_lib = b.addInstallArtifact(c_lib, .{});
+    const install_c_header = b.addInstallHeaderFile(b.path("bindings/c/include/twig.h"), "twig.h");
+    b.getInstallStep().dependOn(&install_c_lib.step);
+    b.getInstallStep().dependOn(&install_c_header.step);
+
+    const install_c_lib_step = b.step("install-c-lib", "Install the C ABI static library");
+    install_c_lib_step.dependOn(&install_c_lib.step);
+    install_c_lib_step.dependOn(&install_c_header.step);
 
     const run_step = b.step("run", "Run the app");
 

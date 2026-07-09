@@ -1,0 +1,12 @@
+[package]
+name = "twig"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust bindings for Twig document parsing/rendering."
+repository = "https://github.com/adammharris/twig"
+links = "twig"
+
+[lib]
+name = "twig"
+path = "src/lib.rs"
