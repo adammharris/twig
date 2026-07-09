@@ -37,6 +37,38 @@ pub fn attrsOf(self: *const AST, id: Node.Id) AST.Attrs {
     return self.attrs[idx];
 }
 
+/// Error from index-path navigation (`getIdByPath`/`getNodeByPath`).
+pub const PathError = error{
+    /// A path segment asked for a child index the node doesn't have — either
+    /// the node has fewer children than the index, or none at all (a leaf).
+    PathOutOfBounds,
+};
+
+/// Navigate from the root to a node by a pure *index path*: `path[i]` selects
+/// the `path[i]`-th child (0-based, source order) of the node reached so far.
+/// An empty path returns the root. This is the document analogue of fig's
+/// `getIdByPath`, but with only an index segment — documents have no keys to
+/// address by (see `editor.zig`). The returned id is valid only against the
+/// `AST` it was resolved from; after an edit + reparse, paths must be
+/// recomputed against the new tree.
+pub fn getIdByPath(self: *const AST, path: []const usize) PathError!Node.Id {
+    var id = self.root;
+    for (path) |idx| {
+        var child = self.nodes[id].first_child orelse return error.PathOutOfBounds;
+        var i: usize = 0;
+        while (i < idx) : (i += 1) {
+            child = self.nodes[child].next_sibling orelse return error.PathOutOfBounds;
+        }
+        id = child;
+    }
+    return id;
+}
+
+/// Like `getIdByPath`, but returns a pointer to the node itself.
+pub fn getNodeByPath(self: *const AST, path: []const usize) PathError!*const Node {
+    return &self.nodes[try getIdByPath(self, path)];
+}
+
 test "children walks first_child/next_sibling in order" {
     const testing = std.testing;
     var b = AST.Builder.init(testing.allocator);

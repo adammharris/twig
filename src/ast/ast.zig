@@ -42,6 +42,9 @@ pub const Builder = @import("builder.zig");
 pub const children = reader.children;
 pub const ChildIterator = reader.ChildIterator;
 pub const attrsOf = reader.attrsOf;
+pub const getIdByPath = reader.getIdByPath;
+pub const getNodeByPath = reader.getNodeByPath;
+pub const PathError = reader.PathError;
 
 allocator: Allocator,
 owned_strings: []const []const u8 = &.{},

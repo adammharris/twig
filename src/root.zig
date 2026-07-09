@@ -40,10 +40,17 @@ pub const Html = @import("languages/html/html.zig");
 /// the Phase 1/2/3 scope split.
 pub const Markdown = @import("languages/markdown/markdown.zig");
 
+/// The span-splice editor: lossless, in-place edits to a parsed document via
+/// index paths into the shared `AST`. Language-agnostic — construct it with a
+/// `parse_fn` for the source's format. See `ast/editor.zig`'s module doc
+/// comment for the reparse/rollback model and its current limits.
+pub const Editor = @import("ast/editor.zig").Editor;
+
 test {
     _ = AST;
     _ = Djot;
     _ = Xml;
     _ = Html;
     _ = Markdown;
+    _ = @import("ast/editor.zig");
 }
