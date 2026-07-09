@@ -46,6 +46,13 @@ pub const Markdown = @import("languages/markdown/markdown.zig");
 /// comment for the reparse/rollback model and its current limits.
 pub const Editor = @import("ast/editor.zig").Editor;
 
+/// Content-based node addressing: `Select.parse` a CSS-lite selector (e.g.
+/// `heading[level=2]`, `link[dest^="http"]`, `item("eggs")`) then
+/// `Select.resolveAll`/`resolveOne` it against an `AST` — the friendly
+/// alternative to raw index paths, and the engine behind `twig query`/`edit`.
+/// See `ast/select.zig`'s module doc comment.
+pub const Select = @import("ast/select.zig");
+
 test {
     _ = AST;
     _ = Djot;
@@ -53,4 +60,5 @@ test {
     _ = Html;
     _ = Markdown;
     _ = @import("ast/editor.zig");
+    _ = Select;
 }
