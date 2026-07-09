@@ -70,6 +70,7 @@ const AST = @import("../../ast/ast.zig");
 const Node = AST.Node;
 const Builder = AST.Builder;
 const entities = @import("entities.zig");
+const Options = @import("options.zig");
 
 /// Parse `text` (a single leaf block's already-assembled content — see this
 /// file's module doc comment) into a flat sequence of inline children, added
@@ -79,10 +80,15 @@ const entities = @import("entities.zig");
 /// definition's destination/title), consulted for reference-style links and
 /// images; it must already be COMPLETE (every link reference definition in
 /// the document registered), which is why `block.zig` defers calling this
-/// until block-level parsing has finished. Returns the ordered list of child
-/// ids (caller's to free; typically immediately handed to `b.setChildren`).
-pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHashMapUnmanaged(Node.Id)) Allocator.Error![]Node.Id {
-    var sc: Scanner = .{ .b = b, .link_refs = link_refs };
+/// until block-level parsing has finished. `options` gates Phase 3's
+/// inline-level extensions (strikethrough, math, GFM extended autolinks —
+/// see the "Phase 3" section below); every extension this file recognizes
+/// checks `sc.options.<flag>` at its own dispatch point, so `options ==
+/// .commonmark` reproduces Phase 2's behavior exactly. Returns the ordered
+/// list of child ids (caller's to free; typically immediately handed to
+/// `b.setChildren`).
+pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHashMapUnmanaged(Node.Id), options: Options) Allocator.Error![]Node.Id {
+    var sc: Scanner = .{ .b = b, .link_refs = link_refs, .options = options };
     defer sc.deinit();
 
     var i: usize = 0;
@@ -196,6 +202,7 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
                     .active = true,
                     .content_start = i + 1,
                     .delim_stack_len = sc.delims.items.len,
+                    .tilde_stack_len = sc.tilde_delims.items.len,
                 });
                 i += 1;
             },
@@ -209,6 +216,7 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
                         .active = true,
                         .content_start = i + 2,
                         .delim_stack_len = sc.delims.items.len,
+                        .tilde_stack_len = sc.tilde_delims.items.len,
                     });
                     i += 2;
                 } else {
@@ -220,6 +228,97 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
                 try sc.flushBuf();
                 i = try handleCloseBracket(&sc, text, i);
             },
+            '~' => {
+                // GFM strikethrough (`self.options.strikethrough`): a `~`/`~~`
+                // delimiter run, reusing the SAME flanking classification as
+                // `*`/`_` (no intraword restriction, since `computeFlanking`
+                // only special-cases `ch == '_'`) but its OWN delimiter stack
+                // and matching pass (`tilde_delims`/`processStrikethrough`)
+                // rather than folding into `delims`/`processEmphasis` — GFM
+                // strikethrough has NO "rule of 3" and only ever matches
+                // EQUAL-length runs of 1 or 2, both of which would be wrong if
+                // it shared CommonMark emphasis's matching algorithm. A run
+                // longer than 2 is never eligible (GFM requires "one or two
+                // tildes"), so it always falls back to literal text.
+                var run_end = i;
+                while (run_end < text.len and text[run_end] == '~') run_end += 1;
+                const run_len = run_end - i;
+                const flank = if (sc.options.strikethrough) computeFlanking(text, i, run_end, '~') else Flank{ .can_open = false, .can_close = false };
+                if (run_len <= 2 and (flank.can_open or flank.can_close)) {
+                    try sc.flushBuf();
+                    const item_idx = try sc.appendItem(try b.addLeaf(.{ .str = text[i..run_end] }));
+                    try sc.tilde_delims.append(b.allocator, .{
+                        .item = item_idx,
+                        .count = run_len,
+                        .can_open = flank.can_open,
+                        .can_close = flank.can_close,
+                    });
+                } else {
+                    try sc.buf.appendSlice(b.allocator, text[i..run_end]);
+                }
+                i = run_end;
+            },
+            '$' => {
+                // Twig's inline/display math extension (`self.options.math`,
+                // OFF by default — not part of CommonMark or GFM). `$$...$$`
+                // (display) is tried before single-`$` (inline) so `$$x$$`
+                // doesn't parse as an empty inline-math pair either side of
+                // `x`. Neither delimiter may be immediately preceded/followed
+                // by whitespace at its inner edge (mirrors common `$...$`
+                // math conventions, e.g. Pandoc's), which keeps stray prose
+                // dollar signs ("$5 and $10") from being misread.
+                var matched: ?struct { kind: Node.Kind, end: usize } = null;
+                if (sc.options.math) {
+                    if (i + 1 < text.len and text[i + 1] == '$') {
+                        if (scanDisplayMath(text, i)) |m| {
+                            matched = .{ .kind = .{ .display_math = text[i + 2 .. m.content_end] }, .end = m.end };
+                        }
+                    } else if (scanInlineMath(text, i)) |m| {
+                        matched = .{ .kind = .{ .inline_math = text[i + 1 .. m.content_end] }, .end = m.end };
+                    }
+                }
+                if (matched) |m| {
+                    try sc.flushBuf();
+                    _ = try sc.appendItem(try b.addLeaf(m.kind));
+                    i = m.end;
+                } else {
+                    try sc.buf.append(b.allocator, '$');
+                    i += 1;
+                }
+            },
+            'h', 'w' => {
+                // GFM extended autolinks (`self.options.autolinks`): bare
+                // `http(s)://...`/`www...` URLs in ordinary text, as opposed
+                // to Phase 2's CommonMark-core `<scheme:...>` form (which
+                // stays on unconditionally via the `<` case above,
+                // regardless of this flag). See `tryExtHttpAutolink`/
+                // `tryExtWwwAutolink` for the word-boundary and trailing-
+                // punctuation-trimming rules approximated here.
+                const auto_end: ?usize = if (sc.options.autolinks)
+                    (if (c == 'h') try tryExtHttpAutolink(&sc, text, i) else try tryExtWwwAutolink(&sc, text, i))
+                else
+                    null;
+                if (auto_end) |end| {
+                    i = end;
+                } else {
+                    try sc.buf.append(b.allocator, c);
+                    i += 1;
+                }
+            },
+            '@' => {
+                // GFM extended email autolink: unlike the `http`/`www` forms,
+                // the LOCAL part of the address is already sitting in `buf`
+                // (ordinary preceding text) by the time `@` is seen, so
+                // `tryExtEmailAutolink` reaches backward into `buf` to claim
+                // it -- see that function's doc comment.
+                const auto_end: ?usize = if (sc.options.autolinks) try tryExtEmailAutolink(&sc, text, i) else null;
+                if (auto_end) |end| {
+                    i = end;
+                } else {
+                    try sc.buf.append(b.allocator, '@');
+                    i += 1;
+                }
+            },
             else => {
                 try sc.buf.append(b.allocator, c);
                 i += 1;
@@ -227,8 +326,10 @@ pub fn parseInline(b: *Builder, text: []const u8, link_refs: *const std.StringHa
         }
     }
     try sc.flushBuf();
-    // Resolve whatever emphasis delimiters are left over the WHOLE stack.
+    // Resolve whatever emphasis/strikethrough delimiters are left over the
+    // WHOLE stack.
     try sc.processEmphasis(0);
+    try sc.processStrikethrough(0);
 
     var out = std.ArrayList(Node.Id).empty;
     errdefer out.deinit(b.allocator);
@@ -330,22 +431,40 @@ const Bracket = struct {
     /// for THIS bracket's contents never reaches back past delimiters that
     /// existed before it opened.
     delim_stack_len: usize,
+    /// `Scanner.tilde_delims.items.len` at the moment this bracket was
+    /// pushed -- the strikethrough analog of `delim_stack_len`, same
+    /// rationale (see `processStrikethrough`).
+    tilde_stack_len: usize = 0,
+};
+
+/// One `~`/`~~` strikethrough delimiter run (`self.options.strikethrough`) --
+/// the GFM analog of `Delim`, but on its OWN stack/matching pass
+/// (`processStrikethrough`) rather than sharing CommonMark emphasis's rule-
+/// of-3 matching -- see the `'~'` case in `parseInline`'s doc comment for why.
+const StrikeDelim = struct {
+    item: ItemIdx,
+    count: usize,
+    can_open: bool,
+    can_close: bool,
 };
 
 const Scanner = struct {
     b: *Builder,
     link_refs: *const std.StringHashMapUnmanaged(Node.Id),
+    options: Options = .{},
     buf: std.ArrayList(u8) = .empty,
     items: std.ArrayList(Item) = .empty,
     head: ?ItemIdx = null,
     tail: ?ItemIdx = null,
     delims: std.ArrayList(Delim) = .empty,
+    tilde_delims: std.ArrayList(StrikeDelim) = .empty,
     brackets: std.ArrayList(Bracket) = .empty,
 
     fn deinit(self: *Scanner) void {
         self.buf.deinit(self.b.allocator);
         self.items.deinit(self.b.allocator);
         self.delims.deinit(self.b.allocator);
+        self.tilde_delims.deinit(self.b.allocator);
         self.brackets.deinit(self.b.allocator);
     }
 
@@ -476,6 +595,68 @@ const Scanner = struct {
         self.delims.items.len = stack_bottom;
     }
 
+    /// GFM strikethrough's matching pass: bottom-up, over `tilde_delims`,
+    /// pairing each closer with the NEAREST still-open opener of the SAME
+    /// run length (1 matches 1, 2 matches 2 -- unlike `processEmphasis`,
+    /// there's no partial consumption and no rule-of-3, since GFM
+    /// strikethrough only ever recognizes whole "1 or 2 tildes" runs). A
+    /// matched pair is entirely consumed (both placeholder items dropped
+    /// from the sequence, replaced by one spliced-in `delete` node);
+    /// unmatched delimiters are simply left as literal text, exactly like
+    /// `processEmphasis`.
+    fn processStrikethrough(self: *Scanner, stack_bottom: usize) Allocator.Error!void {
+        var closer_idx = stack_bottom;
+        while (closer_idx < self.tilde_delims.items.len) {
+            const closer = self.tilde_delims.items[closer_idx];
+            if (!closer.can_close) {
+                closer_idx += 1;
+                continue;
+            }
+            var opener_idx: ?usize = null;
+            if (closer_idx > stack_bottom) {
+                var k = closer_idx;
+                while (k > stack_bottom) {
+                    k -= 1;
+                    const cand = self.tilde_delims.items[k];
+                    if (cand.can_open and cand.count == closer.count) {
+                        opener_idx = k;
+                        break;
+                    }
+                }
+            }
+            if (opener_idx) |oi| {
+                const opener_item = self.tilde_delims.items[oi].item;
+                const closer_item = self.tilde_delims.items[closer_idx].item;
+                var kids = std.ArrayList(Node.Id).empty;
+                defer kids.deinit(self.b.allocator);
+                var cur = self.items.items[opener_item].next;
+                while (cur) |ci| {
+                    if (ci == closer_item) break;
+                    try kids.append(self.b.allocator, self.items.items[ci].node);
+                    cur = self.items.items[ci].next;
+                }
+                const new_node = try self.b.addContainer(.delete, kids.items);
+                const left = self.items.items[opener_item].prev;
+                const right = self.items.items[closer_item].next;
+                _ = try self.insertItemBetween(left, right, new_node);
+                self.removeTildeDelimRange(oi, closer_idx + 1);
+                closer_idx = oi;
+            } else if (!closer.can_open) {
+                self.removeTildeDelimRange(closer_idx, closer_idx + 1);
+            } else {
+                closer_idx += 1;
+            }
+        }
+        self.tilde_delims.items.len = stack_bottom;
+    }
+
+    fn removeTildeDelimRange(self: *Scanner, start: usize, end: usize) void {
+        if (end <= start) return;
+        const tail = self.tilde_delims.items[end..];
+        std.mem.copyForwards(StrikeDelim, self.tilde_delims.items[start..][0..tail.len], tail);
+        self.tilde_delims.items.len -= (end - start);
+    }
+
     /// Insert the `emph`/`strong` node `new_node` (already built from
     /// `use_delims` delimiters' worth of content) in place of the matched
     /// portion of the opener/closer runs. If either run has leftover
@@ -510,6 +691,7 @@ const Scanner = struct {
     /// applies the "links cannot contain links" deactivation.
     fn finishLinkOrImage(self: *Scanner, br: Bracket, dest: []const u8, title: ?[]const u8) Allocator.Error!void {
         try self.processEmphasis(br.delim_stack_len);
+        try self.processStrikethrough(br.tilde_stack_len);
 
         var kids = std.ArrayList(Node.Id).empty;
         defer kids.deinit(self.b.allocator);
@@ -821,6 +1003,209 @@ fn scanAutolinkEmail(text: []const u8, at: usize) ?usize {
     }
     if (i >= text.len or text[i] != '>') return null;
     return i + 1;
+}
+
+// ── Phase 3: inline/display math (`self.options.math`) ─────────────────
+// A twig extension, not part of CommonMark or GFM (mission: "off by default,
+// render is whatever the shared printer already does for `inline_math`/
+// `display_math`"). Follows the common `$...$`/`$$...$$` convention (e.g.
+// Pandoc's): a delimiter's INNER edge (the character right after an opener /
+// right before a closer) may not be whitespace, which is what keeps stray
+// prose dollar signs ("costs $5 and $10") from being misread as math.
+
+const MathSpan = struct { content_end: usize, end: usize };
+
+/// `text[at..at+2] == "$$"`. Scans forward for the next `$$`, requiring at
+/// least one byte of content between them (an adjacent `$$$$` is therefore
+/// never read as empty display math).
+fn scanDisplayMath(text: []const u8, at: usize) ?MathSpan {
+    var j = at + 2;
+    while (j + 1 < text.len) : (j += 1) {
+        if (text[j] == '$' and text[j + 1] == '$') {
+            if (j == at + 2) return null;
+            return .{ .content_end = j, .end = j + 2 };
+        }
+    }
+    return null;
+}
+
+/// `text[at] == '$'` (and, per the caller, not the start of a `$$` run).
+/// Scans forward for a closing `$` whose preceding byte isn't whitespace,
+/// skipping `\`-escaped bytes (so `\$` inside the span never closes it) and
+/// refusing to cross a line ending (no multi-line inline math).
+fn scanInlineMath(text: []const u8, at: usize) ?MathSpan {
+    if (at + 1 >= text.len) return null;
+    const first = text[at + 1];
+    if (first == ' ' or first == '\t' or first == '\n' or first == '$') return null;
+    var j = at + 1;
+    while (j < text.len) {
+        const ch = text[j];
+        if (ch == '\\' and j + 1 < text.len) {
+            j += 2;
+            continue;
+        }
+        if (ch == '\n') return null;
+        if (ch == '$' and text[j - 1] != ' ' and text[j - 1] != '\t') {
+            return .{ .content_end = j, .end = j + 1 };
+        }
+        j += 1;
+    }
+    return null;
+}
+
+// ── Phase 3: GFM extended autolinks (`self.options.autolinks`) ─────────
+// Bare `http(s)://`/`www.`/email URLs in ordinary text -- as opposed to
+// Phase 2's CommonMark-core `<scheme:...>`/`<email>` form (the `'<'` case
+// above), which stays on unconditionally regardless of this flag. This is a
+// documented APPROXIMATION of GFM's own "extended autolinks" grammar (GFM
+// spec appendix, and cmark-gfm's `extensions/autolink.c`), not a byte-exact
+// port: word-boundary detection is "the previous byte isn't alphanumeric/`_`"
+// (GFM's own rule is close to this but not identical for all Unicode input),
+// and trailing-punctuation trimming (`trimTrailingAutolinkPunct`) covers the
+// common ASCII punctuation set plus balanced-paren trimming, but skips GFM's
+// extra carve-out for a trailing `&entity;`-shaped suffix.
+
+fn isWordChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// Trim trailing punctuation off an autolink candidate per GFM's rule:
+/// `?!.,:*_~'";` are always trimmed (repeatedly, so e.g. `".") trims both);
+/// a trailing `)` is only trimmed while it's unbalanced against `(` earlier
+/// in `s` (so `(see http://example.com/a(b))` keeps the inner `)` but drops
+/// the outer one). Stops at the first byte that's neither.
+fn trimTrailingAutolinkPunct(s: []const u8) []const u8 {
+    var end = s.len;
+    while (end > 0) {
+        const c = s[end - 1];
+        if (c == ')') {
+            var open: usize = 0;
+            var close: usize = 0;
+            for (s[0..end]) |ch| {
+                if (ch == '(') open += 1;
+                if (ch == ')') close += 1;
+            }
+            if (close > open) {
+                end -= 1;
+                continue;
+            }
+            break;
+        }
+        switch (c) {
+            '?', '!', '.', ',', ':', '*', '_', '~', '\'', '"', ';' => {
+                end -= 1;
+                continue;
+            },
+            else => break,
+        }
+    }
+    return s[0..end];
+}
+
+/// The body of an extended autolink: every byte from `start` up to (but not
+/// including) the next whitespace byte or `<` (GFM stops an autolink at
+/// `<`, treating it as the start of raw HTML/an autolink instead).
+fn scanExtAutolinkBody(text: []const u8, start: usize) usize {
+    var j = start;
+    while (j < text.len and text[j] != ' ' and text[j] != '\t' and text[j] != '\n' and text[j] != '<') j += 1;
+    return j;
+}
+
+/// `text[at] == 'h'`. `http://`/`https://` not preceded by a word character.
+/// Maps to a plain `url` node (destination == displayed text, matching how
+/// Phase 2 already renders `<scheme:...>` autolinks), since the text IS
+/// already a valid href with no prefixing needed.
+fn tryExtHttpAutolink(sc: *Scanner, text: []const u8, i: usize) Allocator.Error!?usize {
+    if (i > 0 and isWordChar(text[i - 1])) return null;
+    const prefix: []const u8 = if (std.mem.startsWith(u8, text[i..], "https://"))
+        "https://"
+    else if (std.mem.startsWith(u8, text[i..], "http://"))
+        "http://"
+    else
+        return null;
+    const raw_end = scanExtAutolinkBody(text, i + prefix.len);
+    if (raw_end == i + prefix.len) return null;
+    const trimmed = trimTrailingAutolinkPunct(text[i..raw_end]);
+    if (trimmed.len <= prefix.len) return null;
+    const final_end = i + trimmed.len;
+    try sc.flushBuf();
+    _ = try sc.appendItem(try sc.b.addLeaf(.{ .url = text[i..final_end] }));
+    return final_end;
+}
+
+/// `text[at] == 'w'`. `www.` not preceded by a word character. Unlike the
+/// `http(s)://` form, the DISPLAYED text (`www.example.com`) isn't itself a
+/// valid href, so this maps to a `link` node instead of `url` -- destination
+/// gets an `http://` prefix (per the mission: "`www.` gets `http://`
+/// prefixed"), while the child `str` keeps the original, unprefixed text.
+fn tryExtWwwAutolink(sc: *Scanner, text: []const u8, i: usize) Allocator.Error!?usize {
+    if (i > 0 and isWordChar(text[i - 1])) return null;
+    if (!std.mem.startsWith(u8, text[i..], "www.")) return null;
+    const raw_end = scanExtAutolinkBody(text, i + 4);
+    if (raw_end == i + 4) return null;
+    const trimmed = trimTrailingAutolinkPunct(text[i..raw_end]);
+    if (trimmed.len <= 4) return null;
+    const final_end = i + trimmed.len;
+    try sc.flushBuf();
+    var dest = std.ArrayList(u8).empty;
+    defer dest.deinit(sc.b.allocator);
+    try dest.appendSlice(sc.b.allocator, "http://");
+    try dest.appendSlice(sc.b.allocator, text[i..final_end]);
+    const text_node = try sc.b.addLeaf(.{ .str = text[i..final_end] });
+    const link_node = try sc.b.addContainer(.{ .link = .{ .destination = dest.items, .reference = null } }, &.{text_node});
+    _ = try sc.appendItem(link_node);
+    return final_end;
+}
+
+fn isExtEmailLocalChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '.' or c == '+' or c == '-' or c == '_';
+}
+
+/// `text[at] == '@'`. Unlike the `http`/`www` forms, the LOCAL part of an
+/// extended email autolink is already-scanned plain text sitting in
+/// `sc.buf` by the time `@` is reached (there's no lookahead for it), so
+/// this reaches BACKWARD into `buf` to claim its trailing run of valid
+/// local-part characters, then scans FORWARD from `@` for a dot-separated
+/// domain (reusing `scanEmailDomainLabel`, the same domain-label grammar
+/// Phase 2's `<email>` autolink uses), requiring at least two labels (i.e.
+/// at least one `.`) so a bare `user@host` doesn't autolink. On success,
+/// `buf`'s claimed suffix is dropped (so it isn't ALSO flushed as plain
+/// text) and an `email` leaf is appended in its place.
+fn tryExtEmailAutolink(sc: *Scanner, text: []const u8, at: usize) Allocator.Error!?usize {
+    const buf = sc.buf.items;
+    var local_start = buf.len;
+    while (local_start > 0 and isExtEmailLocalChar(buf[local_start - 1])) local_start -= 1;
+    while (local_start < buf.len and !std.ascii.isAlphanumeric(buf[local_start])) local_start += 1;
+    if (local_start == buf.len) return null;
+
+    var j = at + 1;
+    if (!scanEmailDomainLabel(text, &j)) return null;
+    var has_dot = false;
+    while (j < text.len and text[j] == '.') {
+        const save = j;
+        j += 1;
+        if (!scanEmailDomainLabel(text, &j)) {
+            j = save;
+            break;
+        }
+        has_dot = true;
+    }
+    if (!has_dot) return null;
+
+    const domain_trimmed = trimTrailingAutolinkPunct(text[at + 1 .. j]);
+    if (domain_trimmed.len == 0) return null;
+    const final_end = at + 1 + domain_trimmed.len;
+
+    var email = std.ArrayList(u8).empty;
+    defer email.deinit(sc.b.allocator);
+    try email.appendSlice(sc.b.allocator, buf[local_start..]);
+    try email.append(sc.b.allocator, '@');
+    try email.appendSlice(sc.b.allocator, text[at + 1 .. final_end]);
+
+    sc.buf.items.len = local_start;
+    try sc.flushBuf();
+    _ = try sc.appendItem(try sc.b.addLeaf(.{ .email = email.items }));
+    return final_end;
 }
 
 // ── raw inline HTML ─────────────────────────────────────────────────────
@@ -1178,9 +1563,13 @@ const testing = std.testing;
 const empty_refs: std.StringHashMapUnmanaged(Node.Id) = .empty;
 
 fn parseAndFinish(text: []const u8) !AST {
+    return parseAndFinishWithOptions(text, .{});
+}
+
+fn parseAndFinishWithOptions(text: []const u8, options: Options) !AST {
     var b = Builder.init(testing.allocator);
     errdefer b.deinit();
-    const children = try parseInline(&b, text, &empty_refs);
+    const children = try parseInline(&b, text, &empty_refs, options);
     defer b.allocator.free(children);
     const root = try b.addContainer(.para, children);
     return b.finish(root);
@@ -1380,7 +1769,7 @@ fn parseWithOneReference(text: []const u8, label: []const u8, dest: []const u8) 
     defer refs.deinit(testing.allocator);
     try refs.put(testing.allocator, b.nodes.items[ref_id].kind.reference.label, ref_id);
 
-    const children = try parseInline(&b, text, &refs);
+    const children = try parseInline(&b, text, &refs, .{});
     defer b.allocator.free(children);
     const root = try b.addContainer(.para, children);
     return b.finish(root);
@@ -1435,4 +1824,144 @@ test "unhandled inline markup (unresolved brackets) passes through as literal te
     // exact input.
     const link = ast.nodes[ast.root].first_child.?;
     try testing.expect(ast.nodes[link].kind == .link);
+}
+
+// ── Phase 3: strikethrough ────────────────────────────────────────────────
+
+test "strikethrough: ~~text~~ becomes a delete node when the flag is on" {
+    var ast = try parseAndFinishWithOptions("~~gone~~", .{ .strikethrough = true });
+    defer ast.deinit();
+    const del = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[del].kind == .delete);
+    try testing.expectEqualStrings("gone", ast.nodes[ast.nodes[del].first_child.?].kind.str);
+}
+
+test "strikethrough: single tilde also delimits (GFM allows one or two)" {
+    var ast = try parseAndFinishWithOptions("~gone~", .{ .strikethrough = true });
+    defer ast.deinit();
+    const del = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[del].kind == .delete);
+    try testing.expectEqualStrings("gone", ast.nodes[ast.nodes[del].first_child.?].kind.str);
+}
+
+test "strikethrough: a run of 3+ tildes is never a delimiter, stays literal" {
+    var ast = try parseAndFinishWithOptions("~~~not~~~", .{ .strikethrough = true });
+    defer ast.deinit();
+    const child = ast.nodes[ast.root].first_child.?;
+    try testing.expectEqualStrings("~~~not~~~", ast.nodes[child].kind.str);
+}
+
+test "strikethrough OFF: ~~text~~ parses as plain CommonMark literal text" {
+    var ast = try parseAndFinishWithOptions("~~gone~~", .{ .strikethrough = false });
+    defer ast.deinit();
+    const child = ast.nodes[ast.root].first_child.?;
+    try testing.expectEqualStrings("~~gone~~", ast.nodes[child].kind.str);
+}
+
+// ── Phase 3: math ────────────────────────────────────────────────────────
+
+test "inline math: $x$ becomes inline_math when the flag is on" {
+    var ast = try parseAndFinishWithOptions("$x^2$", .{ .math = true });
+    defer ast.deinit();
+    const child = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[child].kind == .inline_math);
+    try testing.expectEqualStrings("x^2", ast.nodes[child].kind.inline_math);
+}
+
+test "display math: $$x$$ becomes display_math when the flag is on" {
+    var ast = try parseAndFinishWithOptions("$$x^2$$", .{ .math = true });
+    defer ast.deinit();
+    const child = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[child].kind == .display_math);
+    try testing.expectEqualStrings("x^2", ast.nodes[child].kind.display_math);
+}
+
+test "math OFF (the default): $x$ parses as plain CommonMark literal text" {
+    var ast = try parseAndFinish("$x$");
+    defer ast.deinit();
+    const child = ast.nodes[ast.root].first_child.?;
+    try testing.expectEqualStrings("$x$", ast.nodes[child].kind.str);
+}
+
+test "math: a dollar sign followed by whitespace never opens math" {
+    var ast = try parseAndFinishWithOptions("costs $5 and $10 total", .{ .math = true });
+    defer ast.deinit();
+    const child = ast.nodes[ast.root].first_child.?;
+    try testing.expectEqualStrings("costs $5 and $10 total", ast.nodes[child].kind.str);
+}
+
+// ── Phase 3: GFM extended autolinks ─────────────────────────────────────
+
+test "extended autolink: bare https:// URL becomes a url node" {
+    var ast = try parseAndFinishWithOptions("see https://example.com/x for more", .{ .autolinks = true });
+    defer ast.deinit();
+    var it = ast.children(ast.root);
+    const s1 = it.next().?;
+    try testing.expectEqualStrings("see ", s1.kind.str);
+    const url = it.next().?;
+    try testing.expect(url.kind == .url);
+    try testing.expectEqualStrings("https://example.com/x", url.kind.url);
+}
+
+test "extended autolink: www. gets an http:// prefix on the destination, text unchanged" {
+    var ast = try parseAndFinishWithOptions("visit www.example.com now", .{ .autolinks = true });
+    defer ast.deinit();
+    var it = ast.children(ast.root);
+    _ = it.next().?; // "visit "
+    const link = it.next().?;
+    try testing.expect(link.kind == .link);
+    try testing.expectEqualStrings("http://www.example.com", link.kind.link.destination.?);
+    try testing.expectEqualStrings("www.example.com", ast.nodes[link.first_child.?].kind.str);
+}
+
+test "extended autolink: trailing sentence punctuation is trimmed off the link" {
+    var ast = try parseAndFinishWithOptions("Check https://example.com.", .{ .autolinks = true });
+    defer ast.deinit();
+    var it = ast.children(ast.root);
+    _ = it.next().?; // "Check "
+    const url = it.next().?;
+    try testing.expect(url.kind == .url);
+    try testing.expectEqualStrings("https://example.com", url.kind.url);
+    const trailing = it.next().?;
+    try testing.expectEqualStrings(".", trailing.kind.str);
+}
+
+test "extended autolink: a balanced trailing paren is kept, an unbalanced one is trimmed" {
+    var ast = try parseAndFinishWithOptions("(see https://en.wikipedia.org/wiki/Foo_(bar))", .{ .autolinks = true });
+    defer ast.deinit();
+    var it = ast.children(ast.root);
+    _ = it.next().?; // "(see "
+    const url = it.next().?;
+    try testing.expect(url.kind == .url);
+    try testing.expectEqualStrings("https://en.wikipedia.org/wiki/Foo_(bar)", url.kind.url);
+    const trailing = it.next().?;
+    try testing.expectEqualStrings(")", trailing.kind.str);
+}
+
+test "extended autolink: bare email address becomes an email node" {
+    var ast = try parseAndFinishWithOptions("contact foo@bar.example.com today", .{ .autolinks = true });
+    defer ast.deinit();
+    var it = ast.children(ast.root);
+    const s1 = it.next().?;
+    try testing.expectEqualStrings("contact ", s1.kind.str);
+    const email = it.next().?;
+    try testing.expect(email.kind == .email);
+    try testing.expectEqualStrings("foo@bar.example.com", email.kind.email);
+}
+
+test "extended autolinks OFF: bare www./http(s) text parses as plain CommonMark literal text" {
+    var ast = try parseAndFinishWithOptions("see www.example.com and https://x.com", .{ .autolinks = false });
+    defer ast.deinit();
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    var it = ast.children(ast.root);
+    while (it.next()) |n| try buf.appendSlice(testing.allocator, n.kind.str);
+    try testing.expectEqualStrings("see www.example.com and https://x.com", buf.items);
+}
+
+test "extended autolinks: a word-internal http:// (preceded by a letter) does not autolink" {
+    var ast = try parseAndFinishWithOptions("xhttp://example.com", .{ .autolinks = true });
+    defer ast.deinit();
+    const child = ast.nodes[ast.root].first_child.?;
+    try testing.expectEqualStrings("xhttp://example.com", ast.nodes[child].kind.str);
 }

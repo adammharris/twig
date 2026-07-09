@@ -262,6 +262,147 @@ fn tryListMarker(s: []const u8) ?ListMarker {
     return null;
 }
 
+const TaskMarker = struct { checked: bool, rest: []const u8 };
+
+/// GFM task list marker: `[ ]`, `[x]`, or `[X]`, immediately followed by a
+/// space/tab or end of the item's first line (`after_marker` is the item's
+/// content, i.e. everything after the list marker itself and its own
+/// separating whitespace). Returns `null` for anything else, leaving the
+/// item as an ordinary `list_item`.
+fn tryTaskListMarker(after_marker: []const u8) ?TaskMarker {
+    if (after_marker.len < 3) return null;
+    if (after_marker[0] != '[') return null;
+    const c = after_marker[1];
+    if (c != ' ' and c != 'x' and c != 'X') return null;
+    if (after_marker[2] != ']') return null;
+    if (after_marker.len == 3) return .{ .checked = c != ' ', .rest = "" };
+    if (after_marker[3] != ' ' and after_marker[3] != '\t') return null;
+    return .{ .checked = c != ' ', .rest = after_marker[4..] };
+}
+
+/// True when `s` looks like the start of some OTHER block construct
+/// (block quote / thematic break / ATX heading / fence / list marker / HTML
+/// block) -- used by both `tryStartTable` and `tryStartDefinitionList` to
+/// decide when a subsequent line ends their own multi-line construct rather
+/// than continuing it (GFM: "The table is broken at ... the beginning of
+/// another block-level structure"). Deliberately reuses the SAME pattern
+/// matchers `tryStartBlocks` itself uses, rather than a separate/looser
+/// heuristic, so "does this line start a new block" means the same thing in
+/// both places.
+fn looksLikeNewBlockStart(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (s[0] == '>') return true;
+    if (isThematicBreak(s)) return true;
+    if (tryAtxHeading(s) != null) return true;
+    if (tryFenceOpen(s) != null) return true;
+    if (tryListMarker(s) != null) return true;
+    if (s.len > 0 and s[0] == '<' and detectHtmlBlockStart(s) != null) return true;
+    return false;
+}
+
+/// A `:`-marked definition-list line: `:` followed by a space/tab (or
+/// nothing else on the line) -- see `tryStartDefinitionList`.
+fn isDefinitionMarkerLine(s: []const u8) bool {
+    if (s.len == 0 or s[0] != ':') return false;
+    return s.len == 1 or s[1] == ' ' or s[1] == '\t';
+}
+
+// ── GFM table row / delimiter-row parsing ────────────────────────────────
+
+/// True if `s` contains a `|` not immediately preceded by an odd number of
+/// backslashes (i.e. not itself backslash-escaped) -- the cheap pre-check
+/// `tryStartTable` uses before committing to full row-splitting.
+fn containsUnescapedPipe(s: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '\\' and i + 1 < s.len) {
+            i += 1;
+            continue;
+        }
+        if (s[i] == '|') return true;
+    }
+    return false;
+}
+
+/// Strip one leading `|` (if present) and one trailing, UNESCAPED `|` (if
+/// present) -- the "outer" pipes of `| a | b |`-style rows, which don't
+/// themselves delimit a cell.
+fn stripEdgePipes(s: []const u8) []const u8 {
+    var t = s;
+    if (t.len > 0 and t[0] == '|') t = t[1..];
+    if (t.len > 0 and t[t.len - 1] == '|') {
+        var backslashes: usize = 0;
+        var k = t.len - 1;
+        while (k > 0 and t[k - 1] == '\\') : (k -= 1) backslashes += 1;
+        if (backslashes % 2 == 0) t = t[0 .. t.len - 1];
+    }
+    return t;
+}
+
+/// Split a table row into its cell texts, on unescaped `|` (a `\|` stays a
+/// literal pipe WITHIN a cell -- decoded later, like any other backslash
+/// escape, when the cell's inline content is parsed), after stripping outer
+/// edge pipes and trimming each cell's surrounding whitespace. Always
+/// returns at least one cell (an all-blank/edge-pipes-only row yields one
+/// empty cell). Caller frees the returned slice (not its (borrowed) string
+/// contents).
+fn splitTableRow(allocator: Allocator, s: []const u8) Allocator.Error![][]const u8 {
+    const trimmed_outer = std.mem.trim(u8, s, " \t");
+    const inner = stripEdgePipes(trimmed_outer);
+    var cells = std.ArrayList([]const u8).empty;
+    errdefer cells.deinit(allocator);
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < inner.len) : (i += 1) {
+        if (inner[i] == '\\' and i + 1 < inner.len) {
+            i += 1;
+            continue;
+        }
+        if (inner[i] == '|') {
+            try cells.append(allocator, std.mem.trim(u8, inner[start..i], " \t"));
+            start = i + 1;
+        }
+    }
+    try cells.append(allocator, std.mem.trim(u8, inner[start..], " \t"));
+    return cells.toOwnedSlice(allocator);
+}
+
+/// Parse a table DELIMITER row (`---|:--:|--:`) into one `Alignment` per
+/// cell, or `null` if any cell isn't of the form `:?-+:?` (at least one
+/// hyphen, optionally flanked by a `:` on either/both sides) -- i.e. `s`
+/// doesn't validly delimit a table at all. Caller frees the returned slice.
+fn parseDelimiterRow(allocator: Allocator, s: []const u8) Allocator.Error!?[]AST.Alignment {
+    const cells = try splitTableRow(allocator, s);
+    defer allocator.free(cells);
+    if (cells.len == 0) return null;
+    for (cells) |cell| {
+        var c = cell;
+        if (c.len == 0) return null;
+        if (c[0] == ':') c = c[1..];
+        if (c.len > 0 and c[c.len - 1] == ':') c = c[0 .. c.len - 1];
+        if (c.len == 0) return null;
+        for (c) |ch| {
+            if (ch != '-') return null;
+        }
+    }
+    const aligns = try allocator.alloc(AST.Alignment, cells.len);
+    for (cells, 0..) |cell, i| {
+        var c = cell;
+        var left = false;
+        var right = false;
+        if (c[0] == ':') {
+            left = true;
+            c = c[1..];
+        }
+        if (c.len > 0 and c[c.len - 1] == ':') {
+            right = true;
+            c = c[0 .. c.len - 1];
+        }
+        aligns[i] = if (left and right) .center else if (left) .left else if (right) .right else .default;
+    }
+    return aligns;
+}
+
 // ── HTML block start detection ──────────────────────────────────────────
 
 const html_type1_tags = [_][]const u8{ "script", "pre", "style", "textarea" };
@@ -432,6 +573,13 @@ const Container = struct {
 
     // .list_item
     content_col: usize = 0,
+    /// GFM task list items (`self.options.task_lists`): this item's content
+    /// began with a `[ ]`/`[x]` checkbox marker (already stripped from the
+    /// content before parsing began -- see the list-marker handling in
+    /// `tryStartBlocks`). `popContainer` emits `task_list_item` instead of
+    /// `list_item` when set.
+    is_task: bool = false,
+    task_checked: bool = false,
 
     // .list
     ordered: bool = false,
@@ -440,6 +588,13 @@ const Container = struct {
     start_num: ?u32 = null,
     tight: bool = true,
     blank_pending: bool = false,
+    /// Set when ANY child item pushed this list turned out to be a task
+    /// item (see `is_task` above); `popContainer` emits `task_list` instead
+    /// of `bullet_list` when set (task lists are unordered-only, per the
+    /// mission -- an ordered list marker is never eligible for task-item
+    /// detection in the first place, so this only ever fires for a bullet
+    /// list).
+    any_task: bool = false,
 
     fn deinit(self: *Container, allocator: Allocator) void {
         self.children.deinit(allocator);
@@ -509,6 +664,16 @@ pub const Parser = struct {
     link_references: std.StringHashMapUnmanaged(Node.Id) = .empty,
     pending_inline: std.ArrayList(PendingInline) = .empty,
     options: Options,
+    /// Phase 3's multi-line block extensions (GFM tables, definition lists,
+    /// frontmatter) recognize and consume SEVERAL lines at once, ahead of
+    /// the normal one-line-at-a-time driver in `parse`'s `for` loop -- rather
+    /// than restructure that loop to let a single `processLine` call report
+    /// back "advance by N lines", each of those extensions just directly
+    /// reads `self.lines[idx+1..]` for as far as its own grammar allows, then
+    /// sets this to the index of the first line it DIDN'T consume.
+    /// `processLine` checks this first and no-ops for any `idx` still below
+    /// it, so the driving loop doesn't need to change at all.
+    skip_until_line: usize = 0,
 
     pub fn init(allocator: Allocator, source: []const u8, options: Options) Allocator.Error!Parser {
         var lines = std.ArrayList([]const u8).empty;
@@ -573,6 +738,7 @@ pub const Parser = struct {
     }
 
     pub fn parse(self: *Parser) Allocator.Error!BlockResult {
+        if (self.options.frontmatter) try self.tryConsumeFrontmatter();
         for (self.lines, 0..) |line, idx| {
             try self.processLine(line, idx);
         }
@@ -607,7 +773,7 @@ pub const Parser = struct {
         }
         for (self.pending_inline.items) |p| {
             defer self.allocator.free(p.text);
-            const kids = try inline_mod.parseInline(&self.builder, p.text, &self.link_references);
+            const kids = try inline_mod.parseInline(&self.builder, p.text, &self.link_references, self.options);
             defer self.allocator.free(kids);
             self.builder.setChildren(p.id, kids);
             setContentSpanFromChildren(&self.builder, p.id);
@@ -660,9 +826,11 @@ pub const Parser = struct {
         const kind: Node.Kind = switch (c.kind) {
             .document => unreachable,
             .block_quote => .block_quote,
-            .list_item => .list_item,
+            .list_item => if (c.is_task) .{ .task_list_item = .{ .checked = c.task_checked } } else .list_item,
             .list => if (c.ordered)
                 .{ .ordered_list = .{ .style = .{ .numbering = .decimal, .delim = c.delim }, .tight = c.tight, .start = c.start_num } }
+            else if (c.any_task)
+                .{ .task_list = .{ .tight = c.tight } }
             else
                 .{ .bullet_list = .{ .style = bulletStyle(c.bullet_char), .tight = c.tight } },
         };
@@ -720,12 +888,24 @@ pub const Parser = struct {
     /// backing storage (typically a soon-to-be-`deinit`'d `Leaf.text`
     /// buffer) will not outlive this call.
     fn emitTextBlock(self: *Parser, kind: Node.Kind, text: []const u8, start_line: usize, end_line: usize) Allocator.Error!void {
+        const id = try self.addDeferredTextNode(kind, text, start_line, end_line);
+        try self.appendToTop(id);
+    }
+
+    /// Like `emitTextBlock`, but returns the new node's id WITHOUT attaching
+    /// it to `self.top()` -- for Phase 3 constructs (GFM table cells,
+    /// definition-list terms/definitions) that assemble a node's own
+    /// children (table rows, a `definition_list_item`'s term + definitions)
+    /// themselves via `self.builder.addContainer` before the whole thing
+    /// gets appended to the currently open container in one shot, rather
+    /// than each leaf attaching itself as it's created.
+    fn addDeferredTextNode(self: *Parser, kind: Node.Kind, text: []const u8, start_line: usize, end_line: usize) Allocator.Error!Node.Id {
         const id = try self.builder.addNode(kind);
         self.builder.setSpan(id, Span.init(self.lineStart(start_line), self.lineEnd(end_line)));
         const owned_text = try self.allocator.dupe(u8, text);
         errdefer self.allocator.free(owned_text);
         try self.pending_inline.append(self.allocator, .{ .id = id, .text = owned_text });
-        try self.appendToTop(id);
+        return id;
     }
 
     fn finishIndentedCode(self: *Parser, lf: *Leaf) Allocator.Error!void {
@@ -813,6 +993,10 @@ pub const Parser = struct {
     }
 
     fn processLine(self: *Parser, line: []const u8, idx: usize) Allocator.Error!void {
+        // Already consumed by a Phase 3 multi-line construct (a GFM table,
+        // definition list, or frontmatter block) started at an earlier
+        // `idx` -- see `skip_until_line`'s doc comment.
+        if (idx < self.skip_until_line) return;
         const m = self.matchContainers(line);
         const cur = m.cur;
 
@@ -852,6 +1036,9 @@ pub const Parser = struct {
                     try self.closeLeaf(idx);
                 },
                 .paragraph => {
+                    if (self.options.definition_lists and lf.start_line == lf.end_line) {
+                        if (try self.tryStartDefinitionList(lf, line, cur, idx)) return;
+                    }
                     if (trySetextUnderline(stripUpTo3Indent(remainder))) |level| {
                         try self.closeParagraphAsHeading(level, idx);
                         return;
@@ -1140,10 +1327,34 @@ pub const Parser = struct {
                         self.top().content_col = content_col;
                         const after_marker_cursor: Cursor = .{ .pos = cur.pos + indent_bytes + mk.marker_len, .col = after_marker_col };
                         cur = skipWsToTarget(line, after_marker_cursor, content_col);
+                        // GFM task list items (`self.options.task_lists`,
+                        // shadowing core bullet-list-item parsing per the
+                        // mission): only tried for a bullet item (never
+                        // ordered) whose content begins with a `[ ]`/`[x]`
+                        // checkbox marker -- see `tryTaskListMarker`. The
+                        // marker text itself is consumed here (advancing
+                        // `cur` past it) so it never reaches inline parsing;
+                        // the enclosing `.list` is flagged `any_task` so
+                        // `popContainer` promotes it to `task_list`.
+                        if (self.options.task_lists and !mk.ordered) {
+                            if (tryTaskListMarker(line[cur.pos..])) |tm| {
+                                self.top().is_task = true;
+                                self.top().task_checked = tm.checked;
+                                if (self.stack.items.len >= 2) {
+                                    self.stack.items[self.stack.items.len - 2].any_task = true;
+                                }
+                                const consumed = line[cur.pos..].len - tm.rest.len;
+                                cur = .{ .pos = cur.pos + consumed, .col = cur.col + consumed };
+                            }
+                        }
                         interrupting = false;
                         pushed_any = true;
                         continue;
                     }
+                }
+
+                if (self.options.tables and !interrupting) {
+                    if (try self.tryStartTable(line, cur, idx)) return true;
                 }
 
                 if (s.len > 0 and s[0] == '<') {
@@ -1233,6 +1444,307 @@ pub const Parser = struct {
     /// despite neither satisfying the "non-empty"/"starts at 1" gate).
     fn isInsideListItem(self: *Parser) bool {
         return self.top().kind == .list_item;
+    }
+
+    // ── Phase 3: frontmatter ─────────────────────────────────────────────
+
+    /// A leading `---`/`+++` frontmatter block (`self.options.frontmatter`):
+    /// only ever tried ONCE, before the main line-by-line scan even starts
+    /// (see `parse`), since frontmatter is defined as a leading construct —
+    /// unlike every other Phase 3 extension, it never competes with
+    /// mid-document block starts. `self.lines[0]` must be EXACTLY `---` (a
+    /// YAML block) or `+++` (a TOML block), ignoring only trailing
+    /// whitespace; the block ends at the first later line that's exactly
+    /// the SAME delimiter. If no such closing line exists, this is NOT
+    /// frontmatter at all (falls through to ordinary parsing — a bare
+    /// leading `---` with no closer is just a thematic break, same as with
+    /// the flag off). On success, the whole block becomes a single
+    /// `raw_block{format="yaml"|"toml"}` node (see this file's/the
+    /// mission's rationale: the shared HTML printer only ever emits
+    /// `raw_block` text for `format == "html"`, so this renders as nothing
+    /// in the HTML body while staying fully inspectable via `-o ast`).
+    fn tryConsumeFrontmatter(self: *Parser) Allocator.Error!void {
+        if (self.lines.len == 0) return;
+        const first = std.mem.trimEnd(u8, self.lines[0], " \t");
+        const format: []const u8 = if (std.mem.eql(u8, first, "---"))
+            "yaml"
+        else if (std.mem.eql(u8, first, "+++"))
+            "toml"
+        else
+            return;
+
+        var i: usize = 1;
+        while (i < self.lines.len) : (i += 1) {
+            const line = std.mem.trimEnd(u8, self.lines[i], " \t");
+            if (!std.mem.eql(u8, line, first)) continue;
+
+            var text = std.ArrayList(u8).empty;
+            defer text.deinit(self.allocator);
+            for (self.lines[1..i]) |content_line| {
+                try text.appendSlice(self.allocator, content_line);
+                try text.append(self.allocator, '\n');
+            }
+            const id = try self.builder.addLeaf(.{ .raw_block = .{ .format = format, .text = text.items } });
+            self.builder.setSpan(id, Span.init(self.lineStart(0), self.lineEnd(i)));
+            try self.appendToTop(id);
+            self.skip_until_line = i + 1;
+            return;
+        }
+        // No closing delimiter anywhere in the document: not frontmatter.
+    }
+
+    // ── Phase 3: GFM tables ──────────────────────────────────────────────
+
+    /// GFM pipe tables (`self.options.tables`). APPROXIMATIONS, documented:
+    ///   - A table never interrupts an already-open paragraph (checked via
+    ///     the caller's `!interrupting` gate) -- unlike CommonMark's other
+    ///     block starts. Most real-world tables are preceded by a blank
+    ///     line anyway; this keeps the "does this line start a table"
+    ///     question fully local to a genuine fresh-block position instead
+    ///     of needing paragraph-reinterpretation machinery.
+    ///   - A header row is any non-blank, <=3-space-indented line containing
+    ///     an unescaped `|` (`containsUnescapedPipe`), immediately followed
+    ///     by a valid delimiter row (`parseDelimiterRow`: cells of the form
+    ///     `:?-+:?`) with the exact SAME cell count.
+    ///   - Body rows continue for as long as subsequent lines (i) still
+    ///     match every currently open ancestor container (so a table nested
+    ///     in a block quote/list item stays properly scoped), (ii) are
+    ///     non-blank and not indented code, and (iii) don't themselves look
+    ///     like the start of some other block construct
+    ///     (`looksLikeNewBlockStart`). Per the GFM spec, ragged rows are
+    ///     padded (missing cells) or truncated (extra cells) to the header's
+    ///     column count rather than ending the table.
+    ///   - `|` inside a backtick code span is NOT treated specially (unlike
+    ///     real GFM); only a backslash-escaped `\|` is recognized as a
+    ///     non-splitting pipe. A cell containing `` `a|b` `` therefore
+    ///     splits where a strict implementation wouldn't.
+    fn tryStartTable(self: *Parser, line: []const u8, cur: Cursor, idx: usize) Allocator.Error!bool {
+        const remainder = line[cur.pos..];
+        const s = stripUpTo3Indent(remainder);
+        if (isBlankLine(s)) return false;
+        if (!containsUnescapedPipe(s)) return false;
+        if (idx + 1 >= self.lines.len) return false;
+
+        const next_line = self.lines[idx + 1];
+        const nm = self.matchContainers(next_line);
+        if (nm.matched_index != self.stack.items.len) return false;
+        const next_remainder = next_line[nm.cur.pos..];
+        if (indentCols(next_remainder, .{}) >= 4) return false;
+        const next_s = stripUpTo3Indent(next_remainder);
+
+        const header_cells = try splitTableRow(self.allocator, s);
+        defer self.allocator.free(header_cells);
+        if (header_cells.len == 0) return false;
+
+        const aligns = (try parseDelimiterRow(self.allocator, next_s)) orelse return false;
+        defer self.allocator.free(aligns);
+        if (aligns.len != header_cells.len) return false;
+
+        try self.maybeCloseTopList(idx, null);
+        self.markListsLoose();
+
+        var row_ids = std.ArrayList(Node.Id).empty;
+        defer row_ids.deinit(self.allocator);
+
+        const header_row_id = try self.buildTableRow(header_cells, aligns, true, idx, idx);
+        try row_ids.append(self.allocator, header_row_id);
+
+        var last_idx = idx + 1;
+        var scan = idx + 2;
+        while (scan < self.lines.len) {
+            const row_line = self.lines[scan];
+            const rm = self.matchContainers(row_line);
+            if (rm.matched_index != self.stack.items.len) break;
+            const row_remainder = row_line[rm.cur.pos..];
+            if (isBlankLine(row_remainder)) break;
+            if (indentCols(row_remainder, .{}) >= 4) break;
+            const row_s = stripUpTo3Indent(row_remainder);
+            if (looksLikeNewBlockStart(row_s)) break;
+
+            const raw_cells = try splitTableRow(self.allocator, row_s);
+            defer self.allocator.free(raw_cells);
+            const row_id = try self.buildTableRow(raw_cells, aligns, false, scan, scan);
+            try row_ids.append(self.allocator, row_id);
+            last_idx = scan;
+            scan += 1;
+        }
+
+        const caption_id = try self.builder.addContainer(.caption, &.{});
+        var all_children = std.ArrayList(Node.Id).empty;
+        defer all_children.deinit(self.allocator);
+        try all_children.append(self.allocator, caption_id);
+        try all_children.appendSlice(self.allocator, row_ids.items);
+
+        const table_id = try self.builder.addContainer(.table, all_children.items);
+        self.builder.setSpan(table_id, Span.init(self.lineStart(idx), self.lineEnd(last_idx)));
+        setContentSpanFromChildren(&self.builder, table_id);
+        try self.appendToTop(table_id);
+
+        self.skip_until_line = last_idx + 1;
+        return true;
+    }
+
+    /// Build one `row` node with exactly `aligns.len` `cell` children,
+    /// pulling text from `cells[i]` when present or `""` for a ragged
+    /// row's missing trailing cells (extra `cells` entries beyond
+    /// `aligns.len` are simply never visited -- GFM's "ignore extra cells"
+    /// rule).
+    fn buildTableRow(self: *Parser, cells: []const []const u8, aligns: []const AST.Alignment, head: bool, start_line: usize, end_line: usize) Allocator.Error!Node.Id {
+        var cell_ids = std.ArrayList(Node.Id).empty;
+        defer cell_ids.deinit(self.allocator);
+        for (aligns, 0..) |al, i| {
+            const text = if (i < cells.len) cells[i] else "";
+            const cell_id = try self.addDeferredTextNode(.{ .cell = .{ .head = head, .alignment = al } }, text, start_line, end_line);
+            try cell_ids.append(self.allocator, cell_id);
+        }
+        const row_id = try self.builder.addContainer(.{ .row = .{ .head = head } }, cell_ids.items);
+        self.builder.setSpan(row_id, Span.init(self.lineStart(start_line), self.lineEnd(end_line)));
+        return row_id;
+    }
+
+    // ── Phase 3: definition lists ────────────────────────────────────────
+
+    /// PHP-Markdown-Extra / Pandoc style definition lists
+    /// (`self.options.definition_lists`). Grammar implemented here
+    /// (documented since this is a twig-chosen approximation, not a spec):
+    ///
+    ///   Term
+    ///   : Definition text -- may lazily continue onto further lines
+    ///     (joined with a soft break, like an ordinary paragraph) until a
+    ///     blank line, another `:`-line, or a line that looks like some
+    ///     other block construct.
+    ///   : A second `:`-line right after the first starts ANOTHER
+    ///     definition for the SAME term (a `definition_list_item` can hold
+    ///     more than one `definition`).
+    ///
+    ///   Term 2
+    ///   : Definition
+    ///
+    /// A "term" is a single-line paragraph (no blank line yet, exactly one
+    /// line accumulated) immediately followed by a `:`-line (at <=3 space
+    /// indent, `:` then a space/tab). Consecutive `Term\n: def...` groups,
+    /// separated by at most ONE blank line, merge into a single
+    /// `definition_list`; anything else ends it. Only tried when the
+    /// currently open leaf is a single-line paragraph (mirrors the
+    /// setext-heading check right next to this call site) -- a definition
+    /// list therefore never interrupts a multi-line paragraph.
+    fn tryStartDefinitionList(self: *Parser, lf: *Leaf, line: []const u8, cur: Cursor, idx: usize) Allocator.Error!bool {
+        const s = stripUpTo3Indent(line[cur.pos..]);
+        if (!isDefinitionMarkerLine(s)) return false;
+
+        const trimmed_term = std.mem.trim(u8, lf.text.items, " \t\r\n");
+        if (trimmed_term.len == 0) return false;
+        const term_text = try self.allocator.dupe(u8, trimmed_term);
+        defer self.allocator.free(term_text);
+        var term_start_line = lf.start_line;
+        // Free the paragraph leaf's own buffer FIRST (while `lf` -- a
+        // pointer into `self.leaf`'s payload -- is still valid), THEN null
+        // out `self.leaf` itself; doing it in the other order would zero
+        // the memory `lf` points to before `deinit` ever reads it, leaking
+        // the text buffer (`Leaf.deinit` on an already-zeroed `ArrayList`
+        // is a silent no-op, not a double-free, which is exactly what made
+        // this easy to miss).
+        lf.deinit(self.allocator);
+        self.leaf = null;
+
+        try self.maybeCloseTopList(idx, null);
+        self.markListsLoose();
+
+        var item_ids = std.ArrayList(Node.Id).empty;
+        defer item_ids.deinit(self.allocator);
+        var scan = idx;
+        var last_idx = idx;
+        var current_term = term_text;
+        var owned_term: ?[]u8 = null;
+        defer if (owned_term) |t| self.allocator.free(t);
+
+        while (true) {
+            const term_id = try self.addDeferredTextNode(.term, current_term, term_start_line, term_start_line);
+            var def_ids = std.ArrayList(Node.Id).empty;
+            defer def_ids.deinit(self.allocator);
+
+            while (scan < self.lines.len) {
+                const dline = self.lines[scan];
+                const dm = self.matchContainers(dline);
+                if (dm.matched_index != self.stack.items.len) break;
+                const ds = stripUpTo3Indent(dline[dm.cur.pos..]);
+                if (!isDefinitionMarkerLine(ds)) break;
+
+                var content = std.ArrayList(u8).empty;
+                defer content.deinit(self.allocator);
+                try content.appendSlice(self.allocator, trimLeadingWs(ds[1..]));
+                const def_start = scan;
+                var def_end = scan;
+                scan += 1;
+                while (scan < self.lines.len) {
+                    const cline = self.lines[scan];
+                    const cm = self.matchContainers(cline);
+                    if (cm.matched_index != self.stack.items.len) break;
+                    const crem = cline[cm.cur.pos..];
+                    if (isBlankLine(crem)) break;
+                    const cs = stripUpTo3Indent(crem);
+                    if (isDefinitionMarkerLine(cs)) break;
+                    if (looksLikeNewBlockStart(cs)) break;
+                    try content.append(self.allocator, '\n');
+                    try content.appendSlice(self.allocator, trimLeadingWs(crem));
+                    def_end = scan;
+                    scan += 1;
+                }
+                const def_id = try self.addDeferredTextNode(.definition, content.items, def_start, def_end);
+                try def_ids.append(self.allocator, def_id);
+                last_idx = def_end;
+            }
+            if (def_ids.items.len == 0) {
+                // The term matched but not one single `:`-line actually
+                // parsed (shouldn't happen given `isDefinitionMarkerLine`
+                // gated entry, but guards against an empty item).
+                break;
+            }
+
+            var item_children = std.ArrayList(Node.Id).empty;
+            defer item_children.deinit(self.allocator);
+            try item_children.append(self.allocator, term_id);
+            try item_children.appendSlice(self.allocator, def_ids.items);
+            const item_id = try self.builder.addContainer(.definition_list_item, item_children.items);
+            self.builder.setSpan(item_id, Span.init(self.lineStart(term_start_line), self.lineEnd(last_idx)));
+            try item_ids.append(self.allocator, item_id);
+
+            // Look for another `Term\n: def` group, tolerating at most one
+            // blank line before it.
+            var next_idx = scan;
+            if (next_idx < self.lines.len) {
+                const bl = self.lines[next_idx];
+                const bm = self.matchContainers(bl);
+                if (bm.matched_index == self.stack.items.len and isBlankLine(bl[bm.cur.pos..])) next_idx += 1;
+            }
+            if (next_idx >= self.lines.len or next_idx + 1 >= self.lines.len) break;
+            const tl = self.lines[next_idx];
+            const tm = self.matchContainers(tl);
+            if (tm.matched_index != self.stack.items.len) break;
+            const trem = tl[tm.cur.pos..];
+            if (isBlankLine(trem) or indentCols(trem, .{}) >= 4) break;
+            const ts = stripUpTo3Indent(trem);
+            if (isDefinitionMarkerLine(ts) or looksLikeNewBlockStart(ts)) break;
+
+            const dl2 = self.lines[next_idx + 1];
+            const dm2 = self.matchContainers(dl2);
+            if (dm2.matched_index != self.stack.items.len) break;
+            const ds2 = stripUpTo3Indent(dl2[dm2.cur.pos..]);
+            if (!isDefinitionMarkerLine(ds2)) break;
+
+            if (owned_term) |t| self.allocator.free(t);
+            owned_term = try self.allocator.dupe(u8, std.mem.trim(u8, ts, " \t\r\n"));
+            current_term = owned_term.?;
+            term_start_line = next_idx;
+            scan = next_idx + 1;
+        }
+
+        const list_id = try self.builder.addContainer(.definition_list, item_ids.items);
+        self.builder.setSpan(list_id, Span.init(self.lineStart(idx), self.lineEnd(last_idx)));
+        setContentSpanFromChildren(&self.builder, list_id);
+        try self.appendToTop(list_id);
+        self.skip_until_line = last_idx + 1;
+        return true;
     }
 
     // ── link reference definitions ───────────────────────────────────────
@@ -1395,6 +1907,14 @@ pub fn parse(allocator: Allocator, source: []const u8, options: Options) Allocat
 }
 
 const testing = std.testing;
+const Html = @import("../html/html.zig");
+
+fn renderHtml(source: []const u8, options: Options) ![]u8 {
+    var r = try parse(testing.allocator, source, options);
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    return Html.serializeAlloc(testing.allocator, &r.ast, null);
+}
 
 test "ATX heading" {
     var r = try parse(testing.allocator, "## Hello\n", .{});
@@ -1467,4 +1987,275 @@ test "a link reference definition is stripped and recorded in the table" {
     const ref_id = r.link_references.get("foo") orelse return error.TestExpectedNonNull;
     try testing.expectEqualStrings("/url", r.ast.nodes[ref_id].kind.reference.destination);
     try testing.expectEqualStrings("title", r.ast.attrsOf(ref_id).get("title").?);
+}
+
+// ── Phase 3: GFM tables ─────────────────────────────────────────────────
+
+test "table: header/delimiter/body with per-column alignment" {
+    var r = try parse(testing.allocator,
+        \\| a | b | c |
+        \\|---|:--:|--:|
+        \\| 1 | 2 | 3 |
+        \\
+    , .{ .tables = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+
+    const table = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[table].kind == .table);
+    const caption = r.ast.nodes[table].first_child.?;
+    try testing.expect(r.ast.nodes[caption].kind == .caption);
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[caption].first_child);
+
+    const head_row = r.ast.nodes[caption].next_sibling.?;
+    try testing.expect(r.ast.nodes[head_row].kind == .row);
+    try testing.expect(r.ast.nodes[head_row].kind.row.head);
+    const c1 = r.ast.nodes[head_row].first_child.?;
+    try testing.expect(r.ast.nodes[c1].kind.cell.head);
+    try testing.expectEqual(AST.Alignment.default, r.ast.nodes[c1].kind.cell.alignment);
+    const c2 = r.ast.nodes[c1].next_sibling.?;
+    try testing.expectEqual(AST.Alignment.center, r.ast.nodes[c2].kind.cell.alignment);
+    const c3 = r.ast.nodes[c2].next_sibling.?;
+    try testing.expectEqual(AST.Alignment.right, r.ast.nodes[c3].kind.cell.alignment);
+
+    const body_row = r.ast.nodes[head_row].next_sibling.?;
+    try testing.expect(!r.ast.nodes[body_row].kind.row.head);
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[body_row].next_sibling);
+}
+
+test "table: ragged rows are padded/truncated to the header's column count" {
+    var r = try parse(testing.allocator,
+        \\| a | b |
+        \\| - | - |
+        \\| 1 |
+        \\| 1 | 2 | 3 |
+        \\
+    , .{ .tables = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+
+    const table = r.ast.nodes[r.ast.root].first_child.?;
+    const caption = r.ast.nodes[table].first_child.?;
+    const head_row = r.ast.nodes[caption].next_sibling.?;
+    const short_row = r.ast.nodes[head_row].next_sibling.?;
+    const short_c1 = r.ast.nodes[short_row].first_child.?;
+    const short_c2 = r.ast.nodes[short_c1].next_sibling.?;
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[short_c2].next_sibling);
+
+    const long_row = r.ast.nodes[short_row].next_sibling.?;
+    const long_c1 = r.ast.nodes[long_row].first_child.?;
+    const long_c2 = r.ast.nodes[long_c1].next_sibling.?;
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[long_c2].next_sibling);
+}
+
+test "table: renders through the shared HTML printer with an empty caption" {
+    const html = try renderHtml("| a | b |\n| - | - |\n| 1 | 2 |\n", .{ .tables = true });
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings(
+        "<table>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n<tr>\n<td>1</td>\n<td>2</td>\n</tr>\n</table>\n",
+        html,
+    );
+}
+
+test "table OFF: a pipe 'table' parses as an ordinary CommonMark paragraph" {
+    var r = try parse(testing.allocator, "| a | b |\n| - | - |\n", .{ .tables = false });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    const para = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[para].kind == .para);
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[para].next_sibling);
+}
+
+// ── Phase 3: task lists ──────────────────────────────────────────────────
+
+test "task list: unchecked and checked (case-insensitive) items" {
+    var r = try parse(testing.allocator, "- [ ] todo\n- [x] done\n- [X] also done\n", .{ .task_lists = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+
+    const list = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[list].kind == .task_list);
+    const item1 = r.ast.nodes[list].first_child.?;
+    try testing.expect(r.ast.nodes[item1].kind == .task_list_item);
+    try testing.expect(!r.ast.nodes[item1].kind.task_list_item.checked);
+    const para1 = r.ast.nodes[item1].first_child.?;
+    const text1 = r.ast.nodes[para1].first_child.?;
+    try testing.expectEqualStrings("todo", r.ast.nodes[text1].kind.str);
+
+    const item2 = r.ast.nodes[item1].next_sibling.?;
+    try testing.expect(r.ast.nodes[item2].kind.task_list_item.checked);
+    const item3 = r.ast.nodes[item2].next_sibling.?;
+    try testing.expect(r.ast.nodes[item3].kind.task_list_item.checked);
+}
+
+test "task list: renders an <input type=checkbox> via the shared HTML printer" {
+    const html = try renderHtml("- [x] done\n", .{ .task_lists = true });
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings(
+        "<ul class=\"task-list\">\n<li>\n<input disabled=\"\" type=\"checkbox\" checked=\"\"/>\ndone\n</li>\n</ul>\n",
+        html,
+    );
+}
+
+test "task lists OFF: '- [ ] x' is a plain bullet list item with literal text" {
+    var r = try parse(testing.allocator, "- [ ] x\n", .{ .task_lists = false });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    const list = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[list].kind == .bullet_list);
+    const item = r.ast.nodes[list].first_child.?;
+    try testing.expect(r.ast.nodes[item].kind == .list_item);
+    const para = r.ast.nodes[item].first_child.?;
+    // `[ ]` with no following `(`/`[` and no matching reference falls back
+    // to literal brackets per Phase 2's existing (unrelated to this flag)
+    // link-resolution rules -- it doesn't stay ONE `str` node (see
+    // `inline.zig`'s "an unresolved reference label falls back to literal
+    // brackets" test), so concatenate every child's text instead.
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    var it = r.ast.children(para);
+    while (it.next()) |n| try buf.appendSlice(testing.allocator, n.kind.str);
+    try testing.expectEqualStrings("[ ] x", buf.items);
+}
+
+// ── Phase 3: extended autolinks (block-level integration) ────────────────
+
+test "extended autolinks render through the shared HTML printer" {
+    const html = try renderHtml("visit www.example.com today\n", .{ .autolinks = true });
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings("<p>visit <a href=\"http://www.example.com\">www.example.com</a> today</p>\n", html);
+}
+
+// ── Phase 3: math (block-level integration) ──────────────────────────────
+
+test "math renders through the shared HTML printer" {
+    const html = try renderHtml("$x$ and $$y$$\n", .{ .math = true });
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings(
+        "<p><span class=\"math inline\">\\(x\\)</span> and <span class=\"math display\">\\[y\\]</span></p>\n",
+        html,
+    );
+}
+
+// ── Phase 3: definition lists ────────────────────────────────────────────
+
+test "definition list: a term with two definitions" {
+    var r = try parse(testing.allocator,
+        \\Term
+        \\: First definition
+        \\: Second definition
+        \\
+    , .{ .definition_lists = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+
+    const dl = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[dl].kind == .definition_list);
+    const item = r.ast.nodes[dl].first_child.?;
+    try testing.expect(r.ast.nodes[item].kind == .definition_list_item);
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[item].next_sibling);
+
+    const term = r.ast.nodes[item].first_child.?;
+    try testing.expect(r.ast.nodes[term].kind == .term);
+    const term_text = r.ast.nodes[term].first_child.?;
+    try testing.expectEqualStrings("Term", r.ast.nodes[term_text].kind.str);
+
+    const def1 = r.ast.nodes[term].next_sibling.?;
+    try testing.expect(r.ast.nodes[def1].kind == .definition);
+    const def1_text = r.ast.nodes[def1].first_child.?;
+    try testing.expectEqualStrings("First definition", r.ast.nodes[def1_text].kind.str);
+
+    const def2 = r.ast.nodes[def1].next_sibling.?;
+    try testing.expect(r.ast.nodes[def2].kind == .definition);
+    const def2_text = r.ast.nodes[def2].first_child.?;
+    try testing.expectEqualStrings("Second definition", r.ast.nodes[def2_text].kind.str);
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[def2].next_sibling);
+}
+
+test "definition list: two adjacent term groups merge into one definition_list" {
+    var r = try parse(testing.allocator,
+        \\Term A
+        \\: def a
+        \\
+        \\Term B
+        \\: def b
+        \\
+    , .{ .definition_lists = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+
+    const dl = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[dl].kind == .definition_list);
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[dl].next_sibling);
+    const item1 = r.ast.nodes[dl].first_child.?;
+    const item2 = r.ast.nodes[item1].next_sibling.?;
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[item2].next_sibling);
+    const term2 = r.ast.nodes[item2].first_child.?;
+    const term2_text = r.ast.nodes[term2].first_child.?;
+    try testing.expectEqualStrings("Term B", r.ast.nodes[term2_text].kind.str);
+}
+
+test "definition list: renders as <dl><dt>...<dd>... via the shared HTML printer" {
+    const html = try renderHtml("Term\n: def\n", .{ .definition_lists = true });
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings("<dl>\n<dt>Term</dt>\n<dd>\ndef</dd>\n</dl>\n", html);
+}
+
+test "definition lists OFF: 'Term\\n: def' lazily continues one CommonMark paragraph" {
+    var r = try parse(testing.allocator, "Term\n: def\n", .{ .definition_lists = false });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    const para = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[para].kind == .para);
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[para].next_sibling);
+}
+
+// ── Phase 3: frontmatter ──────────────────────────────────────────────────
+
+test "frontmatter: a leading YAML block becomes a raw_block, not rendered to HTML" {
+    var r = try parse(testing.allocator, "---\ntitle: Hi\n---\n# Heading\n", .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+
+    const fm = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[fm].kind == .raw_block);
+    try testing.expectEqualStrings("yaml", r.ast.nodes[fm].kind.raw_block.format);
+    try testing.expectEqualStrings("title: Hi\n", r.ast.nodes[fm].kind.raw_block.text);
+
+    const heading = r.ast.nodes[fm].next_sibling.?;
+    try testing.expect(r.ast.nodes[heading].kind == .heading);
+
+    const html = try Html.serializeAlloc(testing.allocator, &r.ast, null);
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings("<h1>Heading</h1>\n", html);
+}
+
+test "frontmatter: a leading TOML (+++) block is tagged format=\"toml\"" {
+    var r = try parse(testing.allocator, "+++\ntitle = \"Hi\"\n+++\nbody\n", .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    const fm = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[fm].kind == .raw_block);
+    try testing.expectEqualStrings("toml", r.ast.nodes[fm].kind.raw_block.format);
+    try testing.expectEqualStrings("title = \"Hi\"\n", r.ast.nodes[fm].kind.raw_block.text);
+}
+
+test "frontmatter: an unterminated leading '---' block falls back to ordinary parsing" {
+    var r = try parse(testing.allocator, "---\ntitle: Hi\n", .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    // No closing `---`: the first line is just a thematic break, same as
+    // with the flag off.
+    const first = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[first].kind == .thematic_break);
+}
+
+test "frontmatter OFF: a leading '---' is an ordinary CommonMark thematic break" {
+    var r = try parse(testing.allocator, "---\nfoo\n", .{ .frontmatter = false });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    const first = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[first].kind == .thematic_break);
+    const para = r.ast.nodes[first].next_sibling.?;
+    try testing.expect(r.ast.nodes[para].kind == .para);
 }
