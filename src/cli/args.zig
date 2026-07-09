@@ -19,7 +19,12 @@ const format = @import("format.zig");
 const InputFormat = format.InputFormat;
 const OutputMode = format.OutputMode;
 
-pub const Action = enum { help, version, convert, identify };
+pub const Action = enum { help, version, convert, identify, edit };
+
+/// The span-splice edit `twig edit` performs — one per invocation, selected by
+/// the corresponding `--…` flag. See `actions.zig`'s `applyEdit` for the
+/// mapping onto `twig.Editor`'s methods.
+pub const EditOp = enum { replace, replace_content, insert_before, insert_after, insert_child, delete };
 
 pub const ConvertOptions = struct {
     /// The file to convert, or `"-"` for stdin.
@@ -38,11 +43,30 @@ pub const IdentifyOptions = struct {
     input: InputFormat = .djot,
 };
 
+pub const EditOptions = struct {
+    /// The file to edit, or `"-"` for stdin (stdin always prints to stdout —
+    /// it can't be written back in place).
+    file: []const u8 = "",
+    input: InputFormat = .djot,
+    op: EditOp = .replace,
+    /// The target node's index path as written on the command line
+    /// (dot-separated, e.g. `"0.3.1"`); parsed into `[]const usize` by
+    /// `actions.zig` (which has the allocator). Empty string = the root.
+    path_str: []const u8 = "",
+    /// Only meaningful for `.insert_child`: the child position to insert at.
+    child_index: usize = 0,
+    /// The replacement/inserted text (unused for `.delete`).
+    text: []const u8 = "",
+    /// Print the edited document to stdout instead of writing it back in place.
+    dry_run: bool = false,
+};
+
 pub const CliActionOptions = union(Action) {
     help: void,
     version: void,
     convert: ConvertOptions,
     identify: IdentifyOptions,
+    edit: EditOptions,
 };
 
 pub const CliConfig = struct {
@@ -61,6 +85,14 @@ pub const ArgError = error{
     MissingFormatValue,
     MissingFile,
     TooManyPositionals,
+    /// An `edit` operation flag (`--replace`, `--insert-child`, …) was missing
+    /// one of its required following values (path/text/index).
+    MissingEditArgument,
+    /// `edit` was given a file but no operation flag at all.
+    MissingEditOperation,
+    /// `--insert-child`'s index value wasn't a non-negative integer (a message
+    /// was already printed).
+    InvalidEditIndex,
 } || format.ResolveInputFormatError;
 
 /// A `[:0]const u8`-argv-slice-backed iterator satisfying the `.next()`
@@ -106,6 +138,9 @@ pub fn parseConfig(args: anytype, stderr: *Writer) ArgError!CliConfig {
     }
     if (std.mem.eql(u8, action_str, "identify")) {
         return parseIdentify(args, stderr, config.binary_name);
+    }
+    if (std.mem.eql(u8, action_str, "edit")) {
+        return parseEdit(args, stderr, config.binary_name);
     }
 
     // Unrecognized verb: fall back to help, same as no args / an explicit
@@ -180,6 +215,81 @@ fn parseIdentify(args: anytype, stderr: *Writer, binary_name: []const u8) ArgErr
         .action = .identify,
         .binary_name = binary_name,
         .options = .{ .identify = .{ .file = path, .input = resolved } },
+    };
+}
+
+fn parseEdit(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError!CliConfig {
+    var input_override: ?InputFormat = null;
+    var file: ?[]const u8 = null;
+    var op: ?EditOp = null;
+    var path_str: []const u8 = "";
+    var child_index: usize = 0;
+    var text: []const u8 = "";
+    var dry_run = false;
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
+            const name = args.next() orelse return ArgError.MissingFormatValue;
+            input_override = format.parseFormatName(name) orelse {
+                try stderr.print("error: unsupported input format '{s}'\n", .{name});
+                try format.printSupportedInputFormats(stderr);
+                try stderr.flush();
+                return ArgError.UnsupportedFormat;
+            };
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--replace")) {
+            op = .replace;
+            path_str = args.next() orelse return ArgError.MissingEditArgument;
+            text = args.next() orelse return ArgError.MissingEditArgument;
+        } else if (std.mem.eql(u8, arg, "--replace-content")) {
+            op = .replace_content;
+            path_str = args.next() orelse return ArgError.MissingEditArgument;
+            text = args.next() orelse return ArgError.MissingEditArgument;
+        } else if (std.mem.eql(u8, arg, "--insert-before")) {
+            op = .insert_before;
+            path_str = args.next() orelse return ArgError.MissingEditArgument;
+            text = args.next() orelse return ArgError.MissingEditArgument;
+        } else if (std.mem.eql(u8, arg, "--insert-after")) {
+            op = .insert_after;
+            path_str = args.next() orelse return ArgError.MissingEditArgument;
+            text = args.next() orelse return ArgError.MissingEditArgument;
+        } else if (std.mem.eql(u8, arg, "--insert-child")) {
+            op = .insert_child;
+            path_str = args.next() orelse return ArgError.MissingEditArgument;
+            const idx_str = args.next() orelse return ArgError.MissingEditArgument;
+            child_index = std.fmt.parseInt(usize, idx_str, 10) catch {
+                try stderr.print("error: invalid child index '{s}' (expected a non-negative integer)\n", .{idx_str});
+                try stderr.flush();
+                return ArgError.InvalidEditIndex;
+            };
+            text = args.next() orelse return ArgError.MissingEditArgument;
+        } else if (std.mem.eql(u8, arg, "--delete")) {
+            op = .delete;
+            path_str = args.next() orelse return ArgError.MissingEditArgument;
+        } else if (file == null) {
+            file = arg;
+        } else {
+            return ArgError.TooManyPositionals;
+        }
+    }
+
+    const path = file orelse return ArgError.MissingFile;
+    const the_op = op orelse return ArgError.MissingEditOperation;
+    const resolved = try format.resolveInputFormat(stderr, path, input_override);
+
+    return .{
+        .action = .edit,
+        .binary_name = binary_name,
+        .options = .{ .edit = .{
+            .file = path,
+            .input = resolved,
+            .op = the_op,
+            .path_str = path_str,
+            .child_index = child_index,
+            .text = text,
+            .dry_run = dry_run,
+        } },
     };
 }
 
@@ -314,4 +424,55 @@ test "parseConfig: an unrecognized verb falls back to help rather than erroring"
     var a = TestArgs{ .items = &.{ "twig", "frobnicate", "f.dj" } };
     const c = try parseConfig(&a, &w);
     try testing.expectEqual(Action.help, c.action);
+}
+
+test "parseConfig: edit --replace parses op, path, text, and the file positional" {
+    var buf: [256]u8 = undefined;
+    var w = scratchWriter(&buf);
+    var a = TestArgs{ .items = &.{ "twig", "edit", "doc.md", "--replace", "0.1", "new text" } };
+    const c = try parseConfig(&a, &w);
+    try testing.expectEqual(Action.edit, c.action);
+    const e = c.options.edit;
+    try testing.expectEqual(EditOp.replace, e.op);
+    try testing.expectEqualStrings("doc.md", e.file);
+    try testing.expectEqualStrings("0.1", e.path_str);
+    try testing.expectEqualStrings("new text", e.text);
+    try testing.expectEqual(InputFormat.markdown, e.input);
+    try testing.expect(!e.dry_run);
+}
+
+test "parseConfig: edit --insert-child parses the index, --dry-run, and -i override" {
+    var buf: [256]u8 = undefined;
+    var w = scratchWriter(&buf);
+    var a = TestArgs{ .items = &.{ "twig", "edit", "-i", "xml", "--dry-run", "--insert-child", "0", "2", "<x/>", "f" } };
+    const c = try parseConfig(&a, &w);
+    const e = c.options.edit;
+    try testing.expectEqual(EditOp.insert_child, e.op);
+    try testing.expectEqualStrings("0", e.path_str);
+    try testing.expectEqual(@as(usize, 2), e.child_index);
+    try testing.expectEqualStrings("<x/>", e.text);
+    try testing.expectEqual(InputFormat.xml, e.input);
+    try testing.expect(e.dry_run);
+}
+
+test "parseConfig: edit --delete needs only a path; missing op or arg errors" {
+    var buf: [256]u8 = undefined;
+
+    var w1 = scratchWriter(&buf);
+    var del = TestArgs{ .items = &.{ "twig", "edit", "doc.dj", "--delete", "2" } };
+    const c = try parseConfig(&del, &w1);
+    try testing.expectEqual(EditOp.delete, c.options.edit.op);
+    try testing.expectEqualStrings("2", c.options.edit.path_str);
+
+    var w2 = scratchWriter(&buf);
+    var no_op = TestArgs{ .items = &.{ "twig", "edit", "doc.dj" } };
+    try testing.expectError(error.MissingEditOperation, parseConfig(&no_op, &w2));
+
+    var w3 = scratchWriter(&buf);
+    var no_arg = TestArgs{ .items = &.{ "twig", "edit", "doc.dj", "--replace", "0.1" } };
+    try testing.expectError(error.MissingEditArgument, parseConfig(&no_arg, &w3));
+
+    var w4 = scratchWriter(&buf);
+    var bad_idx = TestArgs{ .items = &.{ "twig", "edit", "f.xml", "--insert-child", "0", "notnum", "<x/>" } };
+    try testing.expectError(error.InvalidEditIndex, parseConfig(&bad_idx, &w4));
 }

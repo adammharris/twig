@@ -31,21 +31,37 @@ project to `fig` (which does the same for config formats).
     links/images (inline + reference, resolved at parse time; forward-referenced
     defs handled via deferred inline resolution after the block scan), CommonMark
     autolinks, raw inline HTML.
-  - Phase 3 PENDING: GFM (tables, strikethrough, task lists, ext autolinks) +
-    footnotes, definition lists, math, frontmatter — behind the flags.
+  - Phase 3 DONE: GFM (tables, strikethrough, task lists, ext autolinks) +
+    math, definition lists, frontmatter — all behind the flags.
+  - Phase 3b DONE: footnotes — `Document.footnotes` table + a `markdown/html.zig`
+    adapter (mirrors djot's) that builds an `Html.Context` so the shared printer
+    does the numbering/backlinks/endnotes. CLI routes markdown through it.
+  - Markdown parsing is now FEATURE-COMPLETE. Remaining markdown work is
+    render-side only (Phase 4, below).
 - **CLI** (`src/main.zig` + `src/cli/`) — `twig convert [-i F] [-o html|ast|
-  canonical] <file|->` and `twig identify`. Extension inference + `-i` override;
-  extensible format registry (one entry per language). `-o ast` = pretty JSON
-  dump; `-o canonical` = round-trip (XML only so far).
+  canonical] <file|->`, `twig identify`, and `twig edit`. Extension inference +
+  `-i` override; extensible format registry (one entry per language — `parse`,
+  `parseToAst`, `renderHtml`, optional `serializeCanonical`). `-o ast` = pretty
+  JSON dump; `-o canonical` = round-trip (XML only so far).
+- **Editor** (`src/ast/editor.zig`, reader path-nav, `twig edit`) — the
+  span-splice layer: lossless in-place edits via index paths. Primitive
+  `replaceAtSpan` (splice → reparse → byte-for-byte rollback on failure); ops
+  `replaceNode`/`replaceContent`/`insertBefore`/`insertAfter`/`insertChild`/
+  `deleteNode`. Runtime-dispatched over a `parseToAst` callback (djot/markdown
+  adapters free the `Document` side-table maps, hand back the bare `AST`).
+  Limits: no per-field spans (payload edits = whole-node replace), empty-djot-
+  container inserts need a `content_span` the parser leaves null, delete does no
+  whitespace cleanup — all candidates for editor increment 2.
 
 ## Test status
 
-`zig build test --summary all` → **133/133**.
+`zig build test --summary all` → **192/192**.
 Conformance: **djot 265/271**, **html printer 265/271** (both skip the same 6
-AST-print-mode cases), **markdown 496/652** (Phase 2 ratchet, `BASELINE=496` in
-`markdown/conformance.zig` — bump it as phases land). Of the 156 remaining
-markdown failures, `other`(parser bugs)=0: ~6 are minor block-level Phase-1 gaps
-and ~150 are the CommonMark-vs-djot rendering divergences from issues #1/#3 below.
+AST-print-mode cases), **markdown 496/652** (`BASELINE=496` in
+`markdown/conformance.zig`; harness uses the `.commonmark` preset, so extensions
+don't move it). Of the 156 remaining markdown failures, `other`(parser bugs)=0:
+~6 are minor block-level gaps and ~150 are CommonMark-vs-djot *rendering*
+divergences from issues #1/#3 below — i.e. remaining markdown work is render-side.
 
 ## Known issues / deferred (for the Phase-4 rendering pass unless noted)
 
@@ -64,16 +80,22 @@ and ~150 are the CommonMark-vs-djot rendering divergences from issues #1/#3 belo
 
 ## Next steps
 
-1. **Markdown Phase 3** — GFM (tables, strikethrough, task lists, ext autolinks)
-   + footnotes, definition lists, math, frontmatter behind `ParseOptions`. Note
-   the `pending_inline` deferral pattern (Phase 2) generalizes to any future
-   "resolved-by-label, possibly-defined-later" construct (e.g. footnotes).
-3. **Phase 4** — a CommonMark-faithful HTML rendering mode on the shared printer
-   (resolve the divergences in #1/#3, fix the tightness leak).
-4. **HTML parser** (deferred "HTML phase") — forked tokenizer (RCDATA/RAWTEXT,
+1. **Markdown Phase 4 — CommonMark-faithful HTML rendering.** The ~150 residual
+   conformance failures are all rendering conventions, needing a "CommonMark
+   mode" on the shared printer (which djot depends on, so this needs a design
+   decision — a `RenderOptions` flag set, a mode enum, or per-construct
+   options). Divergences to reconcile: void elements `<hr>`→`<hr />`; `"` escaped
+   in text; tight-list `<li>text</li>`; GFM table `align=` attr vs `style=`;
+   task-list `<input>` self-close; `<dd>` trailing newline. PLUS fix the latent
+   tightness-leak bug (issue #1).
+2. **HTML parser** (deferred "HTML phase") — forked tokenizer (RCDATA/RAWTEXT,
    entity refs), implicit tag closing (`<li>`/`<p>`), conservative tree
    construction. Then upgrade markdown's raw-HTML nodes to parsed `element`s.
-5. **CLI follow-ups** — wire Markdown into `-o canonical` once a markdown
+3. **Editor increment 2** — the original motivation is now landed (increment 1:
+   index-path splice ops + `twig edit`). Next: kind-aware/semantic addressing on
+   top of index paths; per-field spans (so a `link` destination or `code_block`
+   lang is editable without whole-node replace); smart delete (whitespace/
+   separator cleanup); move/reorder ops; richer container interiors so
+   empty-container inserts work everywhere.
+4. **CLI follow-ups** — wire Markdown into `-o canonical` once a markdown
    serializer exists; add HTML as an input format once the parser lands.
-6. **Editor / span-splice layer** — the original motivation: use
-   `span`/`content_span` for precise in-place document edits.

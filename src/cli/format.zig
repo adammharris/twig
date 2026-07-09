@@ -84,6 +84,34 @@ fn parseXml(allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
     return .{ .xml = try twig.Xml.parse(allocator, source) };
 }
 
+// ── editor reparse adapters ────────────────────────────────────────────────
+// The span-splice editor (`twig.Editor`) reparses after every edit and only
+// needs the bare shared `AST` — spans/structure, never a `Document`'s side
+// tables. These unwrap djot/Markdown's `Document`: its side-table map KEYS are
+// slices into `ast.owned_strings` and the maps own no AST memory (see each
+// `Document`'s doc comment), so freeing just the map *structures* and handing
+// back `.ast` is leak-free and leaves a fully valid tree. XML already returns a
+// bare `AST`.
+
+fn parseToAstDjot(allocator: Allocator, source: []const u8) anyerror!twig.AST {
+    var doc = try twig.Djot.parse(allocator, source);
+    doc.references.deinit(allocator);
+    doc.auto_references.deinit(allocator);
+    doc.footnotes.deinit(allocator);
+    return doc.ast;
+}
+
+fn parseToAstMarkdown(allocator: Allocator, source: []const u8) anyerror!twig.AST {
+    var doc = try twig.Markdown.parse(allocator, source, .{});
+    doc.link_references.deinit(allocator);
+    doc.footnotes.deinit(allocator);
+    return doc.ast;
+}
+
+fn parseToAstXml(allocator: Allocator, source: []const u8) anyerror!twig.AST {
+    return twig.Xml.parse(allocator, source);
+}
+
 /// Djot needs its own HTML rendering path (`Djot.html.render`) rather than
 /// the generic printer: it resolves reference/footnote labels against
 /// `Document`'s side tables at render time (see `djot/html.zig`'s module doc
@@ -132,6 +160,11 @@ pub const FormatEntry = struct {
     /// (which `parseFormatName` always accepts via `std.meta.stringToEnum`).
     aliases: []const []const u8 = &.{},
     parse: *const fn (Allocator, []const u8) anyerror!ParsedDoc,
+    /// Source -> the bare shared `AST`, the reparse callback the span-splice
+    /// editor (`twig.Editor`, driving `twig edit`) needs. Discards any
+    /// `Document` side tables (see the editor-adapter note above) — editing is
+    /// language-neutral and only touches spans/structure. Every format has one.
+    parseToAst: *const fn (Allocator, []const u8) anyerror!twig.AST,
     renderHtml: *const fn (Allocator, *const ParsedDoc, *Writer) anyerror!void,
     /// Round-trip serializer back to this format's own source syntax —
     /// `convert -o canonical`'s implementation. `null` means the language has
@@ -147,6 +180,7 @@ pub const registry = [_]FormatEntry{
         .extensions = &.{ "dj", "djot" },
         .aliases = &.{"dj"},
         .parse = parseDjot,
+        .parseToAst = parseToAstDjot,
         .renderHtml = renderHtmlDjot,
     },
     .{
@@ -154,12 +188,14 @@ pub const registry = [_]FormatEntry{
         .extensions = &.{ "md", "markdown" },
         .aliases = &.{"md"},
         .parse = parseMarkdown,
+        .parseToAst = parseToAstMarkdown,
         .renderHtml = renderHtmlMarkdown,
     },
     .{
         .id = .xml,
         .extensions = &.{"xml"},
         .parse = parseXml,
+        .parseToAst = parseToAstXml,
         .renderHtml = renderHtmlGeneric,
         .serializeCanonical = serializeCanonicalXml,
     },

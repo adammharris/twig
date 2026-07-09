@@ -19,6 +19,8 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Writer = std.Io.Writer;
 
+const twig = @import("twig");
+
 const format = @import("format.zig");
 const args_mod = @import("args.zig");
 const ast_json = @import("ast_json.zig");
@@ -56,6 +58,18 @@ pub fn runHelp(w: *Writer, binary_name: []const u8) !void {
         \\  identify <file>
         \\      Detect and print a file's input format; performs no conversion.
         \\
+        \\  edit [-i <format>] <file|-> <operation>
+        \\      Losslessly edit a document in place, addressing a node by its
+        \\      dot-separated index path (e.g. 0.3.1). Use `convert -o ast` to
+        \\      see the tree and read off paths. Operations:
+        \\        --replace <path> <text>          replace a node's whole source
+        \\        --replace-content <path> <text>  replace a container's interior
+        \\        --insert-before <path> <text>    insert text before a node
+        \\        --insert-after <path> <text>     insert text after a node
+        \\        --insert-child <path> <i> <text> insert as a container's i-th child
+        \\        --delete <path>                  remove a node
+        \\      Writes back in place; pass --dry-run to print the result instead.
+        \\
         \\  help              show this message
         \\  version           show the version
         \\
@@ -63,6 +77,7 @@ pub fn runHelp(w: *Writer, binary_name: []const u8) !void {
         \\  -i, --input <format>   override input-format detection
         \\                         (djot/dj, markdown/md, xml)
         \\  -o, --output <format>  select convert's output (html, ast, canonical)
+        \\  --dry-run              (edit) print the result instead of writing it
         \\
         \\Input format is normally inferred from the file extension
         \\(.dj/.djot, .md/.markdown, .xml). Pass `-` as the file to read from
@@ -171,6 +186,103 @@ fn convertSource(
     }
 }
 
+/// Apply one span-splice edit to `opts.file` (or stdin) and either write the
+/// result back in place or — for `--dry-run`, or when reading stdin (which
+/// can't be written back) — print it to stdout. The parse/edit core is
+/// `applyEdit`, split out so tests can drive it against an in-memory string.
+pub fn runEdit(allocator: Allocator, io: Io, stdout: *Writer, stderr: *Writer, opts: args_mod.EditOptions) ActionError!void {
+    const source = try readSource(allocator, io, opts.file, stderr);
+    const path = try parsePath(allocator, opts.path_str, stderr);
+    const edited = try applyEdit(allocator, source, opts.input, opts.op, path, opts.child_index, opts.text, stderr);
+
+    // stdin has no file to write back to, so it always prints; `--dry-run`
+    // prints for a real file too, leaving it untouched.
+    if (opts.dry_run or std.mem.eql(u8, opts.file, "-")) {
+        stdout.writeAll(edited) catch {};
+        stdout.flush() catch |err| {
+            stderr.print("error: failed to write output: {t}\n", .{err}) catch {};
+            stderr.flush() catch {};
+            return error.ActionFailed;
+        };
+        return;
+    }
+
+    writeFileInPlace(io, opts.file, edited) catch |err| {
+        stderr.print("error: could not write '{s}': {t}\n", .{ opts.file, err }) catch {};
+        stderr.flush() catch {};
+        return error.ActionFailed;
+    };
+}
+
+/// Parse a dot-separated index path (`"0.3.1"` -> `&.{0,3,1}`; empty -> the
+/// root, `&.{}`). A non-numeric segment prints a message and fails.
+fn parsePath(allocator: Allocator, path_str: []const u8, stderr: *Writer) ActionError![]const usize {
+    if (path_str.len == 0) return &.{};
+    var list: std.ArrayList(usize) = .empty;
+    errdefer list.deinit(allocator);
+    var it = std.mem.splitScalar(u8, path_str, '.');
+    while (it.next()) |seg| {
+        const n = std.fmt.parseInt(usize, seg, 10) catch {
+            stderr.print("error: invalid path segment '{s}' in '{s}' (expected dot-separated indices like 0.3.1)\n", .{ seg, path_str }) catch {};
+            stderr.flush() catch {};
+            return error.ActionFailed;
+        };
+        list.append(allocator, n) catch return error.ActionFailed;
+    }
+    return list.toOwnedSlice(allocator) catch error.ActionFailed;
+}
+
+/// Parse `source` as `input`, apply the one edit, and return the edited bytes
+/// (owned by `allocator`). Every failure — parse, a bad path/interior, or a
+/// reparse-breaking edit that rolls back — prints a clear message and folds
+/// into `ActionError`.
+fn applyEdit(
+    allocator: Allocator,
+    source: []const u8,
+    input: format.InputFormat,
+    op: args_mod.EditOp,
+    path: []const usize,
+    child_index: usize,
+    text: []const u8,
+    stderr: *Writer,
+) ActionError![]u8 {
+    const entry = format.entryFor(input);
+    var editor = twig.Editor.init(allocator, source, entry.parseToAst) catch |err| {
+        stderr.print("error: failed to parse input as {s}: {t}\n", .{ @tagName(input), err }) catch {};
+        stderr.flush() catch {};
+        return error.ActionFailed;
+    };
+    defer editor.deinit();
+
+    const result = switch (op) {
+        .replace => editor.replaceNode(path, text),
+        .replace_content => editor.replaceContent(path, text),
+        .insert_before => editor.insertBefore(path, text),
+        .insert_after => editor.insertAfter(path, text),
+        .insert_child => editor.insertChild(path, child_index, text),
+        .delete => editor.deleteNode(path),
+    };
+    result catch |err| {
+        switch (err) {
+            error.PathOutOfBounds => stderr.print("error: no node at that path (index out of bounds)\n", .{}) catch {},
+            error.NoContentSpan => stderr.print("error: that node has no editable interior (it's a leaf, or a container the parser left without a known interior)\n", .{}) catch {},
+            else => stderr.print("error: the edit produced a document that no longer parses ({t}); nothing was changed\n", .{err}) catch {},
+        }
+        stderr.flush() catch {};
+        return error.ActionFailed;
+    };
+
+    return allocator.dupe(u8, editor.sourceBytes()) catch return error.ActionFailed;
+}
+
+/// Overwrite `path` with `data` (truncating create + positional write). Used
+/// by `runEdit`'s in-place write-back.
+fn writeFileInPlace(io: Io, path: []const u8, data: []const u8) !void {
+    const file = try Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writePositionalAll(io, data, 0);
+}
+
 /// Read `path`'s full contents, or stdin's when `path == "-"`. Both paths go
 /// through the same `max_source_bytes` cap; failures print a clear message to
 /// `stderr` and fold into `ActionError` rather than propagating the
@@ -268,4 +380,55 @@ test "convertSource: canonical output on a format with no serializer fails clear
     // message naming djot and "no serializer", not crash or emit nothing.
     try testing.expectError(error.ActionFailed, convertSource(testing.allocator, "hello\n", "-", .djot, .canonical, &out, &err));
     try testing.expect(std.mem.indexOf(u8, err.buffered(), "no serializer") != null);
+}
+
+test "parsePath: dotted indices, empty = root, non-numeric errors" {
+    var buf: [256]u8 = undefined;
+    var err: Writer = .fixed(&buf);
+
+    const p = try parsePath(testing.allocator, "0.3.1", &err);
+    defer testing.allocator.free(p);
+    try testing.expectEqualSlices(usize, &.{ 0, 3, 1 }, p);
+
+    const root = try parsePath(testing.allocator, "", &err);
+    try testing.expectEqual(@as(usize, 0), root.len);
+
+    try testing.expectError(error.ActionFailed, parsePath(testing.allocator, "0.x", &err));
+}
+
+test "applyEdit: xml replace-content, markdown insert-child, djot replace, delete" {
+    var buf: [512]u8 = undefined;
+    var err: Writer = .fixed(&buf);
+
+    // XML: replace <b>'s interior.
+    const xml = try applyEdit(testing.allocator, "<a><b>hi</b></a>", .xml, .replace_content, &.{ 0, 0 }, 0, "bye", &err);
+    defer testing.allocator.free(xml);
+    try testing.expectEqualStrings("<a><b>bye</b></a>", xml);
+
+    // Markdown: insert a new first list item. The list is doc's child 0; its
+    // items are the list's children.
+    const md = try applyEdit(testing.allocator, "- one\n- two\n", .markdown, .insert_child, &.{0}, 0, "- zero\n", &err);
+    defer testing.allocator.free(md);
+    try testing.expectEqualStrings("- zero\n- one\n- two\n", md);
+
+    // Djot: replace the first paragraph's whole source. deleteNode on the
+    // second one then removes it.
+    const dj = try applyEdit(testing.allocator, "one\n\ntwo\n", .djot, .replace, &.{0}, 0, "ONE", &err);
+    defer testing.allocator.free(dj);
+    try testing.expect(std.mem.startsWith(u8, dj, "ONE"));
+}
+
+test "applyEdit: a leaf interior yields a clear NoContentSpan failure" {
+    var buf: [512]u8 = undefined;
+    var err: Writer = .fixed(&buf);
+    try testing.expectError(error.ActionFailed, applyEdit(testing.allocator, "<a>hi</a>", .xml, .replace_content, &.{ 0, 0 }, 0, "x", &err));
+    try testing.expect(std.mem.indexOf(u8, err.buffered(), "no editable interior") != null);
+}
+
+test "applyEdit: an edit that breaks the reparse rolls back and reports it" {
+    var buf: [512]u8 = undefined;
+    var err: Writer = .fixed(&buf);
+    // Replacing <a>'s interior with "<b>" makes `<a><b></a>` — malformed.
+    try testing.expectError(error.ActionFailed, applyEdit(testing.allocator, "<a>ok</a>", .xml, .replace_content, &.{0}, 0, "<b>", &err));
+    try testing.expect(std.mem.indexOf(u8, err.buffered(), "no longer parses") != null);
 }
