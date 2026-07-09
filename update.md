@@ -51,11 +51,23 @@ project to `fig` (which does the same for config formats).
   adapters free the `Document` side-table maps, hand back the bare `AST`).
   Limits: no per-field spans (payload edits = whole-node replace), empty-djot-
   container inserts need a `content_span` the parser leaves null, delete does no
-  whitespace cleanup — all candidates for editor increment 2.
+  whitespace cleanup — all candidates for editor increment 2. Ops now come in
+  path and `…ById` (node-id) forms; both converge on `replaceAtSpan`.
+- **Selectors** (`src/ast/select.zig`, `twig query`) — content-based node
+  addressing, the friendly alternative to raw index paths. CSS-lite:
+  `heading[level=2]`, `heading("Status")`, `item[2]`, `link[dest^="http"]`,
+  `code[lang=zig]` (kind names + friendly aliases + `:contains`/shorthand +
+  `:nth`/`[k]` + attr predicates). Library API: `Select.parse` →
+  `resolveAll`/`resolveOne`/`textOf` + `AST.pathOf` (id → path). `twig query`
+  lists matches as `[path] kind "preview"`; `twig edit` accepts a selector
+  anywhere it takes a path (auto-detected — all-digits-and-dots = index path,
+  else selector), refusing an ambiguous match with a candidate list. NOT yet:
+  combinators (`a b`, `a > b`) and `section("Title")` — both layer on this same
+  engine next.
 
 ## Test status
 
-`zig build test --summary all` → **192/192**.
+`zig build test --summary all` → **201/201**.
 Conformance: **djot 265/271**, **html printer 265/271** (both skip the same 6
 AST-print-mode cases), **markdown 496/652** (`BASELINE=496` in
 `markdown/conformance.zig`; harness uses the `.commonmark` preset, so extensions
@@ -77,6 +89,11 @@ divergences from issues #1/#3 below — i.e. remaining markdown work is render-s
 4. **Pre-existing `zig fmt` failures** in `djot/inline.zig` and `djot/block.zig`
    (predate this work) — worth a standalone cleanup commit.
 5. XML deviations from strict 1.0 are documented in `xml.zig`'s header.
+6. **Markdown inline nodes carry no source span** (link/emph/strong/etc. are
+   `(0,0)`) — so selector/path edits of them are refused by the editor's
+   `nodeSpan` guard (`error.NoNodeSpan`) rather than silently splicing at offset
+   0. Block-level and djot-inline editing are unaffected. Making the Markdown
+   inline scanner set spans is the fix — see next steps.
 
 ## Next steps
 
@@ -91,11 +108,16 @@ divergences from issues #1/#3 below — i.e. remaining markdown work is render-s
 2. **HTML parser** (deferred "HTML phase") — forked tokenizer (RCDATA/RAWTEXT,
    entity refs), implicit tag closing (`<li>`/`<p>`), conservative tree
    construction. Then upgrade markdown's raw-HTML nodes to parsed `element`s.
-3. **Editor increment 2** — the original motivation is now landed (increment 1:
-   index-path splice ops + `twig edit`). Next: kind-aware/semantic addressing on
-   top of index paths; per-field spans (so a `link` destination or `code_block`
+3. **Markdown inline spans** (unblocks the headline `link[dest^=…]` / emphasis
+   edits) — make `markdown/inline.zig` set each inline node's source span so the
+   `NoNodeSpan` guard stops firing. High value, self-contained.
+4. **Selector combinators + `section("Title")`** — descendant/child combinators
+   (`a b`, `a > b`) and the section form, both layering on `ast/select.zig`.
+5. **Editor increment 2** — the original motivation is now landed (increment 1:
+   index-path splice ops + `twig edit`; plus content-based selectors). Next:
+   per-field spans (so a `link` destination or `code_block`
    lang is editable without whole-node replace); smart delete (whitespace/
    separator cleanup); move/reorder ops; richer container interiors so
    empty-container inserts work everywhere.
-4. **CLI follow-ups** — wire Markdown into `-o canonical` once a markdown
+6. **CLI follow-ups** — wire Markdown into `-o canonical` once a markdown
    serializer exists; add HTML as an input format once the parser lands.
