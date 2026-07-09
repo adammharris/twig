@@ -69,6 +69,32 @@ pub fn getNodeByPath(self: *const AST, path: []const usize) PathError!*const Nod
     return &self.nodes[try getIdByPath(self, path)];
 }
 
+/// The inverse of `getIdByPath`: the index path from the root to `target`
+/// (empty for the root itself), or `null` if `target` isn't in this tree.
+/// Caller frees the returned slice. Used to show a selector match's path
+/// (bridging content-based addressing back to raw index paths).
+pub fn pathOf(self: *const AST, gpa: std.mem.Allocator, target: Node.Id) std.mem.Allocator.Error!?[]usize {
+    var acc: std.ArrayList(usize) = .empty;
+    errdefer acc.deinit(gpa);
+    if (try findPath(self, gpa, self.root, target, &acc)) return try acc.toOwnedSlice(gpa);
+    acc.deinit(gpa);
+    return null;
+}
+
+fn findPath(self: *const AST, gpa: std.mem.Allocator, id: Node.Id, target: Node.Id, acc: *std.ArrayList(usize)) std.mem.Allocator.Error!bool {
+    if (id == target) return true;
+    var idx: usize = 0;
+    var c = self.nodes[id].first_child;
+    while (c) |cid| {
+        try acc.append(gpa, idx);
+        if (try findPath(self, gpa, cid, target, acc)) return true;
+        _ = acc.pop();
+        c = self.nodes[cid].next_sibling;
+        idx += 1;
+    }
+    return false;
+}
+
 test "children walks first_child/next_sibling in order" {
     const testing = std.testing;
     var b = AST.Builder.init(testing.allocator);

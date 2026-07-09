@@ -58,6 +58,13 @@ pub fn runHelp(w: *Writer, binary_name: []const u8) !void {
         \\  identify <file>
         \\      Detect and print a file's input format; performs no conversion.
         \\
+        \\  query [-i <format>] <file> <selector>
+        \\      List nodes matching a CSS-lite selector, one per line:
+        \\      `[index.path]  kind  "text preview"`. Feed a printed path
+        \\      straight to `edit`. Selector examples:
+        \\        heading            heading[level=2]    heading("Status")
+        \\        item[2]            link[dest^="http"]  code[lang=zig]
+        \\
         \\  edit [-i <format>] <file|-> <operation>
         \\      Losslessly edit a document in place, addressing a node by its
         \\      dot-separated index path (e.g. 0.3.1). Use `convert -o ast` to
@@ -184,6 +191,82 @@ fn convertSource(
             };
         },
     }
+}
+
+/// Parse `opts.file`, resolve `opts.selector` against it, and list every
+/// match — one line each: `[index.path]  kind  "text preview"`. The index path
+/// bridges content-based addressing back to the raw paths `edit` also accepts,
+/// and the whole thing is just `Select.resolveAll` + a printer over the library
+/// engine (`ast/select.zig`).
+pub fn runQuery(allocator: Allocator, io: Io, stdout: *Writer, stderr: *Writer, opts: args_mod.QueryOptions) ActionError!void {
+    const source = try readSource(allocator, io, opts.file, stderr);
+
+    // Editing/querying only needs the bare AST — reuse the editor's per-format
+    // reparse adapter (which discards any `Document` side tables).
+    var ast = format.entryFor(opts.input).parseToAst(allocator, source) catch |err| {
+        stderr.print("error: failed to parse '{s}' as {s}: {t}\n", .{ opts.file, @tagName(opts.input), err }) catch {};
+        stderr.flush() catch {};
+        return error.ActionFailed;
+    };
+    defer ast.deinit();
+
+    var selector = twig.Select.parse(allocator, opts.selector) catch |err| {
+        stderr.print("error: could not parse selector '{s}': {t}\n", .{ opts.selector, err }) catch {};
+        stderr.flush() catch {};
+        return error.ActionFailed;
+    };
+    defer selector.deinit();
+
+    const matches = twig.Select.resolveAll(allocator, &ast, &selector) catch return error.ActionFailed;
+
+    if (matches.len == 0) {
+        stderr.print("no matches for selector '{s}'\n", .{opts.selector}) catch {};
+        stderr.flush() catch {};
+        return;
+    }
+
+    for (matches) |m| {
+        printMatchLine(allocator, &ast, m.id, stdout) catch |err| {
+            stderr.print("error: failed to write output: {t}\n", .{err}) catch {};
+            stderr.flush() catch {};
+            return error.ActionFailed;
+        };
+    }
+    stdout.flush() catch |err| {
+        stderr.print("error: failed to write output: {t}\n", .{err}) catch {};
+        stderr.flush() catch {};
+        return error.ActionFailed;
+    };
+}
+
+/// One `query` result line: `[0.3.1]  heading  "some text…"`.
+fn printMatchLine(allocator: Allocator, ast: *const twig.AST, id: twig.AST.Node.Id, stdout: *Writer) !void {
+    try stdout.writeByte('[');
+    if (try ast.pathOf(allocator, id)) |path| {
+        defer allocator.free(path);
+        for (path, 0..) |seg, i| {
+            if (i != 0) try stdout.writeByte('.');
+            try stdout.print("{d}", .{seg});
+        }
+    }
+    try stdout.print("]\t{s}\t", .{@tagName(std.meta.activeTag(ast.nodes[id].kind))});
+
+    const text = try twig.Select.textOf(allocator, ast, id);
+    defer allocator.free(text);
+    try stdout.writeByte('"');
+    try writePreview(text, stdout);
+    try stdout.writeAll("\"\n");
+}
+
+/// Write up to 60 bytes of `text` with newlines/tabs collapsed to spaces, so a
+/// match preview stays on one tidy line.
+fn writePreview(text: []const u8, stdout: *Writer) !void {
+    const limit = 60;
+    const n = @min(text.len, limit);
+    for (text[0..n]) |c| {
+        try stdout.writeByte(if (c == '\n' or c == '\t' or c == '\r') ' ' else c);
+    }
+    if (text.len > limit) try stdout.writeAll("…");
 }
 
 /// Apply one span-splice edit to `opts.file` (or stdin) and either write the

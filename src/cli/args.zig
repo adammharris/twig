@@ -19,7 +19,7 @@ const format = @import("format.zig");
 const InputFormat = format.InputFormat;
 const OutputMode = format.OutputMode;
 
-pub const Action = enum { help, version, convert, identify, edit };
+pub const Action = enum { help, version, convert, identify, edit, query };
 
 /// The span-splice edit `twig edit` performs — one per invocation, selected by
 /// the corresponding `--…` flag. See `actions.zig`'s `applyEdit` for the
@@ -61,12 +61,20 @@ pub const EditOptions = struct {
     dry_run: bool = false,
 };
 
+pub const QueryOptions = struct {
+    file: []const u8 = "",
+    input: InputFormat = .djot,
+    /// The selector string (see `Select`), e.g. `heading[level=2]`.
+    selector: []const u8 = "",
+};
+
 pub const CliActionOptions = union(Action) {
     help: void,
     version: void,
     convert: ConvertOptions,
     identify: IdentifyOptions,
     edit: EditOptions,
+    query: QueryOptions,
 };
 
 pub const CliConfig = struct {
@@ -93,6 +101,8 @@ pub const ArgError = error{
     /// `--insert-child`'s index value wasn't a non-negative integer (a message
     /// was already printed).
     InvalidEditIndex,
+    /// `query` was given a file but no selector string.
+    MissingSelector,
 } || format.ResolveInputFormatError;
 
 /// A `[:0]const u8`-argv-slice-backed iterator satisfying the `.next()`
@@ -141,6 +151,9 @@ pub fn parseConfig(args: anytype, stderr: *Writer) ArgError!CliConfig {
     }
     if (std.mem.eql(u8, action_str, "edit")) {
         return parseEdit(args, stderr, config.binary_name);
+    }
+    if (std.mem.eql(u8, action_str, "query")) {
+        return parseQuery(args, stderr, config.binary_name);
     }
 
     // Unrecognized verb: fall back to help, same as no args / an explicit
@@ -215,6 +228,40 @@ fn parseIdentify(args: anytype, stderr: *Writer, binary_name: []const u8) ArgErr
         .action = .identify,
         .binary_name = binary_name,
         .options = .{ .identify = .{ .file = path, .input = resolved } },
+    };
+}
+
+fn parseQuery(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError!CliConfig {
+    var input_override: ?InputFormat = null;
+    var file: ?[]const u8 = null;
+    var selector: ?[]const u8 = null;
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
+            const name = args.next() orelse return ArgError.MissingFormatValue;
+            input_override = format.parseFormatName(name) orelse {
+                try stderr.print("error: unsupported input format '{s}'\n", .{name});
+                try format.printSupportedInputFormats(stderr);
+                try stderr.flush();
+                return ArgError.UnsupportedFormat;
+            };
+        } else if (file == null) {
+            file = arg;
+        } else if (selector == null) {
+            selector = arg;
+        } else {
+            return ArgError.TooManyPositionals;
+        }
+    }
+
+    const path = file orelse return ArgError.MissingFile;
+    const sel = selector orelse return ArgError.MissingSelector;
+    const resolved = try format.resolveInputFormat(stderr, path, input_override);
+
+    return .{
+        .action = .query,
+        .binary_name = binary_name,
+        .options = .{ .query = .{ .file = path, .input = resolved, .selector = sel } },
     };
 }
 
@@ -416,6 +463,21 @@ test "parseConfig: identify resolves the input format and takes no -o" {
     const c = try parseConfig(&a, &w);
     try testing.expectEqual(Action.identify, c.action);
     try testing.expectEqual(InputFormat.markdown, c.options.identify.input);
+}
+
+test "parseConfig: query takes a file and a selector, plus -i override" {
+    var buf: [256]u8 = undefined;
+    var w = scratchWriter(&buf);
+    var a = TestArgs{ .items = &.{ "twig", "query", "doc.md", "heading[level=2]" } };
+    const c = try parseConfig(&a, &w);
+    try testing.expectEqual(Action.query, c.action);
+    try testing.expectEqualStrings("doc.md", c.options.query.file);
+    try testing.expectEqualStrings("heading[level=2]", c.options.query.selector);
+    try testing.expectEqual(InputFormat.markdown, c.options.query.input);
+
+    var w2 = scratchWriter(&buf);
+    var no_sel = TestArgs{ .items = &.{ "twig", "query", "doc.md" } };
+    try testing.expectError(error.MissingSelector, parseConfig(&no_sel, &w2));
 }
 
 test "parseConfig: an unrecognized verb falls back to help rather than erroring" {
