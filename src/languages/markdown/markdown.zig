@@ -4,22 +4,26 @@
 //! content to `inline.zig`) into one `parse` call, and aggregates every
 //! sibling file's `test {}` blocks (the fig/djot/xml convention).
 //!
-//! ── Scope: this is Phase 1 of 3 ─────────────────────────────────────────
+//! ── Scope: this is Phase 2 of 3 ─────────────────────────────────────────
 //! Twig's Markdown support targets CommonMark 0.31.2
 //! (https://spec.commonmark.org/0.31.2/), built in three phases:
-//!   - Phase 1 (this): block structure (headings, lists, block quotes, code
+//!   - Phase 1 (done): block structure (headings, lists, block quotes, code
 //!     blocks, HTML blocks, thematic breaks, link reference definitions)
 //!     plus a minimal inline subset (plain text, backslash escapes, entity/
-//!     numeric character references, code spans, soft/hard breaks). See
-//!     `block.zig` and `inline.zig`'s module doc comments for the precise
-//!     boundary and documented simplifications.
-//!   - Phase 2 (later): the rest of CommonMark's inline grammar — emphasis/
+//!     numeric character references, code spans, soft/hard breaks).
+//!   - Phase 2 (this): the rest of CommonMark's inline grammar — emphasis/
 //!     strong (the delimiter-run algorithm), links, images, autolinks, raw
-//!     inline HTML — resolved against the `link_references` table this
-//!     phase already populates.
+//!     inline HTML — resolved AT PARSE TIME against the `link_references`
+//!     table Phase 1 populates (unlike djot, Markdown has no render-time
+//!     reference table: a resolved reference link is emitted as a `link`
+//!     node with `destination` already set and `reference == null`). See
+//!     `block.zig` and `inline.zig`'s module doc comments for the precise
+//!     boundary and documented simplifications/approximations.
 //!   - Phase 3 (later): GFM extensions and other options `ParseOptions`
 //!     already declares (tables, strikethrough, task lists, footnotes,
-//!     definition lists, frontmatter, math).
+//!     definition lists, frontmatter, math), plus GFM's *extended*
+//!     autolinks (bare `www.`/`http` URLs in text, as opposed to Phase 2's
+//!     CommonMark-core `<scheme:...>` form).
 //! Do not read the presence of `ParseOptions` fields as "already
 //! implemented" — see that file's doc comment.
 //!
@@ -30,10 +34,9 @@
 //! (`languages/html/serializer.zig`), the same way `languages/html/conformance.zig`
 //! proves it works for djot. Markdown produces no djot-style footnote/
 //! reference-in-prose rendering need beyond what `Document.link_references`
-//! captures, and even that isn't consulted by the renderer until Phase 2
-//! wires up link/image resolution (`Html.Context.references` is shaped to
-//! accept it already — see `conformance.zig` for how a `Document` feeds a
-//! `Context`).
+//! captures, and even that never needs to be consulted by the renderer
+//! (unlike djot's `Html.Context.references`) since Phase 2 resolves every
+//! reference link/image at PARSE time — see this file's module doc comment.
 //!
 //! ── `Document` ───────────────────────────────────────────────────────────
 //! Like djot (and unlike XML, which needs no side tables), Markdown needs a
@@ -56,10 +59,17 @@ pub const ParseOptions = @import("options.zig");
 pub const Parser = block.Parser;
 
 /// A parsed Markdown document: the language-neutral `AST` plus the
-/// label -> `reference`-node table Phase 2's link/image resolution will
-/// consult. Mirrors `Djot.Document` — see that type's doc comment for the
-/// rationale (side tables live here, not on the shared `AST`, because
-/// XML/HTML have nothing like them).
+/// label -> `reference`-node table `inline.zig`'s link/image resolution
+/// consults DURING parsing (`block.parse` calls `inline_mod.parseInline`
+/// with this same map before `Document` is ever constructed — see
+/// `block.zig`'s `resolvePendingInline`). Kept on `Document` after parsing
+/// mainly for provenance/introspection (e.g. future editor tooling that
+/// wants to see where a definition came from); unlike `Djot.Document
+/// .references`, the shared HTML printer never needs to consult it, since
+/// every resolvable `link`/`image` node already carries its resolved
+/// `destination` by the time parsing finishes. Mirrors `Djot.Document`'s
+/// general shape — see that type's doc comment for why side tables live
+/// here rather than on the shared `AST` (XML/HTML have nothing like them).
 pub const Document = struct {
     ast: AST,
 
@@ -67,15 +77,14 @@ pub const Document = struct {
     /// lowercased — see `block.zig`'s `normalizeLabel`) -> the `reference`
     /// node holding that link reference definition's destination (and, as
     /// a `title` attribute when present, its title). These `reference`
-    /// nodes are NOT attached anywhere in `ast`'s tree (matching djot's
-    /// `references`: they're pure side-table entries, resolved by label at
-    /// render time, never rendered in place).
+    /// nodes are NOT attached anywhere in `ast`'s tree: they're pure
+    /// side-table entries that `inline.zig` resolves by label at PARSE
+    /// time (never at render time, and never rendered in place).
     ///
     /// This map's KEYS are slices of `ast.owned_strings` (each key is the
     /// same string as its `reference` node's own `.label` field, not a
-    /// separate copy — see `block.zig`'s `tryParseLinkRefDef`), exactly
-    /// like `Djot.Document.references`, so `deinit` only needs to free the
-    /// map structure itself.
+    /// separate copy — see `block.zig`'s `tryParseLinkRefDef`), so `deinit`
+    /// only needs to free the map structure itself.
     link_references: std.StringHashMapUnmanaged(AST.Node.Id) = .empty,
 
     pub fn deinit(self: *Document) void {

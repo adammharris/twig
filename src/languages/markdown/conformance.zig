@@ -1,4 +1,4 @@
-//! Acceptance test: runs Phase 1's `parse` + the shared `Html` printer
+//! Acceptance test: runs Phase 2's `parse` + the shared `Html` printer
 //! against the vendored CommonMark spec test suite
 //! (`testdata/commonmark-spec-0.31.2.json`, fetched from
 //! `https://spec.commonmark.org/0.31.2/spec.json` — see this file's git log
@@ -6,33 +6,39 @@
 //! reports a pass/total tally, broken down by spec section.
 //!
 //! Unlike `languages/djot/conformance.zig` (which asserts zero failures —
-//! djot is fully implemented), this is Phase 1 of 3: the mission
-//! deliberately scopes emphasis/strong/links/images/autolinks out (Phase 2)
-//! and GFM/extras out (Phase 3), so most of the ~650 examples are EXPECTED
-//! to fail today. Asserting zero failures would be nonsensical; asserting
-//! nothing would let Phase 1 silently regress. The middle ground used here
-//! (matching a comment convention worth calling out for future phases to
-//! keep): a RATCHET — `BASELINE` is pinned to the actual pass count observed
-//! when Phase 1 landed, and the test asserts `passed >= BASELINE`. Phase 2/3
-//! work should bump `BASELINE` upward as it lands (never let it silently
-//! drift down); a regression in already-working block parsing fails the
-//! build immediately instead of being masked by "well, inline isn't done
-//! yet anyway".
+//! djot is fully implemented), this is Phase 2 of 3: GFM/extras are still
+//! scoped out (Phase 3), and a handful of Phase 1 block-parsing corners
+//! (documented in `block.zig`'s module doc comment, e.g. tab handling,
+//! list tight/loose edge cases) remain unclosed, so a chunk of the ~650
+//! examples are still EXPECTED to fail today. Asserting zero failures would
+//! be nonsensical; asserting nothing would let this silently regress. The
+//! middle ground used here (matching a comment convention worth calling out
+//! for future phases to keep): a RATCHET — `BASELINE` is pinned to the
+//! actual pass count observed when a phase lands, and the test asserts
+//! `passed >= BASELINE`. Phase 3 work should bump `BASELINE` upward as it
+//! lands (never let it silently drift down); a regression in already-working
+//! parsing fails the build immediately instead of being masked by "well,
+//! that extension isn't done yet anyway".
 //!
 //! Failures are cheaply bucketed into three categories, printed as counts
 //! (this categorization — not the raw pass/fail number — is the real
-//! Phase-1 intel: it tells future phases what kind of work closes the gap):
-//!   - `inline_not_yet`: expected output uses emphasis/strong/links/images
-//!     (`<em>`, `<strong>`, `<a `, `<img `) — Phase 2's job, not a bug here.
+//! intel: it tells future phases what kind of work closes the gap):
+//!   - `inline_not_yet`: the expected output uses a construct
+//!     (`<em>`/`<strong>`/`<a `/`<img `, or unescaped `<...>` markup) that
+//!     the ACTUAL output shows no sign of recognizing either — see
+//!     `categorize`'s doc comment for why this checks `actual` too, not
+//!     just `expected`. As of Phase 2 this should be small (GFM extended
+//!     autolinks are the main remaining gap, deferred to Phase 3).
 //!   - `rendering_divergence`: the parse is plausibly structurally right
 //!     (the actual output's HTML tags substantially overlap the expected
 //!     one's — see `tagOverlapRatio`) but doesn't match byte-for-byte,
 //!     suggesting a shared-printer rendering-convention mismatch (e.g. list
-//!     tight/loose whitespace, code block attribute shape) rather than a
+//!     tight/loose whitespace, void-element self-closing syntax, percent-
+//!     encoding of destinations, `"`-in-text escaping) rather than a
 //!     parsing bug. This module never patches `languages/html/*` to chase
 //!     these — see the mission — it only reports them.
-//!   - `other`: neither of the above; most likely a genuine block-parsing
-//!     gap or bug.
+//!   - `other`: neither of the above; most likely a genuine parsing gap or
+//!     bug (as of Phase 2, this is 0 against the vendored suite).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -42,13 +48,15 @@ const options_mod = @import("options.zig");
 
 const spec_json = @embedFile("testdata/commonmark-spec-0.31.2.json");
 
-/// Ratchet floor (see this file's module doc comment): the observed Phase 1
-/// pass count against the vendored 0.31.2 suite (652 examples total). Of
-/// the ~360 failures at this baseline, roughly 254 are expected
-/// "inline-not-yet" gaps (Phase 2) and ~106 are shared-printer rendering-
-/// convention divergences (e.g. `<hr>` vs. `<hr />`, tight-list `<li>`
-/// whitespace) rather than parsing bugs — see this file's test output.
-pub const BASELINE: usize = 292;
+/// Ratchet floor (see this file's module doc comment): the observed Phase 2
+/// pass count against the vendored 0.31.2 suite (652 examples total). Of the
+/// ~156 failures at this baseline, essentially all are shared-printer
+/// rendering-convention divergences (percent-encoding of link/image
+/// destinations, void-element self-closing syntax, `"`-in-text escaping,
+/// tight-list `<li>` whitespace) or the small set of already-documented
+/// Phase 1 block-parsing corners — not Phase 2 parsing bugs (`other` is 0)
+/// — see this file's test output.
+pub const BASELINE: usize = 496;
 
 const SpecExample = struct {
     markdown: []const u8,
@@ -153,10 +161,18 @@ fn tagOverlapRatio(allocator: Allocator, expected: []const u8, actual: []const u
 }
 
 fn categorize(allocator: Allocator, expected: []const u8, actual: []const u8) Allocator.Error!Category {
-    if (containsAny(expected, &.{ "<em>", "<strong>", "<a>", "<a ", "<img>", "<img " })) return .inline_not_yet;
+    // `inline_not_yet` means "the construct never got recognized at all",
+    // so it must ALSO be absent from `actual` -- checking `expected` alone
+    // (Phase 1's original heuristic, back when none of these tags could
+    // possibly appear in `actual`) would now misclassify a Phase-2 case
+    // like an `<img>` that parsed correctly but renders with different
+    // attribute order/self-closing syntax as "not yet implemented" instead
+    // of the `rendering_divergence` it actually is.
+    const inline_tags = &.{ "<em>", "<strong>", "<a>", "<a ", "<img>", "<img " };
+    if (containsAny(expected, inline_tags) and !containsAny(actual, inline_tags)) return .inline_not_yet;
     // Autolinks (`<https://...>`) and raw inline HTML (`<a><bab>`) are also
-    // Phase 2 (see `inline.zig`'s module doc comment); Phase 1 passes a
-    // bare `<...>` through as literal text, which the printer then
+    // Phase 2 (see `inline.zig`'s module doc comment); when NOT recognized,
+    // a bare `<...>` passes through as literal text, which the printer then
     // HTML-escapes to `&lt;...&gt;`. When the SPEC expects that same `<`
     // literally (unescaped, i.e. real markup) but our output escaped it,
     // that's the same "not yet" gap even though it isn't one of the tag
@@ -264,7 +280,7 @@ test "CommonMark 0.31.2 spec conformance (Phase 1 ratchet)" {
     defer result.deinit(allocator);
 
     std.debug.print(
-        "\nmarkdown (Phase 1) conformance: {d}/{d} passed ({d} failed)\n",
+        "\nmarkdown (Phase 2) conformance: {d}/{d} passed ({d} failed)\n",
         .{ result.summary.passed, result.summary.total, result.summary.failed },
     );
     std.debug.print(

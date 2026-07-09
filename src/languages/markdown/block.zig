@@ -482,6 +482,22 @@ const Leaf = struct {
     }
 };
 
+/// A leaf text block (paragraph/heading) whose inline content parsing has
+/// been deferred until the whole document's block structure -- and
+/// therefore every link reference definition -- is known. See
+/// `emitTextBlock`/`resolvePendingInline`: link reference definitions can
+/// appear AFTER their first use (`[foo][bar]` followed, later in the
+/// document, by `[bar]: /url`), so `parseInline` can't safely run until
+/// `self.link_references` is complete, which isn't true until `parse`'s
+/// line-by-line scan has finished entirely.
+const PendingInline = struct {
+    id: Node.Id,
+    /// Owned copy of the block's assembled text: the source this was sliced
+    /// from (typically a `Leaf.text` buffer) is freed as soon as its block
+    /// closes, long before `resolvePendingInline` runs.
+    text: []u8,
+};
+
 pub const Parser = struct {
     allocator: Allocator,
     source: []const u8,
@@ -491,6 +507,7 @@ pub const Parser = struct {
     stack: std.ArrayList(Container),
     leaf: ?Leaf = null,
     link_references: std.StringHashMapUnmanaged(Node.Id) = .empty,
+    pending_inline: std.ArrayList(PendingInline) = .empty,
     options: Options,
 
     pub fn init(allocator: Allocator, source: []const u8, options: Options) Allocator.Error!Parser {
@@ -539,6 +556,12 @@ pub const Parser = struct {
         for (self.stack.items) |*c| c.deinit(self.allocator);
         self.stack.deinit(self.allocator);
         if (self.leaf) |*lf| lf.deinit(self.allocator);
+        // Normally empty by the time `deinit` runs -- `parse` drains this
+        // via `resolvePendingInline` before returning -- but freed
+        // defensively here too in case `deinit` is ever reached without a
+        // completed `parse` (e.g. a future early-return error path).
+        for (self.pending_inline.items) |p| self.allocator.free(p.text);
+        self.pending_inline.deinit(self.allocator);
         self.builder.deinit();
         // Keys are slices into the builder's `owned_strings` (see
         // `tryParseLinkRefDef`), not separately allocated, so — mirroring
@@ -553,8 +576,14 @@ pub const Parser = struct {
         for (self.lines, 0..) |line, idx| {
             try self.processLine(line, idx);
         }
+        // Every link reference definition has now been seen and registered
+        // in `self.link_references` (they're only ever stripped off the
+        // front of a closing paragraph, which the loop above and this
+        // final `closeLeaf` cover) -- safe to resolve every deferred leaf
+        // text block's inline content now, forward references included.
         try self.closeLeaf(if (self.lines.len == 0) 0 else self.lines.len - 1);
         while (self.stack.items.len > 1) try self.popContainer(if (self.lines.len == 0) 0 else self.lines.len - 1);
+        try self.resolvePendingInline();
 
         var root = self.stack.pop().?;
         defer root.deinit(self.allocator);
@@ -566,6 +595,23 @@ pub const Parser = struct {
         const refs = self.link_references;
         self.link_references = .empty;
         return .{ .ast = ast, .link_references = refs };
+    }
+
+    /// Parse every deferred leaf text block's inline content (see
+    /// `PendingInline`'s doc comment) now that `self.link_references` is
+    /// complete, attaching the result as that node's children.
+    fn resolvePendingInline(self: *Parser) Allocator.Error!void {
+        defer {
+            self.pending_inline.deinit(self.allocator);
+            self.pending_inline = .empty;
+        }
+        for (self.pending_inline.items) |p| {
+            defer self.allocator.free(p.text);
+            const kids = try inline_mod.parseInline(&self.builder, p.text, &self.link_references);
+            defer self.allocator.free(kids);
+            self.builder.setChildren(p.id, kids);
+            setContentSpanFromChildren(&self.builder, p.id);
+        }
     }
 
     // ── span helpers ─────────────────────────────────────────────────────
@@ -667,12 +713,18 @@ pub const Parser = struct {
         try self.emitTextBlock(.para, trimmed, lf.start_line, lf.end_line);
     }
 
+    /// Adds a leaf text block (paragraph/heading) node with `text` as its
+    /// eventual inline content -- eventual, because parsing that content is
+    /// deferred (see `PendingInline`) until the whole document's link
+    /// reference definitions are known. `text` is duped here since its
+    /// backing storage (typically a soon-to-be-`deinit`'d `Leaf.text`
+    /// buffer) will not outlive this call.
     fn emitTextBlock(self: *Parser, kind: Node.Kind, text: []const u8, start_line: usize, end_line: usize) Allocator.Error!void {
-        const children = try inline_mod.parseInline(&self.builder, text);
-        defer self.allocator.free(children);
-        const id = try self.builder.addContainer(kind, children);
+        const id = try self.builder.addNode(kind);
         self.builder.setSpan(id, Span.init(self.lineStart(start_line), self.lineEnd(end_line)));
-        setContentSpanFromChildren(&self.builder, id);
+        const owned_text = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned_text);
+        try self.pending_inline.append(self.allocator, .{ .id = id, .text = owned_text });
         try self.appendToTop(id);
     }
 
