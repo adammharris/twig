@@ -227,7 +227,13 @@ pub const InlineParser = struct {
     /// lifetime simple: this `InlineParser` is typically `deinit`ed right
     /// after its container closes, before the caller is done with the
     /// events.
-    pub fn getMatches(self: *InlineParser, allocator: Allocator) Allocator.Error![]Event {
+    /// Finalize the parser's events and return them as a BORROWED slice of
+    /// the parser's own storage (valid until the parser is next mutated or
+    /// deinited). The end-of-input fixups mutate `self.matches` in place: drop
+    /// a trailing soft break (and any space it left on the preceding `str`),
+    /// and close a still-open verbatim run. The block parser drains these
+    /// immediately into its own event list, so it borrows rather than copies.
+    pub fn finishMatches(self: *InlineParser, allocator: Allocator) Allocator.Error![]const Event {
         if (self.attribute_parser != null) try self.reparseAttributes(allocator);
 
         if (self.matches.items.len > 0 and self.matches.items[self.matches.items.len - 1].annot == .soft_break) {
@@ -247,7 +253,13 @@ pub const InlineParser = struct {
             const last = self.matches.items[self.matches.items.len - 1];
             try self.addMatch(allocator, last.end, last.end, self.verbatim_type.closeAnnot());
         }
-        return allocator.dupe(Event, self.matches.items);
+        return self.matches.items;
+    }
+
+    /// Owned copy of `finishMatches`, for callers (e.g. tests) that keep the
+    /// events past the parser's lifetime.
+    pub fn getMatches(self: *InlineParser, allocator: Allocator) Allocator.Error![]Event {
+        return allocator.dupe(Event, try self.finishMatches(allocator));
     }
 
     // ── character classes / small matchers ─────────────────────────────

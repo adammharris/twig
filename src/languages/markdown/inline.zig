@@ -112,10 +112,35 @@ pub const Segment = struct {
 /// the mapping is available, left unset (`(0,0)`) otherwise. Returns the
 /// ordered list of child ids (caller's to free; typically immediately
 /// handed to `b.setChildren`).
+/// One-shot inline parse: constructs a throwaway `Scanner`. External callers
+/// and tests use this; a document that resolves many inline blocks should
+/// instead pool one scanner via `initScanner` + `scanReuse` (see
+/// `block.zig`'s `resolvePendingInline`) to avoid re-allocating the scanner's
+/// working buffers per block.
 pub fn parseInline(b: *Builder, text: []const u8, segments: []const Segment, link_refs: *const std.StringHashMapUnmanaged(Node.Id), options: Options) Allocator.Error![]Node.Id {
     var sc: Scanner = .{ .b = b, .link_refs = link_refs, .options = options, .segments = segments };
     defer sc.deinit();
+    return runScan(&sc, text);
+}
 
+/// Construct a reusable inline `Scanner`. `b`/`link_refs`/`options` are fixed
+/// for a whole document; only `segments` (and the working buffers) change per
+/// block, so one scanner can be reset and reused across every inline block.
+/// The caller owns it and must `deinit` it.
+pub fn initScanner(b: *Builder, link_refs: *const std.StringHashMapUnmanaged(Node.Id), options: Options) Scanner {
+    return .{ .b = b, .link_refs = link_refs, .options = options };
+}
+
+/// Parse one inline block reusing `sc`'s already-allocated buffers (their
+/// capacity is retained across blocks). Result is caller-owned, exactly like
+/// `parseInline`.
+pub fn scanReuse(sc: *Scanner, text: []const u8, segments: []const Segment) Allocator.Error![]Node.Id {
+    sc.reset(segments);
+    return runScan(sc, text);
+}
+
+fn runScan(sc: *Scanner, text: []const u8) Allocator.Error![]Node.Id {
+    const b = sc.b;
     var i: usize = 0;
     while (i < text.len) {
         if (sc.buf.items.len == 0) {
@@ -299,7 +324,7 @@ pub fn parseInline(b: *Builder, text: []const u8, segments: []const Segment, lin
             },
             ']' => {
                 try sc.flushBuf(i);
-                i = try handleCloseBracket(&sc, text, i);
+                i = try handleCloseBracket(sc, text, i);
             },
             '~' => {
                 // GFM strikethrough (`self.options.strikethrough`): a `~`/`~~`
@@ -374,7 +399,7 @@ pub fn parseInline(b: *Builder, text: []const u8, segments: []const Segment, lin
                 // `tryExtWwwAutolink` for the word-boundary and trailing-
                 // punctuation-trimming rules approximated here.
                 const auto_end: ?usize = if (sc.options.autolinks)
-                    (if (c == 'h') try tryExtHttpAutolink(&sc, text, i) else try tryExtWwwAutolink(&sc, text, i))
+                    (if (c == 'h') try tryExtHttpAutolink(sc, text, i) else try tryExtWwwAutolink(sc, text, i))
                 else
                     null;
                 if (auto_end) |end| {
@@ -390,7 +415,7 @@ pub fn parseInline(b: *Builder, text: []const u8, segments: []const Segment, lin
                 // (ordinary preceding text) by the time `@` is seen, so
                 // `tryExtEmailAutolink` reaches backward into `buf` to claim
                 // it -- see that function's doc comment.
-                const auto_end: ?usize = if (sc.options.autolinks) try tryExtEmailAutolink(&sc, text, i) else null;
+                const auto_end: ?usize = if (sc.options.autolinks) try tryExtEmailAutolink(sc, text, i) else null;
                 if (auto_end) |end| {
                     i = end;
                 } else {
@@ -549,7 +574,7 @@ const StrikeDelim = struct {
     range_end: usize,
 };
 
-const Scanner = struct {
+pub const Scanner = struct {
     b: *Builder,
     link_refs: *const std.StringHashMapUnmanaged(Node.Id),
     options: Options = .{},
@@ -586,12 +611,29 @@ const Scanner = struct {
     tilde_delims: std.ArrayList(StrikeDelim) = .empty,
     brackets: std.ArrayList(Bracket) = .empty,
 
-    fn deinit(self: *Scanner) void {
+    pub fn deinit(self: *Scanner) void {
         self.buf.deinit(self.b.allocator);
         self.items.deinit(self.b.allocator);
         self.delims.deinit(self.b.allocator);
         self.tilde_delims.deinit(self.b.allocator);
         self.brackets.deinit(self.b.allocator);
+    }
+
+    /// Clear all per-block working state (retaining the buffers' capacity) and
+    /// point at the next block's `segments`, so this scanner can parse another
+    /// inline block without reallocating. Must reset EVERY mutable field --
+    /// `b`/`link_refs`/`options` are the only document-constant ones.
+    fn reset(self: *Scanner, segments: []const Segment) void {
+        self.buf.clearRetainingCapacity();
+        self.items.clearRetainingCapacity();
+        self.delims.clearRetainingCapacity();
+        self.tilde_delims.clearRetainingCapacity();
+        self.brackets.clearRetainingCapacity();
+        self.buf_start = 0;
+        self.buf_pure = true;
+        self.head = null;
+        self.tail = null;
+        self.segments = segments;
     }
 
     /// `text[local_start..local_end)`'s absolute source span, or `null` if

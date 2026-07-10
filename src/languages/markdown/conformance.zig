@@ -5,20 +5,15 @@
 //! for the exact vendoring commit if the upstream URL ever moves) and
 //! reports a pass/total tally, broken down by spec section.
 //!
-//! Unlike `languages/djot/conformance.zig` (which asserts zero failures —
-//! djot is fully implemented), this is Phase 2 of 3: GFM/extras are still
-//! scoped out (Phase 3), and a handful of Phase 1 block-parsing corners
-//! (documented in `block.zig`'s module doc comment, e.g. tab handling,
-//! list tight/loose edge cases) remain unclosed, so a chunk of the ~650
-//! examples are still EXPECTED to fail today. Asserting zero failures would
-//! be nonsensical; asserting nothing would let this silently regress. The
-//! middle ground used here (matching a comment convention worth calling out
-//! for future phases to keep): a RATCHET — `BASELINE` is pinned to the
-//! actual pass count observed when a phase lands, and the test asserts
-//! `passed >= BASELINE`. Phase 3 work should bump `BASELINE` upward as it
-//! lands (never let it silently drift down); a regression in already-working
-//! parsing fails the build immediately instead of being masked by "well,
-//! that extension isn't done yet anyway".
+//! This suite now passes in FULL — all 652 examples of CommonMark 0.31.2 —
+//! so, like `languages/djot/conformance.zig`, it asserts zero failures. It
+//! reached here through a RATCHET: `BASELINE` was pinned to the pass count
+//! observed when each phase landed and the test asserted `passed >= BASELINE`,
+//! so a regression in already-working parsing failed the build immediately
+//! rather than being masked by "that extension isn't done yet anyway". With
+//! `BASELINE` now at the full total, `passed >= BASELINE` is equivalent to
+//! zero failures; the categorization below is retained as living diagnostics
+//! (and to catch any future regression by section). Keep it at the total.
 //!
 //! Failures are cheaply bucketed into three categories, printed as counts
 //! (this categorization — not the raw pass/fail number — is the real
@@ -52,50 +47,32 @@ const options_mod = @import("options.zig");
 
 const spec_json = @embedFile("testdata/commonmark-spec-0.31.2.json");
 
-/// Ratchet floor (see this file's module doc comment): the observed pass
-/// count against the vendored 0.31.2 suite (652 examples total). Progress from
-/// the Phase 2 baseline of 496:
-///   - `Html.commonmark_render_options` (XHTML void self-close +
-///     `src`-before-`alt` image attributes) closed the two biggest
-///     shared-printer divergence buckets (~53 cases: nearly all of Images,
-///     plus Thematic breaks / Hard line breaks / Setext).
-///   - CommonMark tight/loose list-item rendering (`commonmark_lists`) +
-///     stopping `self.tight` from leaking into a list item's nested
-///     blockquotes closed ~46 more (List items, Lists).
-///   - Not arming a list's blank_pending from blank lines *interior* to a
-///     fenced/HTML leaf block (`block.zig`'s `handleBlankLine`) closed 1 more.
-///   - Correct CommonMark tight/loose determination: a blank line makes only
-///     the *deepest* still-open list loose (not every ancestor), and a blank
-///     scoped inside a nested block quote arms nothing; plus the "a list item
-///     may begin with at most one blank line" empty-item rule. Closed the
-///     whole Lists section (26/26) and all but two List-items cases.
-///   - Text-content `"`→`&quot;` escaping (`escape_text_quotes`) and URL
-///     percent-encoding of link/image/autolink destinations
-///     (`percent_encode_urls`) — both CommonMark render conventions djot lacks
-///     — closed ~34 across Links, Link-ref-defs, and inline text.
-///   - Emphasis delimiter-stack fix (a partially-consumed closer now
-///     re-matches an earlier opener) closed the nested `*foo *bar**` family,
-///     and adding Unicode Symbol categories to the flanking punctuation table
-///     closed the currency-symbol case — Emphasis is now 132/132.
-/// Two List-items cases remain (spec ex259/260): list-item continuation is
-/// matched by ABSOLUTE column, but a nested block quote's prefix width can
-/// differ line-to-line, so a lazily-aligned continuation is measured against
-/// the wrong origin. Fixing them needs block-quote-*relative* column tracking
-/// (cmark's per-container offset model) — deferred as its own change. The rest
-///   - HTML5-aligned inline comment grammar (`<!-->`/`<!--->`/`--` allowed),
-///     stripping leading ref definitions before a setext underline is applied,
-///     and Unicode simple case-folding of reference labels (Greek/Cyrillic/
-///     Latin-1/sharp-s) closed 6 more (Raw HTML, Link-ref-defs, Links).
-/// The final 5 failures are two column-model gaps, each needing dedicated
-/// infrastructure: (1) partial-tab expansion — a tab straddling a container
-/// prefix must materialize its leftover columns as content spaces (spec
-/// ex5/6/7, a documented simplification in this file's block parser); (2)
-/// block-quote-*relative* column tracking for list-item continuation, since a
-/// nested quote's prefix width can vary line-to-line (ex259/260). Both are
-/// column-arithmetic reworks of the block parser with real regression surface,
-/// deferred as focused changes. `other` remains 0 (no structural parse bugs).
-/// Bump this as further work lands; never let it drift down.
-pub const BASELINE: usize = 647;
+/// Ratchet floor (see this file's module doc comment): now the FULL suite,
+/// 652/652 of CommonMark 0.31.2. The climb from the Phase 2 baseline of 496:
+///   - `Html.commonmark_render_options`: XHTML void self-close +
+///     `src`-before-`alt` image attributes, text `"`→`&quot;` escaping, and
+///     URL percent-encoding of link/image/autolink destinations — CommonMark
+///     render conventions the shared printer applies for markdown but not djot
+///     (Images, Thematic/Hard/Setext breaks, Links, Link-ref-defs, inline text).
+///   - CommonMark tight/loose lists: `commonmark_lists` `<li>` rendering,
+///     `self.tight` no longer leaking into a nested blockquote, blank lines
+///     interior to a fenced/HTML leaf not arming looseness, a blank marking
+///     only the *deepest* open list loose, blanks scoped inside a nested
+///     blockquote arming nothing, and the "at most one leading blank" empty-item
+///     rule (whole Lists + List-items sections).
+///   - Emphasis: delimiter-stack leftover re-matches an earlier opener
+///     (`*foo *bar**`), and Unicode Symbol categories in the flanking table.
+///   - HTML5-aligned inline comment grammar, stripping leading ref definitions
+///     before a setext underline, and Unicode simple case-folding of reference
+///     labels (Greek/Cyrillic/Latin-1/sharp-s).
+///   - The column model: a partial-tab `Cursor` (`spent`) so a tab straddling
+///     a container prefix materializes its leftover columns as content spaces
+///     (ex5/6/7), and list-item continuation indent stored RELATIVE to the
+///     parent's content start rather than as an absolute column, so a nested
+///     blockquote's varying prefix width resolves correctly (ex259/260).
+/// `other` is 0 and every section is complete. Keep this at 652 — a drop means
+/// a real regression in a construct that used to parse.
+pub const BASELINE: usize = 652;
 
 const SpecExample = struct {
     markdown: []const u8,
@@ -311,7 +288,7 @@ pub fn run(allocator: Allocator, max_failures: usize, failures: *std.ArrayList(F
     return .{ .summary = summary, .categories = categories, .sections = sections };
 }
 
-test "CommonMark 0.31.2 spec conformance (Phase 1 ratchet)" {
+test "CommonMark 0.31.2 spec conformance (full)" {
     const allocator = std.testing.allocator;
     var failures = std.ArrayList(Failure).empty;
     defer failures.deinit(allocator);
@@ -319,7 +296,7 @@ test "CommonMark 0.31.2 spec conformance (Phase 1 ratchet)" {
     defer result.deinit(allocator);
 
     std.debug.print(
-        "\nmarkdown (Phase 2) conformance: {d}/{d} passed ({d} failed)\n",
+        "\nmarkdown conformance: {d}/{d} passed ({d} failed)\n",
         .{ result.summary.passed, result.summary.total, result.summary.failed },
     );
     std.debug.print(
@@ -331,5 +308,8 @@ test "CommonMark 0.31.2 spec conformance (Phase 1 ratchet)" {
         std.debug.print("    {s:<40} {d}/{d}\n", .{ s.name, s.passed, s.total });
     }
 
+    // Full conformance: the ratchet floor is the whole suite, so this is
+    // equivalent to zero failures -- asserted explicitly for a clearer message.
     try std.testing.expect(result.summary.passed >= BASELINE);
+    try std.testing.expectEqual(@as(usize, 0), result.summary.failed);
 }

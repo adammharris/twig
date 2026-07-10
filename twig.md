@@ -30,5 +30,5 @@ but Twig has different design goals:
 The following languages are implemented:
 
 - Djot (265/271 cases passing; the remaining 6 rely on an AST pretty-printer this project doesn't implement yet)
-- Markdown (647/652 CommonMark tests passing; the remaining 5 are two column-model gaps — partial-tab expansion in code blocks, and block-quote-relative column tracking for nested list continuation)
+- Markdown (fully CommonMark 0.31.2 conformant — 652/652 spec examples passing)
 - HTML (generic-markup parser + serializer; forgiving document-oriented tree construction)

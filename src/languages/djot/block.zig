@@ -469,8 +469,10 @@ pub const Parser = struct {
     /// directly, rather than through `self.tip()`.
     fn getInlineMatchesFor(self: *Parser, c: *Container) Allocator.Error!void {
         if (c.inline_parser) |*ip| {
-            const evs = try ip.getMatches(self.allocator);
-            defer self.allocator.free(evs);
+            // Borrowed from `ip` (the just-popped container's still-alive
+            // inline parser); drained straight into `self.matches`, so no copy
+            // and no free -- `ip` outlives this loop.
+            const evs = try ip.finishMatches(self.allocator);
             for (evs) |m| {
                 if (self.matches.items.len > 0) {
                     const last = &self.matches.items[self.matches.items.len - 1];

@@ -108,7 +108,16 @@ pub const BlockResult = struct {
 
 // ── low-level line/column helpers ───────────────────────────────────────
 
-const Cursor = struct { pos: usize = 0, col: usize = 0 };
+/// A position on the current line. `col` is the visual column of the byte at
+/// `pos` (its *start*, a byte boundary). `spent` handles the CommonMark rule
+/// that a tab advances to the next 4-column stop but can be consumed a column
+/// at a time: when `spent > 0`, `line[pos]` is a `\t` whose first `spent`
+/// columns have already been consumed, so the *logical* column here is
+/// `col + spent` and the tab still contributes `(4 - col%4) - spent` columns
+/// of content whitespace. Almost all cursors have `spent == 0`; it only
+/// becomes nonzero when a container prefix (a block-quote marker's optional
+/// space, or a list item's required indent) lands in the middle of a tab.
+const Cursor = struct { pos: usize = 0, col: usize = 0, spent: usize = 0 };
 
 /// The degenerate `(0,0)` span `AST.Builder.addNode`/`addLeaf`/`addContainer`
 /// default every node to, meaning "never explicitly set" -- mirrors
@@ -125,8 +134,9 @@ fn isBlankLine(s: []const u8) bool {
     return true;
 }
 
-/// Columns of leading whitespace from `cur`, tabs advancing to the next
-/// multiple-of-4 column (per CommonMark's tab-handling rule).
+/// Columns of leading whitespace from `cur`'s logical position (`col+spent`)
+/// to the first non-whitespace byte, tabs advancing to the next multiple-of-4
+/// column (per CommonMark's tab-handling rule).
 fn indentCols(line: []const u8, cur: Cursor) usize {
     var col = cur.col;
     var i = cur.pos;
@@ -139,15 +149,19 @@ fn indentCols(line: []const u8, cur: Cursor) usize {
             i += 1;
         } else break;
     }
-    return col - cur.col;
+    // `col` is now the logical column at the first non-ws byte (each tab was
+    // advanced to its stop); subtract the logical start (`cur.col + cur.spent`,
+    // accounting for any already-consumed columns of a straddled leading tab).
+    return col - (cur.col + cur.spent);
 }
 
-/// Consume up to `max_cols` columns of leading whitespace. A tab that would
-/// overshoot `max_cols` is left unconsumed (see this file's module doc
-/// comment's "Tabs" simplification).
+/// Consume up to `max_cols` columns of leading whitespace, splitting a tab
+/// that straddles the limit: the tab byte stays at `pos` with `spent` marking
+/// how many of its columns were taken (CommonMark's partial-tab rule).
 fn skipWsUpToCols(line: []const u8, cur: Cursor, max_cols: usize) Cursor {
     var col = cur.col;
     var i = cur.pos;
+    var spent = cur.spent;
     var consumed: usize = 0;
     while (i < line.len and consumed < max_cols) {
         const c = line[i];
@@ -155,33 +169,50 @@ fn skipWsUpToCols(line: []const u8, cur: Cursor, max_cols: usize) Cursor {
             col += 1;
             i += 1;
             consumed += 1;
+            spent = 0;
         } else if (c == '\t') {
-            const step = 4 - (col % 4);
-            if (consumed + step > max_cols) break;
-            col += step;
-            i += 1;
-            consumed += step;
+            const avail = (4 - (col % 4)) - spent; // remaining columns of this tab
+            if (consumed + avail <= max_cols) {
+                consumed += avail;
+                col += 4 - (col % 4);
+                i += 1;
+                spent = 0;
+            } else {
+                spent += max_cols - consumed;
+                consumed = max_cols;
+                break;
+            }
         } else break;
     }
-    return .{ .pos = i, .col = col };
+    return .{ .pos = i, .col = col, .spent = spent };
 }
 
-/// Consume leading whitespace until reaching (at least) `target_col`
-/// columns, or until a non-whitespace byte is hit.
+/// Consume leading whitespace until the logical column reaches (at least)
+/// `target_col`, or a non-whitespace byte is hit. A tab straddling the target
+/// is split via `spent` (see `Cursor`).
 fn skipWsToTarget(line: []const u8, cur: Cursor, target_col: usize) Cursor {
     var col = cur.col;
     var i = cur.pos;
-    while (i < line.len and col < target_col) {
+    var spent = cur.spent;
+    while (i < line.len and (col + spent) < target_col) {
         const c = line[i];
         if (c == ' ') {
             col += 1;
             i += 1;
+            spent = 0;
         } else if (c == '\t') {
-            col += 4 - (col % 4);
-            i += 1;
+            const tab_end = col + (4 - (col % 4));
+            if (tab_end <= target_col) {
+                col = tab_end;
+                i += 1;
+                spent = 0;
+            } else {
+                spent = target_col - col;
+                break;
+            }
         } else break;
     }
-    return .{ .pos = i, .col = col };
+    return .{ .pos = i, .col = col, .spent = spent };
 }
 
 fn stripUpTo3Indent(s: []const u8) []const u8 {
@@ -886,10 +917,16 @@ pub const Parser = struct {
             self.pending_inline.deinit(self.allocator);
             self.pending_inline = .empty;
         }
+        // One inline scanner, reused across every pending block: `b`,
+        // `link_refs` and `options` are document-constant, so only the working
+        // buffers (retained) and per-block `segments` change -- avoids
+        // re-allocating the scanner's five ArrayLists per block.
+        var sc = inline_mod.initScanner(&self.builder, &self.link_references, self.options);
+        defer sc.deinit();
         for (self.pending_inline.items) |p| {
             defer self.allocator.free(p.text);
             defer self.allocator.free(p.segments);
-            const kids = try inline_mod.parseInline(&self.builder, p.text, p.segments, &self.link_references, self.options);
+            const kids = try inline_mod.scanReuse(&sc, p.text, p.segments);
             defer self.allocator.free(kids);
             self.builder.setChildren(p.id, kids);
             setContentSpanFromChildren(&self.builder, p.id);
@@ -1137,7 +1174,10 @@ pub const Parser = struct {
     fn finishIndentedCode(self: *Parser, lf: *Leaf) Allocator.Error!void {
         // Trim the tentatively-buffered trailing blank lines: an indented
         // code block's content never includes blank lines that turned out
-        // to be trailing (see `continueIndentedCode`).
+        // to be trailing (see `continueIndentedCode`). The trimmed text is
+        // always a prefix of `lf.text`, so shorten it in place rather than
+        // copying to a scratch buffer -- `addLeaf` makes the one owning copy,
+        // and `lf` is deinited right after this returns.
         var text = lf.text.items;
         var n = lf.trailing_blanks;
         while (n > 0) : (n -= 1) {
@@ -1147,33 +1187,25 @@ pub const Parser = struct {
                 text = "";
             }
         }
-        const owned = try self.allocator.dupe(u8, text);
-        defer self.allocator.free(owned);
-        var full = std.ArrayList(u8).empty;
-        defer full.deinit(self.allocator);
-        try full.appendSlice(self.allocator, owned);
-        if (full.items.len > 0 and full.items[full.items.len - 1] != '\n') try full.append(self.allocator, '\n');
-        const id = try self.builder.addLeaf(.{ .code_block = .{ .lang = null, .text = full.items } });
+        lf.text.items.len = text.len;
+        if (lf.text.items.len > 0 and lf.text.items[lf.text.items.len - 1] != '\n') try lf.text.append(self.allocator, '\n');
+        const id = try self.builder.addLeaf(.{ .code_block = .{ .lang = null, .text = lf.text.items } });
         self.builder.setSpan(id, Span.init(self.lineStart(lf.start_line), self.lineEnd(lf.end_line)));
         try self.appendToTop(id);
     }
 
     fn finishFencedCode(self: *Parser, lf: *Leaf) Allocator.Error!void {
-        var full = std.ArrayList(u8).empty;
-        defer full.deinit(self.allocator);
-        try full.appendSlice(self.allocator, lf.text.items);
-        if (full.items.len > 0) try full.append(self.allocator, '\n');
-        const id = try self.builder.addLeaf(.{ .code_block = .{ .lang = lf.lang, .text = full.items } });
+        // Append the terminating newline straight onto `lf.text` (owned by the
+        // soon-to-be-deinited `Leaf`); `addLeaf` copies it. No scratch buffer.
+        if (lf.text.items.len > 0) try lf.text.append(self.allocator, '\n');
+        const id = try self.builder.addLeaf(.{ .code_block = .{ .lang = lf.lang, .text = lf.text.items } });
         self.builder.setSpan(id, Span.init(self.lineStart(lf.start_line), self.lineEnd(lf.end_line)));
         try self.appendToTop(id);
     }
 
     fn finishHtmlBlock(self: *Parser, lf: *Leaf) Allocator.Error!void {
-        var full = std.ArrayList(u8).empty;
-        defer full.deinit(self.allocator);
-        try full.appendSlice(self.allocator, lf.text.items);
-        if (full.items.len > 0) try full.append(self.allocator, '\n');
-        const id = try self.builder.addLeaf(.{ .raw_block = .{ .format = "html", .text = full.items } });
+        if (lf.text.items.len > 0) try lf.text.append(self.allocator, '\n');
+        const id = try self.builder.addLeaf(.{ .raw_block = .{ .format = "html", .text = lf.text.items } });
         self.builder.setSpan(id, Span.init(self.lineStart(lf.start_line), self.lineEnd(lf.end_line)));
         try self.appendToTop(id);
     }
@@ -1209,17 +1241,37 @@ pub const Parser = struct {
         const after_indent = skipWsUpToCols(line, cur, 3);
         if (after_indent.pos >= line.len or line[after_indent.pos] != '>') return null;
         var c2: Cursor = .{ .pos = after_indent.pos + 1, .col = after_indent.col + 1 };
-        if (c2.pos < line.len and (line[c2.pos] == ' ' or line[c2.pos] == '\t')) {
-            c2 = .{ .pos = c2.pos + 1, .col = c2.col + 1 };
+        // One optional space/tab after `>`, consumed as a single COLUMN. A tab
+        // wider than one column is only partially consumed -- its remaining
+        // columns stay as the quote's content indentation (e.g. `>\t\tfoo`
+        // yields an indented code block `  foo`, spec ex6).
+        if (c2.pos < line.len) {
+            if (line[c2.pos] == ' ') {
+                c2 = .{ .pos = c2.pos + 1, .col = c2.col + 1 };
+            } else if (line[c2.pos] == '\t') {
+                if (4 - (c2.col % 4) == 1) {
+                    c2 = .{ .pos = c2.pos + 1, .col = c2.col + 1 };
+                } else {
+                    c2 = .{ .pos = c2.pos, .col = c2.col, .spent = 1 };
+                }
+            }
         }
         return c2;
     }
 
     fn matchListItem(line: []const u8, cur: Cursor, content_col: usize) ?Cursor {
         if (isBlankLine(line[cur.pos..])) return cur;
-        const target = skipWsToTarget(line, cur, content_col);
-        if (target.col < content_col) return null;
-        return target;
+        // `content_col` is the item's continuation indent RELATIVE to its
+        // parent container's content start, resolved here against THIS line's
+        // parent position (`cur`). A nested block quote's prefix width can
+        // differ line-to-line, so an ABSOLUTE column would match the wrong
+        // amount of indentation (spec ex259/260).
+        const target = cur.col + cur.spent + content_col;
+        const t = skipWsToTarget(line, cur, target);
+        // `col + spent` is the logical column reached (a straddled tab leaves
+        // `spent` nonzero); the item continues only if it reaches `target`.
+        if (t.col + t.spent < target) return null;
+        return t;
     }
 
     fn processLine(self: *Parser, line: []const u8, idx: usize) Allocator.Error!void {
@@ -1258,9 +1310,9 @@ pub const Parser = struct {
                     return;
                 },
                 .indented_code => {
-                    const indent = indentCols(remainder, .{});
+                    const indent = indentCols(line, cur);
                     if (indent >= 4) {
-                        try self.continueIndentedCode(lf, remainder, idx);
+                        try self.continueIndentedCode(lf, line, cur, idx);
                         return;
                     }
                     try self.closeLeaf(idx);
@@ -1416,10 +1468,47 @@ pub const Parser = struct {
 
     // ── indented code ────────────────────────────────────────────────────
 
-    fn continueIndentedCode(self: *Parser, lf: *Leaf, remainder: []const u8, idx: usize) Allocator.Error!void {
+    /// Append one indented-code content line. Starting from `cur` (which may
+    /// sit mid-tab after a container prefix consumed part of a tab), strip up
+    /// to 4 columns of the code block's own indentation. A tab straddling that
+    /// 4-column boundary is split: its columns past the boundary survive as
+    /// leading spaces of the content, and the rest of the line is appended
+    /// verbatim (interior tabs are preserved, per CommonMark). Spec ex5/6/7.
+    fn appendIndentedContent(self: *Parser, buf: *std.ArrayList(u8), line: []const u8, cur: Cursor) Allocator.Error!void {
+        var col = cur.col;
+        var i = cur.pos;
+        var spent = cur.spent;
+        var consumed: usize = 0;
+        while (i < line.len and consumed < 4) {
+            const c = line[i];
+            if (c == ' ') {
+                col += 1;
+                i += 1;
+                consumed += 1;
+                spent = 0;
+            } else if (c == '\t') {
+                const avail = (4 - (col % 4)) - spent;
+                if (consumed + avail <= 4) {
+                    consumed += avail;
+                    col += 4 - (col % 4);
+                    i += 1;
+                    spent = 0;
+                } else {
+                    const leftover = avail - (4 - consumed);
+                    var k: usize = 0;
+                    while (k < leftover) : (k += 1) try buf.append(self.allocator, ' ');
+                    i += 1; // consume the straddled tab byte
+                    try buf.appendSlice(self.allocator, line[i..]);
+                    return;
+                }
+            } else break;
+        }
+        try buf.appendSlice(self.allocator, line[i..]);
+    }
+
+    fn continueIndentedCode(self: *Parser, lf: *Leaf, line: []const u8, cur: Cursor, idx: usize) Allocator.Error!void {
         if (lf.line_count > 0) try lf.text.append(self.allocator, '\n');
-        const stripped = skipWsUpToCols(remainder, .{}, 4);
-        try lf.text.appendSlice(self.allocator, remainder[stripped.pos..]);
+        try self.appendIndentedContent(&lf.text, line, cur);
         lf.line_count += 1;
         lf.trailing_blanks = 0;
         lf.end_line = idx;
@@ -1526,7 +1615,7 @@ pub const Parser = struct {
         var pushed_any = false;
         while (true) {
             const remainder = line[cur.pos..];
-            const indent = indentCols(remainder, .{});
+            const indent = indentCols(line, cur);
 
             if (indent < 4) {
                 const s = stripUpTo3Indent(remainder);
@@ -1621,7 +1710,10 @@ pub const Parser = struct {
                             content_col = if (spaces >= 1 and spaces <= 4) after_marker_col + spaces else after_marker_col + 1;
                         }
                         try self.pushContainer(.list_item, idx);
-                        self.top().content_col = content_col;
+                        // Store the continuation indent RELATIVE to the parent
+                        // content start (`cur.col + cur.spent` here), not the
+                        // absolute column -- see `matchListItem`.
+                        self.top().content_col = content_col -| (cur.col + cur.spent);
                         const after_marker_cursor: Cursor = .{ .pos = cur.pos + indent_bytes + mk.marker_len, .col = after_marker_col };
                         cur = skipWsToTarget(line, after_marker_cursor, content_col);
                         // GFM task list items (`self.options.task_lists`,
@@ -1686,8 +1778,7 @@ pub const Parser = struct {
                 // open one is handled before `tryStartBlocks` is called).
                 try self.maybeCloseTopList(idx, null);
                 var lf: Leaf = .{ .kind = .indented_code, .start_line = idx, .end_line = idx, .line_count = 1 };
-                const stripped = skipWsUpToCols(remainder, .{}, 4);
-                try lf.text.appendSlice(self.allocator, remainder[stripped.pos..]);
+                try self.appendIndentedContent(&lf.text, line, cur);
                 self.markListsLoose();
                 self.leaf = lf;
                 return true;
@@ -2168,7 +2259,8 @@ pub const Parser = struct {
         }
 
         try self.pushContainer(.footnote_def, idx);
-        self.top().content_col = content_col;
+        // Relative continuation indent, like a list item's -- see `matchListItem`.
+        self.top().content_col = content_col -| (cur.col + cur.spent);
         self.top().footnote_label = m.label;
 
         const after_marker_cursor: Cursor = .{ .pos = cur.pos + indent_bytes + m.marker_len, .col = after_marker_col };
