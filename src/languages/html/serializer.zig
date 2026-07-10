@@ -92,6 +92,15 @@ pub const RenderOptions = struct {
     /// nodes are identical, only the print order differs. Defaults to djot's
     /// order; the markdown path opts in.
     commonmark_image_attrs: bool = false,
+    /// Render list items the CommonMark way: a *tight* item hugs its content
+    /// (`<li>one</li>`, first paragraph inline with no wrapping `<p>` and no
+    /// surrounding newlines), a following block (a nested list) gets a single
+    /// separating newline only when the cursor isn't already at line start,
+    /// and a *loose* item is `<li>\n<p>…</p>\n…</li>`. djot instead always
+    /// frames items as `<li>\n…\n</li>` regardless of tightness, so this
+    /// defaults off and the markdown path opts in. (`<p>` suppression in
+    /// tight lists is independent of this flag — see the `para` branch.)
+    commonmark_lists: bool = false,
 };
 
 /// Djot-shaped render-time side tables, supplied by whatever language module
@@ -318,11 +327,46 @@ pub const Renderer = struct {
             .bullet_list => |v| self.tight = v.tight,
             .ordered_list => |v| self.tight = v.tight,
             .task_list => |v| self.tight = v.tight,
+            // Tightness is a property of a list item's *direct* paragraph
+            // children only; a paragraph nested inside another block container
+            // (a blockquote/div/section within the item) is never tight. Reset
+            // so `self.tight` doesn't leak past such a boundary — otherwise the
+            // container's paragraphs would lose their `<p>` wrapping. `list_item`
+            // is deliberately absent: it must preserve the enclosing list's
+            // tightness for its own paragraphs to consume.
+            .block_quote, .div, .section => self.tight = false,
             else => {},
         }
         var it = self.ast.children(id);
         while (it.next()) |child| try self.renderNode(child.id);
         self.tight = old_tight;
+    }
+
+    /// Render one `<li>` the CommonMark way (see `RenderOptions.commonmark_lists`).
+    /// `self.tight` is the enclosing list's tightness, set by the parent list's
+    /// `renderChildren` before this item is reached. A tight paragraph hugs the
+    /// content (rendered inline, no `<p>`, no surrounding newline); every other
+    /// child is a block that self-terminates with a newline, and is preceded by
+    /// a single separating newline only when the cursor isn't already at line
+    /// start — mirroring cmark's `cr()`. This tracks line-start structurally
+    /// (from child kinds) rather than by inspecting the output buffer.
+    fn renderCommonMarkListItem(self: *Renderer, id: Node.Id) RenderError!void {
+        try self.writer.writeAll("<li>");
+        var at_line_start = false;
+        var it = self.ast.children(id);
+        while (it.next()) |child| {
+            const kind = self.ast.nodes[child.id].kind;
+            if (self.tight and kind == .para) {
+                // Tight paragraph: just its inline content, no `<p>`, no newline.
+                try self.renderChildren(child.id);
+                at_line_start = false;
+            } else {
+                if (!at_line_start) try self.writer.writeByte('\n');
+                try self.renderNode(child.id);
+                at_line_start = true;
+            }
+        }
+        try self.writer.writeAll("</li>\n");
     }
 
     /// Write a raw-text element's children literally (no escaping). The parser
@@ -460,7 +504,10 @@ pub const Renderer = struct {
             .block_quote => try self.inTags("blockquote", id, 2, &.{}),
             .div => try self.inTags("div", id, 2, &.{}),
             .section => try self.inTags("section", id, 2, &.{}),
-            .list_item => try self.inTags("li", id, 2, &.{}),
+            .list_item => if (self.options.commonmark_lists)
+                try self.renderCommonMarkListItem(id)
+            else
+                try self.inTags("li", id, 2, &.{}),
             .task_list_item => |v| {
                 try self.writer.writeAll("<li>\n");
                 if (v.checked) {

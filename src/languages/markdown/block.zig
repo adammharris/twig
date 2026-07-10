@@ -1240,6 +1240,16 @@ pub const Parser = struct {
     /// contributes exactly one line to the joined text either way.
     fn handleBlankLine(self: *Parser, line: []const u8, cur: Cursor, idx: usize) Allocator.Error!void {
         const remainder = line[cur.pos..];
+        // A blank line absorbed as the *interior* of an open leaf block (a
+        // fenced code block, or an HTML block of type 1-5) is code/markup
+        // content, not a separator between an item's blocks -- so it must NOT
+        // arm `blank_pending`, or a fenced block containing blank lines would
+        // spuriously make its enclosing list loose (CommonMark's tight/loose
+        // rule counts only blanks *between* an item's block-level children).
+        // A paragraph is closed by the blank (a real separator) and an HTML
+        // 6/7 block ends on it; those, and a blank at pure container level,
+        // still arm it.
+        var interior_of_leaf = false;
         if (self.leaf) |*lf| {
             switch (lf.kind) {
                 .paragraph => try self.closeLeaf(idx),
@@ -1251,7 +1261,10 @@ pub const Parser = struct {
                     lf.trailing_blanks += 1;
                     lf.end_line = idx;
                 },
-                .fenced_code => try self.continueFencedCode(lf, line, cur, idx),
+                .fenced_code => {
+                    try self.continueFencedCode(lf, line, cur, idx);
+                    interior_of_leaf = true;
+                },
                 .html_block => {
                     if (lf.html_type == 6 or lf.html_type == 7) {
                         try self.closeLeaf(idx);
@@ -1259,12 +1272,15 @@ pub const Parser = struct {
                         if (lf.text.items.len > 0) try lf.text.append(self.allocator, '\n');
                         try lf.text.appendSlice(self.allocator, remainder);
                         lf.end_line = idx;
+                        interior_of_leaf = true;
                     }
                 },
             }
         }
-        for (self.stack.items) |*c| {
-            if (c.kind == .list) c.blank_pending = true;
+        if (!interior_of_leaf) {
+            for (self.stack.items) |*c| {
+                if (c.kind == .list) c.blank_pending = true;
+            }
         }
     }
 

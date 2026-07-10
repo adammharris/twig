@@ -53,18 +53,27 @@ const options_mod = @import("options.zig");
 const spec_json = @embedFile("testdata/commonmark-spec-0.31.2.json");
 
 /// Ratchet floor (see this file's module doc comment): the observed pass
-/// count against the vendored 0.31.2 suite (652 examples total). The markdown
-/// path now renders with `Html.commonmark_render_options` (XHTML void
-/// self-close + `src`-before-`alt` image attributes), which closed the two
-/// biggest shared-printer divergence buckets (~53 cases: nearly all of
-/// Images, plus Thematic breaks / Hard line breaks / Setext) and lifted this
-/// from 496. Of the ~103 remaining failures, the dominant bucket is list
-/// tight/loose block-parsing corners (List items + Lists, ~40 cases — a real
-/// parsing gap, already documented in `block.zig`); the rest are smaller
+/// count against the vendored 0.31.2 suite (652 examples total). Progress from
+/// the Phase 2 baseline of 496:
+///   - `Html.commonmark_render_options` (XHTML void self-close +
+///     `src`-before-`alt` image attributes) closed the two biggest
+///     shared-printer divergence buckets (~53 cases: nearly all of Images,
+///     plus Thematic breaks / Hard line breaks / Setext).
+///   - CommonMark tight/loose list-item rendering (`commonmark_lists`) +
+///     stopping `self.tight` from leaking into a list item's nested
+///     blockquotes closed ~46 more (List items, Lists).
+///   - Not arming a list's blank_pending from blank lines *interior* to a
+///     fenced/HTML leaf block (`block.zig`'s `handleBlankLine`) closed 1 more.
+/// Of the ~56 remaining failures, the notable list corner still open is the
+/// full CommonMark tight/loose determination for blanks nested inside deeper
+/// items/blockquotes (spec ex307/319/320/259/260/280) — needs cmark's
+/// `last_line_blank`/`ends_with_blank_line` finalize-time analysis, since the
+/// owning list can't be known at blank time (a deep blank may belong to an
+/// outer list once the next line pops back to it). The rest are smaller
 /// rendering-convention divergences (percent-encoding of link/image
-/// destinations, `"`-in-text escaping) — still not Phase 2 parsing bugs
-/// (`other` is 0). Bump this as further work lands; never let it drift down.
-pub const BASELINE: usize = 549;
+/// destinations, `"`-in-text escaping) — still not parsing bugs (`other` is 0).
+/// Bump this as further work lands; never let it drift down.
+pub const BASELINE: usize = 596;
 
 const SpecExample = struct {
     markdown: []const u8,

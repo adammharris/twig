@@ -37,6 +37,7 @@ pub const serializeAllocOpts = serializer_mod.serializeAllocOpts;
 pub const commonmark_render_options: RenderOptions = .{
     .xhtml_void = true,
     .commonmark_image_attrs = true,
+    .commonmark_lists = true,
 };
 
 /// Parse forgiving HTML into the shared generic-markup AST.  This is a
