@@ -36,6 +36,22 @@ pub const InputFormat = enum {
 /// module doc comment above and on `actions.zig`'s `runConvert`.
 pub const OutputMode = enum { html, ast, canonical };
 
+/// Per-invocation parse configuration, threaded from the CLI's feature flags
+/// (`args.zig`) into the `parse`/`parseToAst` adapters. Passed as an opaque
+/// `*const anyopaque` (so `editor.zig` can carry it across reparses without
+/// depending on this type — see `Editor.ParseFn`); every adapter that reads it
+/// `@ptrCast`s it back. Only Markdown consults it today; other formats'
+/// adapters ignore it.
+pub const ParseConfig = struct {
+    markdown: twig.Markdown.ParseOptions = .{},
+
+    /// Recover a `*const ParseConfig` from the opaque pointer the registry
+    /// adapters / the editor pass around.
+    fn from(ctx: *const anyopaque) *const ParseConfig {
+        return @ptrCast(@alignCast(ctx));
+    }
+};
+
 pub fn parseOutputMode(name: []const u8) ?OutputMode {
     return std.meta.stringToEnum(OutputMode, name);
 }
@@ -96,19 +112,22 @@ pub const ParsedDoc = union(InputFormat) {
     }
 };
 
-fn parseDjot(allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
+fn parseDjot(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
+    _ = ctx;
     return .{ .djot = try twig.Djot.parse(allocator, source) };
 }
 
-fn parseMarkdown(allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
-    return .{ .markdown = try twig.Markdown.parse(allocator, source, .{}) };
+fn parseMarkdown(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
+    return .{ .markdown = try twig.Markdown.parse(allocator, source, ParseConfig.from(ctx).markdown) };
 }
 
-fn parseXml(allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
+fn parseXml(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
+    _ = ctx;
     return .{ .xml = try twig.Xml.parse(allocator, source) };
 }
 
-fn parseHtml(allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
+fn parseHtml(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
+    _ = ctx;
     return .{ .html = try twig.Html.parse(allocator, source) };
 }
 
@@ -121,7 +140,8 @@ fn parseHtml(allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
 // back `.ast` is leak-free and leaves a fully valid tree. XML already returns a
 // bare `AST`.
 
-fn parseToAstDjot(allocator: Allocator, source: []const u8) anyerror!twig.AST {
+fn parseToAstDjot(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!twig.AST {
+    _ = ctx;
     var doc = try twig.Djot.parse(allocator, source);
     doc.references.deinit(allocator);
     doc.auto_references.deinit(allocator);
@@ -129,18 +149,20 @@ fn parseToAstDjot(allocator: Allocator, source: []const u8) anyerror!twig.AST {
     return doc.ast;
 }
 
-fn parseToAstMarkdown(allocator: Allocator, source: []const u8) anyerror!twig.AST {
-    var doc = try twig.Markdown.parse(allocator, source, .{});
+fn parseToAstMarkdown(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!twig.AST {
+    var doc = try twig.Markdown.parse(allocator, source, ParseConfig.from(ctx).markdown);
     doc.link_references.deinit(allocator);
     doc.footnotes.deinit(allocator);
     return doc.ast;
 }
 
-fn parseToAstXml(allocator: Allocator, source: []const u8) anyerror!twig.AST {
+fn parseToAstXml(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!twig.AST {
+    _ = ctx;
     return twig.Xml.parse(allocator, source);
 }
 
-fn parseToAstHtml(allocator: Allocator, source: []const u8) anyerror!twig.AST {
+fn parseToAstHtml(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!twig.AST {
+    _ = ctx;
     return twig.Html.parse(allocator, source);
 }
 
@@ -207,12 +229,14 @@ pub const FormatEntry = struct {
     /// Extra `-i`/`--input` names accepted besides `@tagName(id)` itself
     /// (which `parseFormatName` always accepts via `std.meta.stringToEnum`).
     aliases: []const []const u8 = &.{},
-    parse: *const fn (Allocator, []const u8) anyerror!ParsedDoc,
+    parse: *const fn (*const anyopaque, Allocator, []const u8) anyerror!ParsedDoc,
     /// Source -> the bare shared `AST`, the reparse callback the span-splice
     /// editor (`twig.Editor`, driving `twig edit`) needs. Discards any
     /// `Document` side tables (see the editor-adapter note above) — editing is
     /// language-neutral and only touches spans/structure. Every format has one.
-    parseToAst: *const fn (Allocator, []const u8) anyerror!twig.AST,
+    /// Its shape matches `twig.Editor.ParseFn` (leading opaque `ParseConfig`
+    /// context) so it can be handed straight to `Editor.init`.
+    parseToAst: twig.Editor.ParseFn,
     renderHtml: *const fn (Allocator, *const ParsedDoc, *Writer) anyerror!void,
     /// Round-trip serializer back to this format's own source syntax —
     /// `convert -o canonical`'s implementation. `null` means the language has

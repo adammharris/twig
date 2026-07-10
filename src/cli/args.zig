@@ -41,6 +41,9 @@ pub const ConvertOptions = struct {
     /// names — see `format.OutputTarget`'s doc comment. `null` for the
     /// ordinary `-o canonical` ("round-trip back to `input`") case.
     output_format: ?InputFormat = null,
+    /// Markdown extension flags (`--directives`, `--math`, `--commonmark`,
+    /// `--gfm`); ignored for non-Markdown inputs. See `applyExtFlag`.
+    parse_config: format.ParseConfig = .{},
 };
 
 pub const IdentifyOptions = struct {
@@ -53,6 +56,10 @@ pub const EditOptions = struct {
     /// it can't be written back in place).
     file: []const u8 = "",
     input: InputFormat = .djot,
+    /// Markdown extension flags — see `ConvertOptions.parse_config`. The editor
+    /// reparses with these on every edit, so a directive-bearing document stays
+    /// parseable across edits.
+    parse_config: format.ParseConfig = .{},
     op: EditOp = .replace,
     /// The target node's index path as written on the command line
     /// (dot-separated, e.g. `"0.3.1"`); parsed into `[]const usize` by
@@ -71,6 +78,9 @@ pub const QueryOptions = struct {
     input: InputFormat = .djot,
     /// The selector string (see `Select`), e.g. `heading[level=2]`.
     selector: []const u8 = "",
+    /// Markdown extension flags — see `ConvertOptions.parse_config`. Needed so
+    /// a selector like `directive[name=vis]` has directive nodes to match.
+    parse_config: format.ParseConfig = .{},
 };
 
 pub const CliActionOptions = union(Action) {
@@ -130,6 +140,34 @@ fn isAny(s: []const u8, options: []const []const u8) bool {
     return false;
 }
 
+/// Consume a Markdown extension flag, mutating `cfg`. Returns true if `arg`
+/// was one (so the caller's arg loop skips its own positional handling). These
+/// only affect a Markdown parse; for any other input format they're inert.
+///   --directives / --no-directives   the generic-directives extension
+///   --math / --no-math                `$…$`/`$$…$$` math
+///   --commonmark                      strict CommonMark (every extension off)
+///   --gfm                             the GFM extension set
+/// A preset (`--commonmark`/`--gfm`) followed by an individual flag composes
+/// left-to-right, so `--gfm --directives` is GFM plus directives.
+fn applyExtFlag(arg: []const u8, cfg: *format.ParseConfig) bool {
+    if (std.mem.eql(u8, arg, "--directives")) {
+        cfg.markdown.directives = true;
+    } else if (std.mem.eql(u8, arg, "--no-directives")) {
+        cfg.markdown.directives = false;
+    } else if (std.mem.eql(u8, arg, "--math")) {
+        cfg.markdown.math = true;
+    } else if (std.mem.eql(u8, arg, "--no-math")) {
+        cfg.markdown.math = false;
+    } else if (std.mem.eql(u8, arg, "--commonmark")) {
+        cfg.markdown = .commonmark;
+    } else if (std.mem.eql(u8, arg, "--gfm")) {
+        cfg.markdown = .gfm;
+    } else {
+        return false;
+    }
+    return true;
+}
+
 pub fn parseConfig(args: anytype, stderr: *Writer) ArgError!CliConfig {
     var config = CliConfig{};
     config.binary_name = args.next() orelse "twig";
@@ -173,9 +211,12 @@ fn parseConvert(args: anytype, stderr: *Writer, binary_name: []const u8) ArgErro
     var output: OutputMode = .html;
     var output_format: ?InputFormat = null;
     var file: ?[]const u8 = null;
+    var parse_config = format.ParseConfig{};
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
+        if (applyExtFlag(arg, &parse_config)) {
+            // handled
+        } else if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
             const name = args.next() orelse return ArgError.MissingFormatValue;
             input_override = format.parseFormatName(name) orelse {
                 try stderr.print("error: unsupported input format '{s}'\n", .{name});
@@ -205,7 +246,7 @@ fn parseConvert(args: anytype, stderr: *Writer, binary_name: []const u8) ArgErro
     return .{
         .action = .convert,
         .binary_name = binary_name,
-        .options = .{ .convert = .{ .file = path, .input = resolved, .output = output, .output_format = output_format } },
+        .options = .{ .convert = .{ .file = path, .input = resolved, .output = output, .output_format = output_format, .parse_config = parse_config } },
     };
 }
 
@@ -243,9 +284,12 @@ fn parseQuery(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError!
     var input_override: ?InputFormat = null;
     var file: ?[]const u8 = null;
     var selector: ?[]const u8 = null;
+    var parse_config = format.ParseConfig{};
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
+        if (applyExtFlag(arg, &parse_config)) {
+            // handled
+        } else if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
             const name = args.next() orelse return ArgError.MissingFormatValue;
             input_override = format.parseFormatName(name) orelse {
                 try stderr.print("error: unsupported input format '{s}'\n", .{name});
@@ -269,7 +313,7 @@ fn parseQuery(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError!
     return .{
         .action = .query,
         .binary_name = binary_name,
-        .options = .{ .query = .{ .file = path, .input = resolved, .selector = sel } },
+        .options = .{ .query = .{ .file = path, .input = resolved, .selector = sel, .parse_config = parse_config } },
     };
 }
 
@@ -281,9 +325,12 @@ fn parseEdit(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError!C
     var child_index: usize = 0;
     var text: []const u8 = "";
     var dry_run = false;
+    var parse_config = format.ParseConfig{};
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
+        if (applyExtFlag(arg, &parse_config)) {
+            // handled
+        } else if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
             const name = args.next() orelse return ArgError.MissingFormatValue;
             input_override = format.parseFormatName(name) orelse {
                 try stderr.print("error: unsupported input format '{s}'\n", .{name});
@@ -339,6 +386,7 @@ fn parseEdit(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError!C
         .options = .{ .edit = .{
             .file = path,
             .input = resolved,
+            .parse_config = parse_config,
             .op = the_op,
             .path_str = path_str,
             .child_index = child_index,
@@ -486,6 +534,44 @@ test "parseConfig: query takes a file and a selector, plus -i override" {
     var w2 = scratchWriter(&buf);
     var no_sel = TestArgs{ .items = &.{ "twig", "query", "doc.md" } };
     try testing.expectError(error.MissingSelector, parseConfig(&no_sel, &w2));
+}
+
+test "parseConfig: convert --directives / --math set the markdown parse config" {
+    var buf: [256]u8 = undefined;
+    var w = scratchWriter(&buf);
+    var a = TestArgs{ .items = &.{ "twig", "convert", "-i", "md", "--directives", "--math", "doc.md" } };
+    const c = try parseConfig(&a, &w);
+    try testing.expect(c.options.convert.parse_config.markdown.directives);
+    try testing.expect(c.options.convert.parse_config.markdown.math);
+    // A default parse leaves both off.
+    var w2 = scratchWriter(&buf);
+    var a2 = TestArgs{ .items = &.{ "twig", "convert", "doc.md" } };
+    const c2 = try parseConfig(&a2, &w2);
+    try testing.expect(!c2.options.convert.parse_config.markdown.directives);
+}
+
+test "parseConfig: --commonmark and --gfm presets, and left-to-right composition" {
+    var buf: [256]u8 = undefined;
+
+    var w = scratchWriter(&buf);
+    var cm = TestArgs{ .items = &.{ "twig", "query", "--commonmark", "doc.md", "para" } };
+    const c = try parseConfig(&cm, &w);
+    try testing.expect(!c.options.query.parse_config.markdown.tables); // commonmark turns extensions off
+
+    var w2 = scratchWriter(&buf);
+    var gfmd = TestArgs{ .items = &.{ "twig", "query", "--gfm", "--directives", "doc.md", "para" } };
+    const c2 = try parseConfig(&gfmd, &w2);
+    try testing.expect(c2.options.query.parse_config.markdown.tables); // from --gfm
+    try testing.expect(c2.options.query.parse_config.markdown.directives); // added after the preset
+}
+
+test "parseConfig: edit carries the parse config too" {
+    var buf: [256]u8 = undefined;
+    var w = scratchWriter(&buf);
+    var a = TestArgs{ .items = &.{ "twig", "edit", "-i", "md", "--directives", "doc.md", "--delete", "1" } };
+    const c = try parseConfig(&a, &w);
+    try testing.expect(c.options.edit.parse_config.markdown.directives);
+    try testing.expectEqual(EditOp.delete, c.options.edit.op);
 }
 
 test "parseConfig: an unrecognized verb falls back to help rather than erroring" {

@@ -40,13 +40,22 @@ const AST = @import("ast.zig");
 const Node = AST.Node;
 const Span = @import("../span.zig");
 
-/// Source -> a freshly-allocated `AST` the editor takes ownership of. Runtime
-/// (not comptime-generic) so the CLI can pick the language at run time; the
-/// error set is open (`anyerror`) because each language's parse error set
-/// differs and a reparse failure is a legitimate, caller-visible outcome.
-pub const ParseFn = *const fn (Allocator, []const u8) anyerror!AST;
-
 pub const Editor = struct {
+    /// Source -> a freshly-allocated `AST` the editor takes ownership of.
+    /// Runtime (not comptime-generic) so the CLI can pick the language at run
+    /// time; the error set is open (`anyerror`) because each language's parse
+    /// error set differs and a reparse failure is a legitimate, caller-visible
+    /// outcome.
+    ///
+    /// The leading `ctx` is an opaque pointer the caller supplies to `init`
+    /// and the editor passes back to every reparse, unread — the hook for
+    /// parse configuration the editor itself has no business knowing about
+    /// (the CLI passes a `*const format.ParseConfig` so an edited Markdown
+    /// document reparses with the SAME extension flags, e.g. `--directives`,
+    /// it was first parsed with; a callback that needs no configuration just
+    /// ignores it). It must outlive the editor.
+    pub const ParseFn = *const fn (ctx: *const anyopaque, Allocator, []const u8) anyerror!AST;
+
     allocator: Allocator,
     /// The current (edited) document bytes. Owns its memory.
     source: std.ArrayList(u8),
@@ -54,14 +63,19 @@ pub const Editor = struct {
     /// memory; replaced wholesale on every successful edit.
     ast: AST,
     parse_fn: ParseFn,
+    /// Opaque configuration handed to `parse_fn` on every reparse (see
+    /// `ParseFn`). Borrowed; must outlive the editor.
+    parse_ctx: *const anyopaque,
 
     /// Parse `source_bytes` and build an editor over a private copy of them.
-    pub fn init(allocator: Allocator, source_bytes: []const u8, parse_fn: ParseFn) !Editor {
+    /// `parse_ctx` is forwarded verbatim to `parse_fn` on the initial parse
+    /// and every reparse — see `ParseFn`.
+    pub fn init(allocator: Allocator, source_bytes: []const u8, parse_ctx: *const anyopaque, parse_fn: ParseFn) !Editor {
         var source: std.ArrayList(u8) = .empty;
         errdefer source.deinit(allocator);
         try source.appendSlice(allocator, source_bytes);
-        const ast = try parse_fn(allocator, source.items);
-        return .{ .allocator = allocator, .source = source, .ast = ast, .parse_fn = parse_fn };
+        const ast = try parse_fn(parse_ctx, allocator, source.items);
+        return .{ .allocator = allocator, .source = source, .ast = ast, .parse_fn = parse_fn, .parse_ctx = parse_ctx };
     }
 
     pub fn deinit(self: *Editor) void {
@@ -102,7 +116,7 @@ pub const Editor = struct {
         new_src.appendSliceAssumeCapacity(replacement);
         new_src.appendSliceAssumeCapacity(s[span.end..]);
 
-        const new_ast = self.parse_fn(self.allocator, new_src.items) catch |err| {
+        const new_ast = self.parse_fn(self.parse_ctx, self.allocator, new_src.items) catch |err| {
             new_src.deinit(self.allocator);
             return err;
         };
@@ -218,13 +232,18 @@ pub const Editor = struct {
 
 const testing = std.testing;
 
-fn parseXml(a: Allocator, s: []const u8) anyerror!AST {
+fn parseXml(ctx: *const anyopaque, a: Allocator, s: []const u8) anyerror!AST {
+    _ = ctx;
     const Xml = @import("../languages/xml/xml.zig");
     return Xml.parse(a, s);
 }
 
+/// A throwaway context for the tests below, which use `parseXml` (which
+/// ignores its `ctx`). Any stable pointer works; this is the conventional one.
+const test_ctx: u8 = 0;
+
 test "replaceContent rewrites an element interior, losslessly" {
-    var ed = try Editor.init(testing.allocator, "<a><b>hi</b></a>", parseXml);
+    var ed = try Editor.init(testing.allocator, "<a><b>hi</b></a>", &test_ctx, parseXml);
     defer ed.deinit();
 
     // Path [0,0] = doc -> <a> -> <b>. Replace <b>'s interior "hi".
@@ -233,7 +252,7 @@ test "replaceContent rewrites an element interior, losslessly" {
 }
 
 test "insertChild appends and inserts by index" {
-    var ed = try Editor.init(testing.allocator, "<r><a/><c/></r>", parseXml);
+    var ed = try Editor.init(testing.allocator, "<r><a/><c/></r>", &test_ctx, parseXml);
     defer ed.deinit();
 
     // Insert between the two children (index 1 of <r>).
@@ -250,7 +269,7 @@ test "insertChild appends and inserts by index" {
 }
 
 test "insertBefore / insertAfter / deleteNode" {
-    var ed = try Editor.init(testing.allocator, "<r><a/><b/></r>", parseXml);
+    var ed = try Editor.init(testing.allocator, "<r><a/><b/></r>", &test_ctx, parseXml);
     defer ed.deinit();
 
     try ed.insertAfter(&.{ 0, 0 }, "<x/>");
@@ -264,7 +283,7 @@ test "insertBefore / insertAfter / deleteNode" {
 }
 
 test "a reparse-breaking edit rolls back and leaves the document untouched" {
-    var ed = try Editor.init(testing.allocator, "<a>ok</a>", parseXml);
+    var ed = try Editor.init(testing.allocator, "<a>ok</a>", &test_ctx, parseXml);
     defer ed.deinit();
 
     // Replace <a>'s interior with a fragment that makes the doc malformed
@@ -277,14 +296,14 @@ test "a reparse-breaking edit rolls back and leaves the document untouched" {
 }
 
 test "replaceContent on a leaf yields NoContentSpan" {
-    var ed = try Editor.init(testing.allocator, "<a>hi</a>", parseXml);
+    var ed = try Editor.init(testing.allocator, "<a>hi</a>", &test_ctx, parseXml);
     defer ed.deinit();
     // [0,0] = the "hi" text node, a leaf: no interior to splice.
     try testing.expectError(error.NoContentSpan, ed.replaceContent(&.{ 0, 0 }, "x"));
 }
 
 test "path navigation reports out-of-bounds" {
-    var ed = try Editor.init(testing.allocator, "<a><b/></a>", parseXml);
+    var ed = try Editor.init(testing.allocator, "<a><b/></a>", &test_ctx, parseXml);
     defer ed.deinit();
     try testing.expectError(error.PathOutOfBounds, ed.astView().getIdByPath(&.{ 0, 5 }));
     try testing.expectError(error.PathOutOfBounds, ed.astView().getIdByPath(&.{ 0, 0, 0 }));

@@ -19,10 +19,12 @@
 //!              | ":contains(" str ")"          text contains
 //!              | ":nth(" N ")"  |  "[" N "]"   the N-th match (1-based)
 //!              | "[" key (op value)? "]"       attribute/payload test
-//!   op        := "="  "^="  "$="  "*="         eq / prefix / suffix / substring
+//!   op        := "=" "^=" "$=" "*=" "~="       eq / prefix / suffix /
+//!                                              substring / whitespace-word
 //! Examples: `heading`, `heading[level=2]`, `heading("Status")`, `item[2]`,
 //! `link[dest^="http"]`, `code[lang=zig]`, `list[ordered]`, `list > item`,
-//! `list:nth(2) > item("dishes")`, `blockquote para`.
+//! `list:nth(2) > item("dishes")`, `blockquote para`,
+//! `directive[name=vis]`, `directive[name=vis][class~=public]`.
 //!
 //! Each step's `:nth`/`[k]` applies *within that step's scope* — it picks the
 //! k-th candidate matched under the current scope, and that pick becomes the
@@ -43,8 +45,10 @@ const Span = @import("../span.zig");
 
 /// A comparison a `[key op value]` predicate performs against a node's
 /// attribute/payload value. `present` is the bare `[key]` form (key exists,
-/// value ignored).
-pub const Op = enum { present, eq, prefix, suffix, substr };
+/// value ignored). `word` is CSS's `~=`: the value is one whitespace-separated
+/// token of `actual` — the natural test for class membership
+/// (`[class~=public]` on a `class="public family"` value).
+pub const Op = enum { present, eq, prefix, suffix, substr, word };
 
 pub const AttrPred = struct {
     key: []const u8,
@@ -215,10 +219,11 @@ fn parseAttr(a: Allocator, inner: []const u8) ParseError!AttrPred {
     var i: usize = 0;
     while (i < inner.len) : (i += 1) {
         if (inner[i] == '=') {
-            if (i > 0 and (inner[i - 1] == '^' or inner[i - 1] == '$' or inner[i - 1] == '*')) {
+            if (i > 0 and (inner[i - 1] == '^' or inner[i - 1] == '$' or inner[i - 1] == '*' or inner[i - 1] == '~')) {
                 op = switch (inner[i - 1]) {
                     '^' => .prefix,
                     '$' => .suffix,
+                    '~' => .word,
                     else => .substr,
                 };
                 op_at = i - 1;
@@ -434,6 +439,14 @@ fn opMatch(op: Op, actual: []const u8, want: []const u8) bool {
         .prefix => std.mem.startsWith(u8, actual, want),
         .suffix => std.mem.endsWith(u8, actual, want),
         .substr => std.mem.indexOf(u8, actual, want) != null,
+        .word => blk: {
+            if (want.len == 0) break :blk false;
+            var it = std.mem.tokenizeAny(u8, actual, " \t\r\n");
+            while (it.next()) |tok| {
+                if (std.mem.eql(u8, tok, want)) break :blk true;
+            }
+            break :blk false;
+        },
     };
 }
 
@@ -460,6 +473,17 @@ fn attrMatches(ast: *const AST, id: Node.Id, pred: AttrPred) bool {
             else => null,
         };
         return if (l) |ll| opMatch(pred.op, ll, pred.value) else false;
+    }
+    // `name` addresses the named kinds — a directive's type (`directive
+    // [name=vis]`) or a generic element's tag (`element[name=video]`).
+    if (std.mem.eql(u8, pred.key, "name")) {
+        const nm: ?[]const u8 = switch (node.kind) {
+            .directive => |d| d.name,
+            .element => |e| e.name,
+            else => null,
+        };
+        if (nm) |n| return if (pred.op == .present) true else opMatch(pred.op, n, pred.value);
+        return false;
     }
     if (std.mem.eql(u8, pred.key, "ordered")) return std.meta.activeTag(node.kind) == .ordered_list;
     if (std.mem.eql(u8, pred.key, "checked")) return switch (node.kind) {
@@ -590,6 +614,41 @@ test "resolveAll: a directive node is addressable by its kind name" {
     defer testing.allocator.free(ms);
     try testing.expectEqual(@as(usize, 2), ms.len);
     try testing.expect(ast.nodes[ms[0].id].kind == .directive);
+}
+
+test "resolveAll: directive[name=...] and [class~=...] audience filtering" {
+    const Markdown = @import("../languages/markdown/markdown.zig");
+    const src =
+        ":::vis{.public}\npublic stuff\n:::\n\n" ++
+        ":::vis{.adam .family}\nprivate stuff\n:::\n\n" ++
+        ":::note{.public}\nnot a vis block\n:::\n";
+    var doc = try Markdown.parse(testing.allocator, src, .{ .directives = true });
+    doc.link_references.deinit(testing.allocator);
+    doc.footnotes.deinit(testing.allocator);
+    var ast = doc.ast;
+    defer ast.deinit();
+
+    // All vis directives, regardless of audience.
+    var vis = try parse(testing.allocator, "directive[name=vis]");
+    defer vis.deinit();
+    const all_vis = try resolveAll(testing.allocator, &ast, &vis);
+    defer testing.allocator.free(all_vis);
+    try testing.expectEqual(@as(usize, 2), all_vis.len);
+
+    // Only vis directives whose class set contains `public`.
+    var pub_vis = try parse(testing.allocator, "directive[name=vis][class~=public]");
+    defer pub_vis.deinit();
+    const public = try resolveAll(testing.allocator, &ast, &pub_vis);
+    defer testing.allocator.free(public);
+    try testing.expectEqual(@as(usize, 1), public.len);
+    try testing.expectEqualStrings("vis", ast.nodes[public[0].id].kind.directive.name);
+
+    // `~=` is word-membership, not substring: `publi` matches nothing.
+    var partial = try parse(testing.allocator, "directive[class~=publi]");
+    defer partial.deinit();
+    const none = try resolveAll(testing.allocator, &ast, &partial);
+    defer testing.allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "resolveAll: matches by kind across a real markdown tree" {

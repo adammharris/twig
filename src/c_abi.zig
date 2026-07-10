@@ -437,7 +437,15 @@ const EditOp = enum { replace, replace_content, insert_before, insert_after, ins
 // XML/HTML already parse to a bare `AST`. Mirrors `cli/format.zig`'s
 // `parseToAst*` adapters.
 
-fn parseToAstDjot(allocator: Allocator, source: []const u8) anyerror!twig.AST {
+// The editor reparse callback (`twig.Editor.ParseFn`) takes a leading opaque
+// `ctx` for parse configuration; the C ABI exposes no parse options, so these
+// adapters ignore it and use each language's default options, and
+// `twig_editor_create` hands the editor `&c_abi_parse_ctx` (a stable, unread
+// pointer).
+const c_abi_parse_ctx: u8 = 0;
+
+fn parseToAstDjot(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!twig.AST {
+    _ = ctx;
     var doc = try twig.Djot.parse(allocator, source);
     doc.references.deinit(allocator);
     doc.auto_references.deinit(allocator);
@@ -445,22 +453,25 @@ fn parseToAstDjot(allocator: Allocator, source: []const u8) anyerror!twig.AST {
     return doc.ast;
 }
 
-fn parseToAstMarkdown(allocator: Allocator, source: []const u8) anyerror!twig.AST {
+fn parseToAstMarkdown(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!twig.AST {
+    _ = ctx;
     var doc = try twig.Markdown.parse(allocator, source, .{});
     doc.link_references.deinit(allocator);
     doc.footnotes.deinit(allocator);
     return doc.ast;
 }
 
-fn parseToAstXml(allocator: Allocator, source: []const u8) anyerror!twig.AST {
+fn parseToAstXml(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!twig.AST {
+    _ = ctx;
     return twig.Xml.parse(allocator, source);
 }
 
-fn parseToAstHtml(allocator: Allocator, source: []const u8) anyerror!twig.AST {
+fn parseToAstHtml(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!twig.AST {
+    _ = ctx;
     return twig.Html.parse(allocator, source);
 }
 
-fn parseFnFor(format: TwigFormat) *const fn (Allocator, []const u8) anyerror!twig.AST {
+fn parseFnFor(format: TwigFormat) twig.Editor.ParseFn {
     return switch (format) {
         .djot => parseToAstDjot,
         .markdown => parseToAstMarkdown,
@@ -483,7 +494,7 @@ pub export fn twig_editor_create(
     const target = intToFormat(format) orelse return .unsupported_format;
 
     const allocator = activeAllocator();
-    var editor = twig.Editor.init(allocator, source, parseFnFor(target)) catch |err| switch (err) {
+    var editor = twig.Editor.init(allocator, source, &c_abi_parse_ctx, parseFnFor(target)) catch |err| switch (err) {
         error.OutOfMemory => return .out_of_memory,
         else => return .parse_error,
     };

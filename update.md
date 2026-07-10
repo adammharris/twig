@@ -59,6 +59,11 @@ project to `fig` (which does the same for config formats).
   `-i` override (including `.html`/`.htm`); extensible format registry (one entry per language — `parse`,
   `parseToAst`, `renderHtml`, optional `serializeCanonical`). `-o ast` = pretty
   JSON dump; `-o canonical` = round-trip serializer (XML, Djot, Markdown).
+  Markdown extension flags (`--directives`/`--math`/`--commonmark`/`--gfm`) on
+  `convert`/`query`/`edit`, threaded as a `format.ParseConfig` through the parse
+  adapters (and through the editor's reparse, so an edited directive document
+  stays parseable). The registry's `parseToAst` now matches `Editor.ParseFn`
+  (leading opaque parse-config context — see below).
 - **Editor** (`src/ast/editor.zig`, reader path-nav, `twig edit`) — the
   span-splice layer: lossless in-place edits via index paths. Primitive
   `replaceAtSpan` (splice → reparse → byte-for-byte rollback on failure); ops
@@ -73,7 +78,12 @@ project to `fig` (which does the same for config formats).
   addressing, the friendly alternative to raw index paths. CSS-lite:
   `heading[level=2]`, `heading("Status")`, `item[2]`, `link[dest^="http"]`,
   `code[lang=zig]` (kind names + friendly aliases + `:contains`/shorthand +
-  `:nth`/`[k]` + attr predicates). Library API: `Select.parse` →
+  `:nth`/`[k]` + attr predicates). Payload-field predicates resolve through the
+  same special-case-then-side-table machine: `level`/`dest`/`lang`/`ordered`/
+  `checked` and now `name` (`directive[name=vis]`, `element[name=video]`). The
+  `~=` operator (`[class~=public]`) is CSS whitespace-word membership — the
+  clean class-set test for directive audiences (`directive[name=vis][class~=public]`).
+  Library API: `Select.parse` →
   `resolveAll`/`resolveOne`/`textOf` + `AST.pathOf` (id → path). `twig query`
   lists matches as `[path] kind "preview"`; `twig edit` accepts a selector
   anywhere it takes a path (auto-detected — all-digits-and-dots = index path,

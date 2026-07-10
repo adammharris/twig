@@ -3323,4 +3323,3 @@ test "text directive renders inline as its named element" {
     defer testing.allocator.free(html);
     try testing.expectEqualStrings("<p>See <abbr title=\"HyperText\">HTML</abbr> here.</p>\n", html);
 }
-

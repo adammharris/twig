@@ -90,6 +90,12 @@ pub fn runHelp(w: *Writer, binary_name: []const u8) !void {
         \\  -o, --output <format>  select convert's output (html, ast, canonical)
         \\  --dry-run              (edit) print the result instead of writing it
         \\
+        \\markdown extension flags (convert/query/edit; ignored for other inputs):
+        \\  --directives           enable generic directives (:name, ::name, :::name)
+        \\  --math                 enable $…$ / $$…$$ math
+        \\  --commonmark           strict CommonMark (all extensions off)
+        \\  --gfm                  the GFM extension set
+        \\
         \\Input format is normally inferred from the file extension
         \\(.dj/.djot, .md/.markdown, .xml, .html/.htm). Pass `-` as the file to read from
         \\stdin — this requires an explicit `-i`, since there is no extension
@@ -130,7 +136,7 @@ pub fn runIdentify(stdout: *Writer, opts: args_mod.IdentifyOptions) !void {
 ///                    format has no serializer.
 pub fn runConvert(allocator: Allocator, io: Io, stdout: *Writer, stderr: *Writer, opts: args_mod.ConvertOptions) ActionError!void {
     const source = try readSource(allocator, io, opts.file, stderr);
-    try convertSource(allocator, source, opts.file, opts.input, opts.output, opts.output_format, stdout, stderr);
+    try convertSource(allocator, source, opts.file, opts.input, opts.parse_config, opts.output, opts.output_format, stdout, stderr);
     stdout.flush() catch |err| {
         stderr.print("error: failed to write output: {t}\n", .{err}) catch {};
         stderr.flush() catch {};
@@ -148,6 +154,7 @@ fn convertSource(
     source: []const u8,
     display_name: []const u8,
     input: format.InputFormat,
+    parse_config: format.ParseConfig,
     output: format.OutputMode,
     output_format: ?format.InputFormat,
     stdout: *Writer,
@@ -155,7 +162,7 @@ fn convertSource(
 ) ActionError!void {
     const entry = format.entryFor(input);
 
-    var doc = entry.parse(allocator, source) catch |err| {
+    var doc = entry.parse(&parse_config, allocator, source) catch |err| {
         stderr.print("error: failed to parse '{s}' as {s}: {t}\n", .{ display_name, @tagName(input), err }) catch {};
         stderr.flush() catch {};
         return error.ActionFailed;
@@ -236,7 +243,7 @@ pub fn runQuery(allocator: Allocator, io: Io, stdout: *Writer, stderr: *Writer, 
 
     // Editing/querying only needs the bare AST — reuse the editor's per-format
     // reparse adapter (which discards any `Document` side tables).
-    var ast = format.entryFor(opts.input).parseToAst(allocator, source) catch |err| {
+    var ast = format.entryFor(opts.input).parseToAst(&opts.parse_config, allocator, source) catch |err| {
         stderr.print("error: failed to parse '{s}' as {s}: {t}\n", .{ opts.file, @tagName(opts.input), err }) catch {};
         stderr.flush() catch {};
         return error.ActionFailed;
@@ -308,7 +315,7 @@ fn writePreview(text: []const u8, stdout: *Writer) !void {
 /// `applyEdit`, split out so tests can drive it against an in-memory string.
 pub fn runEdit(allocator: Allocator, io: Io, stdout: *Writer, stderr: *Writer, opts: args_mod.EditOptions) ActionError!void {
     const source = try readSource(allocator, io, opts.file, stderr);
-    const edited = try applyEditByLocator(allocator, source, opts.input, opts.op, opts.path_str, opts.child_index, opts.text, stderr);
+    const edited = try applyEditByLocator(allocator, source, opts.input, opts.parse_config, opts.op, opts.path_str, opts.child_index, opts.text, stderr);
 
     // stdin has no file to write back to, so it always prints; `--dry-run`
     // prints for a real file too, leaving it untouched.
@@ -355,6 +362,7 @@ fn applyEditByLocator(
     allocator: Allocator,
     source: []const u8,
     input: format.InputFormat,
+    parse_config: format.ParseConfig,
     op: args_mod.EditOp,
     locator: []const u8,
     child_index: usize,
@@ -362,7 +370,10 @@ fn applyEditByLocator(
     stderr: *Writer,
 ) ActionError![]u8 {
     const entry = format.entryFor(input);
-    var editor = twig.Editor.init(allocator, source, entry.parseToAst) catch |err| {
+    // `&parse_config` (this stack frame's copy) outlives `editor`, which is
+    // deinited before this function returns — so the editor's borrowed parse
+    // context stays valid across every reparse.
+    var editor = twig.Editor.init(allocator, source, &parse_config, entry.parseToAst) catch |err| {
         stderr.print("error: failed to parse input as {s}: {t}\n", .{ @tagName(input), err }) catch {};
         stderr.flush() catch {};
         return error.ActionFailed;
@@ -502,7 +513,7 @@ test "convertSource: html output for djot goes through Djot.html.render (footnot
     var out: Writer = .fixed(&out_buf);
     var err: Writer = .fixed(&err_buf);
 
-    try convertSource(testing.allocator, "hi[^1]\n\n[^1]: a note\n", "-", .djot, .html, null, &out, &err);
+    try convertSource(testing.allocator, "hi[^1]\n\n[^1]: a note\n", "-", .djot, .{}, .html, null, &out, &err);
     // `role="doc-endnotes"`/`id="fn1"` only appear when the djot-specific
     // side-table-aware render path (`Djot.html.render`) actually resolved the
     // footnote reference — the generic `Html.serialize(..., null)` path
@@ -519,7 +530,7 @@ test "convertSource: ast output is JSON starting with a doc-kind object" {
     var out: Writer = .fixed(&out_buf);
     var err: Writer = .fixed(&err_buf);
 
-    try convertSource(testing.allocator, "hello\n", "-", .djot, .ast, null, &out, &err);
+    try convertSource(testing.allocator, "hello\n", "-", .djot, .{}, .ast, null, &out, &err);
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"kind\": \"doc\"") != null);
 }
 
@@ -529,7 +540,7 @@ test "convertSource: xml canonical output round-trips through Xml.serializeAlloc
     var out: Writer = .fixed(&out_buf);
     var err: Writer = .fixed(&err_buf);
 
-    try convertSource(testing.allocator, "<a><b/></a>", "-", .xml, .canonical, null, &out, &err);
+    try convertSource(testing.allocator, "<a><b/></a>", "-", .xml, .{}, .canonical, null, &out, &err);
     try testing.expectEqualStrings("<a><b/></a>", out.buffered());
 }
 
@@ -539,7 +550,7 @@ test "convertSource: djot canonical output uses Djot.serializeAlloc" {
     var out: Writer = .fixed(&out_buf);
     var err: Writer = .fixed(&err_buf);
 
-    try convertSource(testing.allocator, "hello *world*\n", "-", .djot, .canonical, null, &out, &err);
+    try convertSource(testing.allocator, "hello *world*\n", "-", .djot, .{}, .canonical, null, &out, &err);
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "*world*") != null);
 }
 
@@ -549,7 +560,7 @@ test "convertSource: markdown canonical output uses Markdown.serializeAlloc" {
     var out: Writer = .fixed(&out_buf);
     var err: Writer = .fixed(&err_buf);
 
-    try convertSource(testing.allocator, "[x][a]\n\n[a]: /u\n", "-", .markdown, .canonical, null, &out, &err);
+    try convertSource(testing.allocator, "[x][a]\n\n[a]: /u\n", "-", .markdown, .{}, .canonical, null, &out, &err);
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "[a]: /u") != null);
 }
 
@@ -559,7 +570,7 @@ test "convertSource: -o djot with markdown input cross-converts via Djot.seriali
     var out: Writer = .fixed(&out_buf);
     var err: Writer = .fixed(&err_buf);
 
-    try convertSource(testing.allocator, "This is *markdown*.\n", "-", .markdown, .canonical, .djot, &out, &err);
+    try convertSource(testing.allocator, "This is *markdown*.\n", "-", .markdown, .{}, .canonical, .djot, &out, &err);
     // Markdown's `*markdown*` (emph) round-trips through the shared `AST`
     // as an `emph` node, which the Djot serializer renders djot-style, with
     // underscores rather than asterisks.
@@ -572,7 +583,7 @@ test "convertSource: -o markdown with djot input cross-converts via Markdown.ser
     var out: Writer = .fixed(&out_buf);
     var err: Writer = .fixed(&err_buf);
 
-    try convertSource(testing.allocator, "This is _djot emphasis_.\n", "-", .djot, .canonical, .markdown, &out, &err);
+    try convertSource(testing.allocator, "This is _djot emphasis_.\n", "-", .djot, .{}, .canonical, .markdown, &out, &err);
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "*djot emphasis*") != null);
 }
 
@@ -595,17 +606,17 @@ test "applyEditByLocator: index paths across xml, markdown, djot" {
     var err: Writer = .fixed(&buf);
 
     // XML: replace <b>'s interior at path 0.0.
-    const xml = try applyEditByLocator(testing.allocator, "<a><b>hi</b></a>", .xml, .replace_content, "0.0", 0, "bye", &err);
+    const xml = try applyEditByLocator(testing.allocator, "<a><b>hi</b></a>", .xml, .{}, .replace_content, "0.0", 0, "bye", &err);
     defer testing.allocator.free(xml);
     try testing.expectEqualStrings("<a><b>bye</b></a>", xml);
 
     // Markdown: insert a new first list item (list is doc's child 0).
-    const md = try applyEditByLocator(testing.allocator, "- one\n- two\n", .markdown, .insert_child, "0", 0, "- zero\n", &err);
+    const md = try applyEditByLocator(testing.allocator, "- one\n- two\n", .markdown, .{}, .insert_child, "0", 0, "- zero\n", &err);
     defer testing.allocator.free(md);
     try testing.expectEqualStrings("- zero\n- one\n- two\n", md);
 
     // Djot: replace the first paragraph's whole source at path 0.
-    const dj = try applyEditByLocator(testing.allocator, "one\n\ntwo\n", .djot, .replace, "0", 0, "ONE", &err);
+    const dj = try applyEditByLocator(testing.allocator, "one\n\ntwo\n", .djot, .{}, .replace, "0", 0, "ONE", &err);
     defer testing.allocator.free(dj);
     try testing.expect(std.mem.startsWith(u8, dj, "ONE"));
 }
@@ -615,7 +626,7 @@ test "applyEditByLocator: a selector locator resolves to the target node" {
     var err: Writer = .fixed(&buf);
 
     // Address the second heading by its text instead of a path.
-    const md = try applyEditByLocator(testing.allocator, "# One\n\n## Two\n", .markdown, .replace, "heading(\"Two\")", 0, "## Renamed", &err);
+    const md = try applyEditByLocator(testing.allocator, "# One\n\n## Two\n", .markdown, .{}, .replace, "heading(\"Two\")", 0, "## Renamed", &err);
     defer testing.allocator.free(md);
     try testing.expectEqualStrings("# One\n\n## Renamed\n", md);
 }
@@ -624,7 +635,7 @@ test "applyEditByLocator: an ambiguous selector is refused and lists candidates"
     var buf: [1024]u8 = undefined;
     var err: Writer = .fixed(&buf);
     // Two headings match `heading` -> ambiguous.
-    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "# One\n\n# Two\n", .markdown, .replace, "heading", 0, "x", &err));
+    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "# One\n\n# Two\n", .markdown, .{}, .replace, "heading", 0, "x", &err));
     try testing.expect(std.mem.indexOf(u8, err.buffered(), "ambiguous") != null);
 }
 
@@ -634,7 +645,7 @@ test "applyEditByLocator: a Markdown inline link node has an accurate span and e
     // so this splices at the link's own `[x](http://a.co)` extent rather
     // than erroring with `NoNodeSpan`.
     var err: Writer = .fixed(&.{});
-    const out = try applyEditByLocator(testing.allocator, "see [x](http://a.co)\n", .markdown, .replace, "link", 0, "[y](http://b.co)", &err);
+    const out = try applyEditByLocator(testing.allocator, "see [x](http://a.co)\n", .markdown, .{}, .replace, "link", 0, "[y](http://b.co)", &err);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("see [y](http://b.co)\n", out);
 }
@@ -647,14 +658,14 @@ test "applyEditByLocator: a Markdown inline node with no mapped span is still re
     // comment's "Inline spans" section) -- the emphasis run here straddles
     // the line join, so it's left with no span, and the edit must error
     // clearly rather than splice at offset 0.
-    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "a *b\nc* d\n", .markdown, .replace, "emph", 0, "*x*", &err));
+    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "a *b\nc* d\n", .markdown, .{}, .replace, "emph", 0, "*x*", &err));
     try testing.expect(std.mem.indexOf(u8, err.buffered(), "no source span") != null);
 }
 
 test "applyEditByLocator: a leaf interior yields a clear NoContentSpan failure" {
     var buf: [512]u8 = undefined;
     var err: Writer = .fixed(&buf);
-    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "<a>hi</a>", .xml, .replace_content, "0.0", 0, "x", &err));
+    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "<a>hi</a>", .xml, .{}, .replace_content, "0.0", 0, "x", &err));
     try testing.expect(std.mem.indexOf(u8, err.buffered(), "no editable interior") != null);
 }
 
@@ -662,6 +673,6 @@ test "applyEditByLocator: an edit that breaks the reparse rolls back and reports
     var buf: [512]u8 = undefined;
     var err: Writer = .fixed(&buf);
     // Replacing <a>'s interior with "<b>" makes `<a><b></a>` — malformed.
-    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "<a>ok</a>", .xml, .replace_content, "0", 0, "<b>", &err));
+    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "<a>ok</a>", .xml, .{}, .replace_content, "0", 0, "<b>", &err));
     try testing.expect(std.mem.indexOf(u8, err.buffered(), "no longer parses") != null);
 }
