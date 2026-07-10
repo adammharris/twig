@@ -92,6 +92,20 @@ pub const RenderOptions = struct {
     /// nodes are identical, only the print order differs. Defaults to djot's
     /// order; the markdown path opts in.
     commonmark_image_attrs: bool = false,
+    /// Percent-encode link/image destinations (and autolink URLs) the way
+    /// CommonMark's reference `houdini_escape_href` does: pass through
+    /// alphanumerics, `-_.~` and the URL-reserved set `!#$%&'()*+,/:;=?@`
+    /// (so an already-`%`-encoded byte survives), and `%XX`-encode everything
+    /// else, including spaces, `"`, `\`, `[`, `]`, and every non-ASCII byte
+    /// (UTF-8, one `%XX` per byte). djot emits destinations verbatim, so this
+    /// defaults off and the markdown path opts in. (HTML attribute escaping
+    /// still runs afterward, turning a passed-through `&` into `&amp;`.)
+    percent_encode_urls: bool = false,
+    /// Escape `"` to `&quot;` in text content, not just in attribute values.
+    /// CommonMark's reference `escape_html` escapes `&<>"` everywhere; djot
+    /// escapes only `&<>` in text (a literal `"` stays bare). Defaults to
+    /// djot's behavior; the markdown path opts in.
+    escape_text_quotes: bool = false,
     /// Render list items the CommonMark way: a *tight* item hugs its content
     /// (`<li>one</li>`, first paragraph inline with no wrapping `<p>` and no
     /// surrounding newlines), a following block (a nested list) gets a single
@@ -143,6 +157,39 @@ const void_elements = std.StaticStringMap(void).initComptime(.{
 
 fn isVoidElement(name: []const u8) bool {
     return void_elements.has(name);
+}
+
+/// Bytes passed through literally by `percentEncodeHref` — CommonMark's
+/// `houdini_escape_href` "safe" set: ASCII alphanumerics, `-_.~`, and the
+/// URL-reserved punctuation `!#$%&'()*+,/:;=?@`. Every other byte (spaces,
+/// `"`, `<`, `>`, `\`, `[`, `]`, controls, and all non-ASCII) is `%XX`-encoded.
+fn hrefSafeByte(c: u8) bool {
+    return switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9' => true,
+        '-', '_', '.', '~' => true,
+        '!', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '/', ':', ';', '=', '?', '@' => true,
+        else => false,
+    };
+}
+
+/// Percent-encode a URL destination the way CommonMark's reference renderer
+/// does (see `hrefSafeByte`). Returns a freshly allocated buffer owned by the
+/// caller. Note an existing `%` passes through (it's "safe"), so a
+/// pre-encoded destination is not double-encoded.
+fn percentEncodeHref(allocator: Allocator, url: []const u8) Allocator.Error![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    const hex = "0123456789ABCDEF";
+    for (url) |c| {
+        if (hrefSafeByte(c)) {
+            try out.append(allocator, c);
+        } else {
+            try out.append(allocator, '%');
+            try out.append(allocator, hex[c >> 4]);
+            try out.append(allocator, hex[c & 0x0F]);
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Elements whose content is *raw text*: it has no character-reference
@@ -211,6 +258,10 @@ pub const Renderer = struct {
                 '&' => try self.writer.writeAll("&amp;"),
                 '<' => try self.writer.writeAll("&lt;"),
                 '>' => try self.writer.writeAll("&gt;"),
+                '"' => if (self.options.escape_text_quotes)
+                    try self.writer.writeAll("&quot;")
+                else
+                    try self.writer.writeByte(c),
                 else => try self.writer.writeByte(c),
             }
         }
@@ -766,29 +817,44 @@ pub const Renderer = struct {
         }
     }
 
+    /// Percent-encode a URL per `RenderOptions.percent_encode_urls`. Passes
+    /// the raw slice through unchanged when the option is off; otherwise
+    /// returns an owned buffer stashed in `slot` (freed by the caller) so the
+    /// returned slice outlives this call's tag emission. Only one URL is
+    /// emitted per link/image, so a single slot suffices.
+    fn hrefValue(self: *Renderer, raw: []const u8, slot: *?[]u8) Allocator.Error![]const u8 {
+        if (!self.options.percent_encode_urls) return raw;
+        const enc = try percentEncodeHref(self.allocator, raw);
+        slot.* = enc;
+        return enc;
+    }
+
     fn renderLinkOrImage(self: *Renderer, id: Node.Id, v: anytype, is_image: bool) RenderError!void {
         var dest: ?[]const u8 = v.destination;
         var extra = std.ArrayList(KV).empty;
         defer extra.deinit(self.allocator);
         var alt: ?[]u8 = null;
         defer if (alt) |a| self.allocator.free(a);
+        var href_buf: ?[]u8 = null;
+        defer if (href_buf) |b| self.allocator.free(b);
 
         if (v.reference) |ref| {
             const resolved = self.references.get(ref) orelse self.auto_references.get(ref);
             if (resolved) |ref_id| {
                 const ref_attrs = self.ast.attrsOf(ref_id);
                 dest = self.ast.nodes[ref_id].kind.reference.destination;
+                const src_val = try self.hrefValue(dest.?, &href_buf);
                 if (is_image) {
                     alt = try self.stringContent(id);
                     if (self.options.commonmark_image_attrs) {
-                        try extra.append(self.allocator, .{ .key = "src", .value = dest.? });
+                        try extra.append(self.allocator, .{ .key = "src", .value = src_val });
                         try extra.append(self.allocator, .{ .key = "alt", .value = alt.? });
                     } else {
                         try extra.append(self.allocator, .{ .key = "alt", .value = alt.? });
-                        try extra.append(self.allocator, .{ .key = "src", .value = dest.? });
+                        try extra.append(self.allocator, .{ .key = "src", .value = src_val });
                     }
                 } else {
-                    try extra.append(self.allocator, .{ .key = "href", .value = dest.? });
+                    try extra.append(self.allocator, .{ .key = "href", .value = src_val });
                 }
                 const own_attrs = self.ast.attrsOf(id);
                 for (ref_attrs.entries) |kv| {
@@ -804,14 +870,14 @@ pub const Renderer = struct {
             if (is_image) {
                 alt = try self.stringContent(id);
                 if (self.options.commonmark_image_attrs and dest != null) {
-                    try extra.append(self.allocator, .{ .key = "src", .value = dest.? });
+                    try extra.append(self.allocator, .{ .key = "src", .value = try self.hrefValue(dest.?, &href_buf) });
                     try extra.append(self.allocator, .{ .key = "alt", .value = alt.? });
                 } else {
                     try extra.append(self.allocator, .{ .key = "alt", .value = alt.? });
-                    if (dest) |d| try extra.append(self.allocator, .{ .key = "src", .value = d });
+                    if (dest) |d| try extra.append(self.allocator, .{ .key = "src", .value = try self.hrefValue(d, &href_buf) });
                 }
             } else if (dest) |d| {
-                try extra.append(self.allocator, .{ .key = "href", .value = d });
+                try extra.append(self.allocator, .{ .key = "href", .value = try self.hrefValue(d, &href_buf) });
             }
         }
 
@@ -822,12 +888,15 @@ pub const Renderer = struct {
         }
     }
 
-    fn renderUrlOrEmail(self: *Renderer, id: Node.Id, text: []const u8, is_email: bool) Writer.Error!void {
+    fn renderUrlOrEmail(self: *Renderer, id: Node.Id, text: []const u8, is_email: bool) RenderError!void {
         var buf: [512]u8 = undefined;
-        const href = if (is_email)
+        const raw_href = if (is_email)
             std.fmt.bufPrint(&buf, "mailto:{s}", .{text}) catch text
         else
             text;
+        var href_buf: ?[]u8 = null;
+        defer if (href_buf) |b| self.allocator.free(b);
+        const href = try self.hrefValue(raw_href, &href_buf);
         try self.renderTag("a", id, &.{.{ .key = "href", .value = href }});
         try self.writeEscaped(text);
         try self.renderCloseTag("a");

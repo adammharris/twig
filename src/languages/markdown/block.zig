@@ -960,13 +960,32 @@ pub const Parser = struct {
         try self.top().children.append(self.allocator, id);
     }
 
-    /// Called whenever genuinely new block-level content is added while
-    /// some list(s) are open: converts any of those lists' pending blank
-    /// line into a permanent tight=false, per CommonMark's tight/loose
-    /// definition (see this file's module doc comment).
+    /// Called whenever genuinely new block-level content is added while some
+    /// list(s) are open: resolves a pending blank line into tightness, per
+    /// CommonMark's tight/loose definition (see this file's module doc
+    /// comment).
+    ///
+    /// A blank line makes exactly ONE list loose: the deepest still-open list
+    /// on the stack, i.e. the innermost list whose sibling-level the content
+    /// being added joins. (A list gains a new *item* only after any deeper
+    /// list has already been popped by `closeToDepth`/`maybeCloseTopList`, so
+    /// the deepest list still on the stack is precisely the one the new
+    /// sibling belongs to.) The earlier "mark every pending list loose"
+    /// over-reached: a blank nested inside a deep item wrongly made every
+    /// ancestor list loose too (spec ex307/319/320). Once resolved, all
+    /// `blank_pending` flags are cleared — the blank event is consumed.
     fn markListsLoose(self: *Parser) void {
+        var i = self.stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            const c = &self.stack.items[i];
+            if (c.kind == .list and c.blank_pending) {
+                c.tight = false;
+                break;
+            }
+        }
         for (self.stack.items) |*c| {
-            if (c.kind == .list and c.blank_pending) c.tight = false;
+            if (c.kind == .list) c.blank_pending = false;
         }
     }
 
@@ -1278,8 +1297,33 @@ pub const Parser = struct {
             }
         }
         if (!interior_of_leaf) {
-            for (self.stack.items) |*c| {
-                if (c.kind == .list) c.blank_pending = true;
+            // "A list item can begin with at most one blank line": if the top
+            // container is a list item still empty at this blank (its only
+            // preceding line was the marker, whose own trailing blank is the
+            // one allowed -- any real content would have produced a leaf or
+            // child by now), a further blank terminates it empty, so later
+            // content attaches outside it rather than being adopted (spec
+            // ex280). Close it before arming, so `blank_pending` lands on the
+            // enclosing list, not the defunct item.
+            {
+                const top_c = &self.stack.items[self.stack.items.len - 1];
+                if (top_c.kind == .list_item and top_c.children.items.len == 0 and self.leaf == null) {
+                    try self.popContainer(idx);
+                }
+            }
+            // A blank scoped *inside* a block quote (or footnote definition) --
+            // the deepest still-matched container, meaning this line carried
+            // that container's own marker (e.g. a lone `>`) -- separates blocks
+            // within it, not the items/blocks of any enclosing list, so it must
+            // not arm those lists (spec ex320). A blank at the list's own level
+            // fails to match the quote and closes it first (via `closeToDepth`
+            // in `processLine`), leaving a list/list_item on top, so arming then
+            // proceeds normally.
+            const top_kind = self.stack.items[self.stack.items.len - 1].kind;
+            if (top_kind != .block_quote and top_kind != .footnote_def) {
+                for (self.stack.items) |*c| {
+                    if (c.kind == .list) c.blank_pending = true;
+                }
             }
         }
     }
@@ -2225,7 +2269,18 @@ pub const Parser = struct {
         // whole definition attempt fails (see this file's module doc
         // comment's documented simplification).
         const after_dest = i;
+        const dest_line_end = std.mem.indexOfScalarPos(u8, text, after_dest, '\n') orelse text.len;
         const ws_end = skipLrdWs(text, after_dest);
+        // Did the whitespace between the destination and a title candidate
+        // cross a line ending? A malformed title on a *separate* line doesn't
+        // sink the whole definition -- the definition ends at the destination
+        // line and the bad title line becomes an ordinary paragraph (spec
+        // ex210). A malformed title on the *same* line as the destination
+        // still fails the definition entirely.
+        const title_on_new_line = std.mem.indexOfScalarPos(u8, text, after_dest, '\n') != null and dest_line_end < ws_end;
+        // Backing off to a dest-only definition is only valid if the
+        // destination's own line has nothing but blanks after it.
+        const dest_line_blank = isBlankLine(text[after_dest..dest_line_end]);
         var title: ?[]const u8 = null;
         var end = after_dest;
         if (ws_end > after_dest and ws_end < text.len and (text[ws_end] == '"' or text[ws_end] == '\'' or text[ws_end] == '(')) {
@@ -2235,18 +2290,23 @@ pub const Parser = struct {
             while (j < text.len and text[j] != close) : (j += 1) {
                 if (text[j] == '\\' and j + 1 < text.len) j += 1;
             }
-            if (j < text.len) {
+            const malformed = blk: {
+                if (j >= text.len) break :blk true;
                 const rest_start = j + 1;
                 const line_end = std.mem.indexOfScalarPos(u8, text, rest_start, '\n') orelse text.len;
-                if (isBlankLine(text[rest_start..line_end])) {
-                    title = text[ws_end + 1 .. j];
-                    end = line_end;
+                if (!isBlankLine(text[rest_start..line_end])) break :blk true;
+                title = text[ws_end + 1 .. j];
+                end = line_end;
+                break :blk false;
+            };
+            if (malformed) {
+                if (title_on_new_line and dest_line_blank) {
+                    end = dest_line_end;
                 } else return 0;
-            } else return 0;
+            }
         } else {
-            const line_end = std.mem.indexOfScalarPos(u8, text, after_dest, '\n') orelse text.len;
-            if (!isBlankLine(text[after_dest..line_end])) return 0;
-            end = line_end;
+            if (!dest_line_blank) return 0;
+            end = dest_line_end;
         }
 
         const ref_id = try self.builder.addLeaf(.{ .reference = .{ .label = label_owned, .destination = dest_decoded } });

@@ -772,7 +772,17 @@ const Scanner = struct {
                 const del_start = if (opener_count > 0) oi + 1 else oi;
                 const del_end = if (closer_count > 0) closer_idx else closer_idx + 1;
                 self.removeDelimRange(del_start, del_end);
-                closer_idx = if (closer_count > 0) oi + 1 else del_start;
+                // `removeDelimRange(del_start, del_end)` shifts whatever was at
+                // `del_end` down to `del_start`. When the closer still has
+                // delimiters left (`closer_count > 0`) it lived at `del_end`,
+                // so it now sits at `del_start` and must be re-examined there
+                // for a further (earlier) opener -- e.g. `*foo *bar**`, where
+                // the outer `*` still needs the leftover `*` after the inner
+                // match. The old `oi + 1` was only correct when the opener
+                // survived (`opener_count > 0`); with an exhausted opener it
+                // skipped past the shifted-down closer, stranding it as literal
+                // text. `del_start` is right in every case.
+                closer_idx = del_start;
             } else if (!closer.can_open) {
                 // No opener found, and this closer can never itself open --
                 // it will never match anything; drop it from the stack (it
@@ -1684,7 +1694,18 @@ fn isUnicodeWhitespaceCp(cp: u21) bool {
 fn isUnicodePunctuationCp(cp: u21) bool {
     if (cp < 0x80) return isAsciiPunct(@intCast(cp));
     return switch (cp) {
+        // Latin-1 Supplement P/S code points (0.31.2 counts Symbol categories
+        // as punctuation for flanking, so currency like £/¥ blocks emphasis --
+        // spec ex354). The interspersed letters/numbers (ª µ º ² ³ ¹ ¼ ½ ¾ and
+        // the letter ranges) are deliberately excluded.
+        0x00A1, 0x00A7, 0x00B6, 0x00BF => true, // ¡ § ¶ ¿ (Po)
+        0x00A2...0x00A6 => true, // ¢ £ ¤ ¥ ¦ (Sc/So)
+        0x00A8, 0x00A9, 0x00AC, 0x00AE, 0x00AF => true, // ¨ © ¬ ® ¯ (Sk/So/Sm)
+        0x00AB, 0x00BB => true, // « » (Pi/Pf)
+        0x00B0, 0x00B1, 0x00B4, 0x00B7, 0x00B8 => true, // ° ± ´ · ¸ (So/Sm/Sk/Po)
+        0x00D7, 0x00F7 => true, // × ÷ (Sm)
         0x2010...0x2027, 0x2030...0x205E => true, // General Punctuation (dashes, quotes, ellipsis, etc.)
+        0x20A0...0x20BF => true, // Currency Symbols block (€ etc., Sc)
         0x3001...0x303F => true, // CJK punctuation
         0xFF01...0xFF0F, 0xFF1A...0xFF20, 0xFF3B...0xFF40, 0xFF5B...0xFF65 => true, // fullwidth ASCII punctuation
         else => false,
@@ -2142,33 +2163,32 @@ test "span: strong emphasis covers its own delimiters" {
     try testing.expectEqualStrings("abc", Span.of(u8, ast.nodes[strong].content_span.?, s));
 }
 
-test "span: a partially-consumed delimiter run's leftover placeholder still gets an accurate span" {
-    // "*a **b***": the inner "**"+"***" pair stack-matches as a `strong`
-    // covering "**b**" (2 of the closer's 3 delimiters used), leaving the
-    // OUTER single "*" on each side unmatched -- neither the leading nor
-    // the trailing single "*" ever pairs with anything, so both stay
-    // literal `str` leaves (see `spliceEmphasis`'s leftover-placeholder
-    // case) rather than forming an outer `emph`. Every one of these four
-    // top-level nodes -- including the two single-`*` leftovers -- must
-    // still get its own byte-accurate span.
+test "span: a partially-consumed delimiter run pairs its leftover with an outer opener" {
+    // "*a **b***": the `***` closer (3) first pairs 2 of its delimiters with
+    // the inner `**` opener to form `strong` over "**b**", and its leftover
+    // single `*` then pairs with the OUTER leading `*` to form `emph` over
+    // the whole "*a **b***" (CommonMark: <em>a <strong>b</strong></em>). This
+    // leftover-opener re-match is exactly the delimiter-stack bookkeeping in
+    // `processEmphasis` (spec ex409/414/415). Spans must stay byte-accurate
+    // through both the partial consumption and the outer pairing.
     var ast = try parseAndFinishMapped("*a **b***", .{});
     defer ast.deinit();
     const s = "*a **b***";
 
-    const lead_star = ast.nodes[ast.root].first_child.?;
-    try testing.expectEqualStrings("*", Span.of(u8, ast.nodes[lead_star].span, s));
+    const emph = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[emph].kind == .emph);
+    try testing.expectEqualStrings("*a **b***", Span.of(u8, ast.nodes[emph].span, s));
+    try testing.expectEqualStrings("a **b**", Span.of(u8, ast.nodes[emph].content_span.?, s));
+    try testing.expectEqual(@as(?Node.Id, null), ast.nodes[emph].next_sibling);
 
-    const a_space = ast.nodes[lead_star].next_sibling.?;
+    const a_space = ast.nodes[emph].first_child.?;
     try testing.expectEqualStrings("a ", Span.of(u8, ast.nodes[a_space].span, s));
 
     const strong = ast.nodes[a_space].next_sibling.?;
     try testing.expect(ast.nodes[strong].kind == .strong);
     try testing.expectEqualStrings("**b**", Span.of(u8, ast.nodes[strong].span, s));
     try testing.expectEqualStrings("b", Span.of(u8, ast.nodes[strong].content_span.?, s));
-
-    const trail_star = ast.nodes[strong].next_sibling.?;
-    try testing.expectEqualStrings("*", Span.of(u8, ast.nodes[trail_star].span, s));
-    try testing.expectEqual(@as(?Node.Id, null), ast.nodes[trail_star].next_sibling);
+    try testing.expectEqual(@as(?Node.Id, null), ast.nodes[strong].next_sibling);
 }
 
 test "span: an inline link covers '[text](dest)', content_span covers just the text" {

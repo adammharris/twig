@@ -64,16 +64,31 @@ const spec_json = @embedFile("testdata/commonmark-spec-0.31.2.json");
 ///     blockquotes closed ~46 more (List items, Lists).
 ///   - Not arming a list's blank_pending from blank lines *interior* to a
 ///     fenced/HTML leaf block (`block.zig`'s `handleBlankLine`) closed 1 more.
-/// Of the ~56 remaining failures, the notable list corner still open is the
-/// full CommonMark tight/loose determination for blanks nested inside deeper
-/// items/blockquotes (spec ex307/319/320/259/260/280) — needs cmark's
-/// `last_line_blank`/`ends_with_blank_line` finalize-time analysis, since the
-/// owning list can't be known at blank time (a deep blank may belong to an
-/// outer list once the next line pops back to it). The rest are smaller
-/// rendering-convention divergences (percent-encoding of link/image
-/// destinations, `"`-in-text escaping) — still not parsing bugs (`other` is 0).
-/// Bump this as further work lands; never let it drift down.
-pub const BASELINE: usize = 596;
+///   - Correct CommonMark tight/loose determination: a blank line makes only
+///     the *deepest* still-open list loose (not every ancestor), and a blank
+///     scoped inside a nested block quote arms nothing; plus the "a list item
+///     may begin with at most one blank line" empty-item rule. Closed the
+///     whole Lists section (26/26) and all but two List-items cases.
+///   - Text-content `"`→`&quot;` escaping (`escape_text_quotes`) and URL
+///     percent-encoding of link/image/autolink destinations
+///     (`percent_encode_urls`) — both CommonMark render conventions djot lacks
+///     — closed ~34 across Links, Link-ref-defs, and inline text.
+///   - Emphasis delimiter-stack fix (a partially-consumed closer now
+///     re-matches an earlier opener) closed the nested `*foo *bar**` family,
+///     and adding Unicode Symbol categories to the flanking punctuation table
+///     closed the currency-symbol case — Emphasis is now 132/132.
+/// Two List-items cases remain (spec ex259/260): list-item continuation is
+/// matched by ABSOLUTE column, but a nested block quote's prefix width can
+/// differ line-to-line, so a lazily-aligned continuation is measured against
+/// the wrong origin. Fixing them needs block-quote-*relative* column tracking
+/// (cmark's per-container offset model) — deferred as its own change. The rest
+/// of the ~11 failures are Unicode reference-label case-folding (ex206/540),
+/// two link-ref-definition/setext-heading interactions (ex215/216 — a leading
+/// ref def is not part of the paragraph a following `===` would underline, so
+/// it must be stripped before the setext check), tabs, and raw-HTML corners —
+/// still not the kind of structural bug `other` counts (`other` is 0). Bump
+/// this as further work lands; never let it drift down.
+pub const BASELINE: usize = 641;
 
 const SpecExample = struct {
     markdown: []const u8,

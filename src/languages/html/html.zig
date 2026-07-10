@@ -38,6 +38,8 @@ pub const commonmark_render_options: RenderOptions = .{
     .xhtml_void = true,
     .commonmark_image_attrs = true,
     .commonmark_lists = true,
+    .escape_text_quotes = true,
+    .percent_encode_urls = true,
 };
 
 /// Parse forgiving HTML into the shared generic-markup AST.  This is a
