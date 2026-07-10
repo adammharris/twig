@@ -25,8 +25,19 @@ pub const Parser = parser_mod.Parser;
 pub const ParseError = parser_mod.ParseError;
 
 pub const serialize = serializer_mod.serialize;
+pub const serializeOpts = serializer_mod.serializeOpts;
 pub const serializeNode = serializer_mod.serializeNode;
+pub const serializeNodeOpts = serializer_mod.serializeNodeOpts;
 pub const serializeAlloc = serializer_mod.serializeAlloc;
+pub const serializeAllocOpts = serializer_mod.serializeAllocOpts;
+
+/// The HTML render conventions CommonMark's reference output uses (XHTML
+/// void self-close + `src`-before-`alt` image attributes). The markdown
+/// path renders with these; djot keeps the defaults. See `RenderOptions`.
+pub const commonmark_render_options: RenderOptions = .{
+    .xhtml_void = true,
+    .commonmark_image_attrs = true,
+};
 
 /// Parse forgiving HTML into the shared generic-markup AST.  This is a
 /// document-oriented parser rather than a browser DOM implementation: it

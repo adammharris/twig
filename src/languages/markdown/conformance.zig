@@ -33,10 +33,14 @@
 //!     (the actual output's HTML tags substantially overlap the expected
 //!     one's — see `tagOverlapRatio`) but doesn't match byte-for-byte,
 //!     suggesting a shared-printer rendering-convention mismatch (e.g. list
-//!     tight/loose whitespace, void-element self-closing syntax, percent-
-//!     encoding of destinations, `"`-in-text escaping) rather than a
-//!     parsing bug. This module never patches `languages/html/*` to chase
-//!     these — see the mission — it only reports them.
+//!     tight/loose whitespace, percent-encoding of destinations, `"`-in-text
+//!     escaping) rather than a parsing bug. Where a convention genuinely
+//!     differs between formats — CommonMark's XHTML void self-close (`<br />`)
+//!     and `src`-before-`alt` image attributes vs djot's HTML forms — the fix
+//!     is a per-caller flag on the shared printer's `RenderOptions`
+//!     (`Html.commonmark_render_options`), NOT a global edit that would
+//!     regress djot; this runner renders through those options. It still never
+//!     silently mutates the shared printer's defaults to chase a divergence.
 //!   - `other`: neither of the above; most likely a genuine parsing gap or
 //!     bug (as of Phase 2, this is 0 against the vendored suite).
 
@@ -48,15 +52,19 @@ const options_mod = @import("options.zig");
 
 const spec_json = @embedFile("testdata/commonmark-spec-0.31.2.json");
 
-/// Ratchet floor (see this file's module doc comment): the observed Phase 2
-/// pass count against the vendored 0.31.2 suite (652 examples total). Of the
-/// ~156 failures at this baseline, essentially all are shared-printer
+/// Ratchet floor (see this file's module doc comment): the observed pass
+/// count against the vendored 0.31.2 suite (652 examples total). The markdown
+/// path now renders with `Html.commonmark_render_options` (XHTML void
+/// self-close + `src`-before-`alt` image attributes), which closed the two
+/// biggest shared-printer divergence buckets (~53 cases: nearly all of
+/// Images, plus Thematic breaks / Hard line breaks / Setext) and lifted this
+/// from 496. Of the ~103 remaining failures, the dominant bucket is list
+/// tight/loose block-parsing corners (List items + Lists, ~40 cases — a real
+/// parsing gap, already documented in `block.zig`); the rest are smaller
 /// rendering-convention divergences (percent-encoding of link/image
-/// destinations, void-element self-closing syntax, `"`-in-text escaping,
-/// tight-list `<li>` whitespace) or the small set of already-documented
-/// Phase 1 block-parsing corners — not Phase 2 parsing bugs (`other` is 0)
-/// — see this file's test output.
-pub const BASELINE: usize = 496;
+/// destinations, `"`-in-text escaping) — still not Phase 2 parsing bugs
+/// (`other` is 0). Bump this as further work lands; never let it drift down.
+pub const BASELINE: usize = 549;
 
 const SpecExample = struct {
     markdown: []const u8,
@@ -241,7 +249,7 @@ pub fn run(allocator: Allocator, max_failures: usize, failures: *std.ArrayList(F
         };
         defer doc.deinit();
 
-        const rendered = try Html.serializeAlloc(allocator, &doc.ast, null);
+        const rendered = try Html.serializeAllocOpts(allocator, &doc.ast, null, Html.commonmark_render_options);
         if (std.mem.eql(u8, rendered, ex.html)) {
             summary.passed += 1;
             sec.passed += 1;

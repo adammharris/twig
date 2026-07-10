@@ -50,7 +50,12 @@ fn contextFor(doc: *const Document) Html.Context {
 /// printer's own `RenderOptions` -- mirrors `Djot.html.render` exactly.
 pub fn render(allocator: Allocator, doc: *const Document, writer: *Writer, options: RenderOptions) RenderError!void {
     const ctx = contextFor(doc);
-    var r = Html.Renderer.init(allocator, &doc.ast, writer, &ctx, .{ .warn = options.warn });
+    // CommonMark output is XHTML (`<br />`, `<img src=... alt=...>`); route
+    // through the shared printer with those conventions plus this call's
+    // `warn` hook. See `Html.commonmark_render_options`.
+    var render_opts = Html.commonmark_render_options;
+    render_opts.warn = options.warn;
+    var r = Html.Renderer.init(allocator, &doc.ast, writer, &ctx, render_opts);
     defer r.deinit();
     try r.renderNode(doc.ast.root);
 }

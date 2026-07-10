@@ -80,6 +80,18 @@ const Node = AST.Node;
 
 pub const RenderOptions = struct {
     warn: ?*const fn (message: []const u8) void = null,
+    /// Emit void elements (`br`/`img`/`hr`/...) XHTML-style, with a ` />`
+    /// self-close, instead of the bare `>` of HTML5. CommonMark's reference
+    /// output is XHTML (`<br />`); djot's is HTML (`<br>`), so this defaults
+    /// off and the markdown path opts in. Only affects void elements — an
+    /// ordinary element's closer is unchanged.
+    xhtml_void: bool = false,
+    /// Emit an image's synthesized attributes in CommonMark order
+    /// (`src`, `alt`, `title`) rather than djot's (`alt`, `src`, `title`).
+    /// The two formats' reference renderers disagree on this ordering; the
+    /// nodes are identical, only the print order differs. Defaults to djot's
+    /// order; the markdown path opts in.
+    commonmark_image_attrs: bool = false,
 };
 
 /// Djot-shaped render-time side tables, supplied by whatever language module
@@ -277,7 +289,11 @@ pub const Renderer = struct {
     fn renderTag(self: *Renderer, tag: []const u8, id: Node.Id, extra: []const KV) Writer.Error!void {
         try self.writer.print("<{s}", .{tag});
         if (self.hasAttrsOrExtra(id, extra)) try self.renderAttributes(id, extra);
-        try self.writer.writeByte('>');
+        if (self.options.xhtml_void and isVoidElement(tag)) {
+            try self.writer.writeAll(" />");
+        } else {
+            try self.writer.writeByte('>');
+        }
     }
 
     fn renderCloseTag(self: *Renderer, tag: []const u8) Writer.Error!void {
@@ -590,7 +606,7 @@ pub const Renderer = struct {
                 if (std.mem.eql(u8, v.format, "html")) try self.writer.writeAll(v.text);
             },
             .soft_break => try self.writer.writeByte('\n'),
-            .hard_break => try self.writer.writeAll("<br>\n"),
+            .hard_break => try self.writer.writeAll(if (self.options.xhtml_void) "<br />\n" else "<br>\n"),
             .non_breaking_space => try self.writer.writeAll("&nbsp;"),
             .link => |v| try self.renderLinkOrImage(id, v, false),
             .image => |v| try self.renderLinkOrImage(id, v, true),
@@ -717,8 +733,13 @@ pub const Renderer = struct {
                 dest = self.ast.nodes[ref_id].kind.reference.destination;
                 if (is_image) {
                     alt = try self.stringContent(id);
-                    try extra.append(self.allocator, .{ .key = "alt", .value = alt.? });
-                    try extra.append(self.allocator, .{ .key = "src", .value = dest.? });
+                    if (self.options.commonmark_image_attrs) {
+                        try extra.append(self.allocator, .{ .key = "src", .value = dest.? });
+                        try extra.append(self.allocator, .{ .key = "alt", .value = alt.? });
+                    } else {
+                        try extra.append(self.allocator, .{ .key = "alt", .value = alt.? });
+                        try extra.append(self.allocator, .{ .key = "src", .value = dest.? });
+                    }
                 } else {
                     try extra.append(self.allocator, .{ .key = "href", .value = dest.? });
                 }
@@ -735,8 +756,13 @@ pub const Renderer = struct {
         } else {
             if (is_image) {
                 alt = try self.stringContent(id);
-                try extra.append(self.allocator, .{ .key = "alt", .value = alt.? });
-                if (dest) |d| try extra.append(self.allocator, .{ .key = "src", .value = d });
+                if (self.options.commonmark_image_attrs and dest != null) {
+                    try extra.append(self.allocator, .{ .key = "src", .value = dest.? });
+                    try extra.append(self.allocator, .{ .key = "alt", .value = alt.? });
+                } else {
+                    try extra.append(self.allocator, .{ .key = "alt", .value = alt.? });
+                    if (dest) |d| try extra.append(self.allocator, .{ .key = "src", .value = d });
+                }
             } else if (dest) |d| {
                 try extra.append(self.allocator, .{ .key = "href", .value = d });
             }
@@ -766,24 +792,41 @@ pub const Renderer = struct {
 /// them (pass `null` for a tree that has none — see this file's module doc
 /// comment).
 pub fn serializeNode(allocator: Allocator, ast: *const AST, id: Node.Id, writer: *Writer, ctx: ?*const Context) RenderError!void {
-    var r = Renderer.init(allocator, ast, writer, ctx, .{});
+    try serializeNodeOpts(allocator, ast, id, writer, ctx, .{});
+}
+
+/// Like `serializeNode`, but with explicit render-convention `options`
+/// (void self-close, image attribute order). The bare `serializeNode`
+/// delegates here with djot-default options.
+pub fn serializeNodeOpts(allocator: Allocator, ast: *const AST, id: Node.Id, writer: *Writer, ctx: ?*const Context, options: RenderOptions) RenderError!void {
+    var r = Renderer.init(allocator, ast, writer, ctx, options);
     defer r.deinit();
     try r.renderNode(id);
 }
 
 /// Serialize the whole tree (from `ast.root`) to `writer`.
 pub fn serialize(allocator: Allocator, ast: *const AST, writer: *Writer, ctx: ?*const Context) RenderError!void {
-    try serializeNode(allocator, ast, ast.root, writer, ctx);
+    try serializeNodeOpts(allocator, ast, ast.root, writer, ctx, .{});
+}
+
+/// Like `serialize`, but with explicit render-convention `options`.
+pub fn serializeOpts(allocator: Allocator, ast: *const AST, writer: *Writer, ctx: ?*const Context, options: RenderOptions) RenderError!void {
+    try serializeNodeOpts(allocator, ast, ast.root, writer, ctx, options);
 }
 
 /// Convenience wrapper: serialize to an owned string.
 pub fn serializeAlloc(allocator: Allocator, ast: *const AST, ctx: ?*const Context) Allocator.Error![]u8 {
+    return serializeAllocOpts(allocator, ast, ctx, .{});
+}
+
+/// Like `serializeAlloc`, but with explicit render-convention `options`.
+pub fn serializeAllocOpts(allocator: Allocator, ast: *const AST, ctx: ?*const Context, options: RenderOptions) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(allocator);
     defer out.deinit();
     // `Writer.Allocating` only ever fails (`error.WriteFailed`) when its own
     // backing allocation fails, so both halves of `RenderError` collapse to
     // `error.OutOfMemory` here (mirrors `djot/html.zig`'s `renderAlloc`).
-    serialize(allocator, ast, &out.writer, ctx) catch |err| switch (err) {
+    serializeOpts(allocator, ast, &out.writer, ctx, options) catch |err| switch (err) {
         error.WriteFailed, error.OutOfMemory => return error.OutOfMemory,
     };
     return out.toOwnedSlice();
