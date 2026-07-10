@@ -27,6 +27,10 @@ definition_lists: bool = true,
 frontmatter: bool = true,
 /// Not part of GFM; off by default.
 math: bool = false,
+/// Generic directives (the remark/CommonMark "generic directives" proposal:
+/// inline `:name[x]{attrs}`, leaf `::name[x]{attrs}`, container
+/// `:::name{attrs}` ... `:::`). Not part of GFM; off by default, like `math`.
+directives: bool = false,
 
 /// Strict CommonMark: every extension off. Use this to compare Phase 1's
 /// output against the CommonMark spec's own test suite (`conformance.zig`
@@ -40,6 +44,7 @@ pub const commonmark: Options = .{
     .definition_lists = false,
     .frontmatter = false,
     .math = false,
+    .directives = false,
 };
 
 /// GitHub-Flavored Markdown's extension set (tables/strikethrough/task
@@ -54,4 +59,5 @@ pub const gfm: Options = .{
     .definition_lists = false,
     .frontmatter = false,
     .math = false,
+    .directives = false,
 };

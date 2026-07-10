@@ -24,7 +24,7 @@ project to `fig` (which does the same for config formats).
   `ctx=null` for generic input. Djot's `html.zig` is now a 137-line adapter over it.
 - **Markdown** (`src/languages/markdown/`) — CommonMark parser targeting the
   shared AST, rendered via the shared HTML printer. Extensions gated by
-  `ParseOptions` (CommonMark+GFM+extras: math opt-in, rest on). Raw HTML →
+  `ParseOptions` (CommonMark+GFM+extras: math and directives opt-in, rest on). Raw HTML →
   `raw_block`/`raw_inline` (format="html"); frontmatter → raw metadata block.
   - Phase 1 DONE: block structure + basic inline (text, escapes, entities, code
     spans, breaks) + CommonMark 0.31.2 conformance harness (652 vendored
@@ -38,6 +38,20 @@ project to `fig` (which does the same for config formats).
   - Phase 3b DONE: footnotes — `Document.footnotes` table + a `markdown/html.zig`
     adapter (mirrors djot's) that builds an `Html.Context` so the shared printer
     does the numbering/backlinks/endnotes. CLI routes markdown through it.
+  - Phase 3c DONE: generic directives + attributes (`options.directives`, OFF by
+    default like `math` — the colon grammar could otherwise disturb prose). The
+    remark/CommonMark "generic directives" family, NOT djot semantics: inline
+    `:name[label]{attrs}` (`inline.zig`), leaf `::name[label]{attrs}` and
+    container `:::name{attrs}` … `:::` (`block.zig`, a new `ContainerKind
+    .directive` that matches every line with no prefix, closed by a colon-fence
+    of ≥ its own length; nests, interrupts paragraphs, works inside block
+    quotes/lists). New shared-AST kind `directive{form,name}` +
+    `DirectiveForm{text,leaf,container}`; the `{#id .class k=v}` shorthand is a
+    markdown-local one-shot parser (`markdown/attributes.zig`, distinct from
+    djot's event-stream `attributes.zig`) stored in the normal `attrs`
+    side-table. Renders like an element whose tag = the directive name with the
+    shorthand applied (remark-directive's documented default); round-trips
+    through the markdown serializer. Selectors can address it as `directive`.
   - Markdown parsing is now FEATURE-COMPLETE. Remaining markdown work is
     render-side only (Phase 4, below).
 - **CLI** (`src/main.zig` + `src/cli/`) — `twig convert [-i F] [-o html|ast|

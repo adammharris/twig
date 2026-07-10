@@ -178,6 +178,7 @@ fn dupeKind(self: *Builder, kind: Node.Kind) Allocator.Error!Node.Kind {
             .destination = if (v.destination) |d| try self.dupe(d) else null,
             .reference = if (v.reference) |r| try self.dupe(r) else null,
         } },
+        .directive => |v| .{ .directive = .{ .form = v.form, .name = try self.dupe(v.name) } },
         .element => |v| .{ .element = .{ .name = try self.dupe(v.name) } },
         .comment => |v| .{ .comment = try self.dupe(v) },
         .doctype => |v| .{ .doctype = try self.dupe(v) },

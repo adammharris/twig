@@ -88,6 +88,7 @@ const Builder = AST.Builder;
 const Span = @import("../../span.zig");
 const Options = @import("options.zig");
 const inline_mod = @import("inline.zig");
+const attrs_mod = @import("attributes.zig");
 
 /// Re-exported for readability at this file's own call sites -- see
 /// `inline_mod.Segment`'s doc comment for what it means and this file's
@@ -678,7 +679,7 @@ fn normalizeLabel(allocator: Allocator, s: []const u8) Allocator.Error![]u8 {
 
 // ── container / leaf staging types ──────────────────────────────────────
 
-const ContainerKind = enum { document, block_quote, list, list_item, footnote_def };
+const ContainerKind = enum { document, block_quote, list, list_item, footnote_def, directive };
 
 const Container = struct {
     kind: ContainerKind,
@@ -719,8 +720,18 @@ const Container = struct {
     /// list).
     any_task: bool = false,
 
+    // .directive (container directives, `self.options.directives`): the
+    // opening fence's colon count (a closing fence must be at least this
+    // long), the directive name (a borrowed slice of `Parser.source`, stable
+    // for the whole parse), and the parsed `{attrs}` shorthand (owned; freed
+    // in `deinit`, after `popContainer` has copied it into the node).
+    directive_name: []const u8 = "",
+    directive_fence_len: usize = 0,
+    directive_attrs: ?attrs_mod.Parsed = null,
+
     fn deinit(self: *Container, allocator: Allocator) void {
         self.children.deinit(allocator);
+        if (self.directive_attrs) |p| p.deinit(allocator);
     }
 };
 
@@ -1079,9 +1090,21 @@ pub const Parser = struct {
             try self.finishFootnoteDef(&c, line_idx);
             return;
         }
+        if (c.kind == .directive) {
+            const id = try self.builder.addContainer(
+                .{ .directive = .{ .form = .container, .name = c.directive_name } },
+                c.children.items,
+            );
+            self.builder.setSpan(id, Span.init(self.lineStart(c.start_line), self.lineEnd(@min(c.end_line, line_idx))));
+            setContentSpanFromChildren(&self.builder, id);
+            if (c.directive_attrs) |p| try self.builder.setAttrs(id, .{ .entries = p.entries });
+            try self.appendToTop(id);
+            return;
+        }
         const kind: Node.Kind = switch (c.kind) {
             .document => unreachable,
             .footnote_def => unreachable, // handled above
+            .directive => unreachable, // handled above
             .block_quote => .block_quote,
             .list_item => if (c.is_task) .{ .task_list_item = .{ .checked = c.task_checked } } else .list_item,
             .list => if (c.ordered)
@@ -1220,6 +1243,11 @@ pub const Parser = struct {
             switch (c.kind) {
                 .document => unreachable,
                 .list => {},
+                // A container directive imposes no per-line prefix: every line
+                // until its closing colon-fence is content, at whatever
+                // indentation it's written (like a djot fenced div). So it
+                // always "matches" and consumes nothing, exactly like `.list`.
+                .directive => {},
                 .block_quote => {
                     const nc = matchBlockQuote(line, cur) orelse break;
                     cur = nc;
@@ -1569,6 +1597,7 @@ pub const Parser = struct {
         if (indent >= 4) return false;
         const s = stripUpTo3Indent(remainder);
         if (s.len > 0 and s[0] == '>') return true;
+        if (self.options.directives and self.looksLikeDirective(s)) return true;
         if (isThematicBreak(s)) return true;
         if (tryAtxHeading(s) != null) return true;
         if (tryFenceOpen(s) != null) return true;
@@ -1591,6 +1620,152 @@ pub const Parser = struct {
             }
         }
         return false;
+    }
+
+    // ── generic directives (`self.options.directives`) ──────────────────
+
+    /// Leading `:` run length of `s`.
+    fn countColons(s: []const u8) usize {
+        var n: usize = 0;
+        while (n < s.len and s[n] == ':') n += 1;
+        return n;
+    }
+
+    /// Pure predicate for `canInterruptParagraph`: does `s` (indent already
+    /// stripped) begin a container opening/closing fence or a leaf directive?
+    fn looksLikeDirective(self: *Parser, s: []const u8) bool {
+        const n = countColons(s);
+        if (n >= 3) {
+            if (isBlankLine(s[n..])) return self.innermostDirectiveIndex(n) != null; // close
+            return attrs_mod.scanName(s, n) != null; // open
+        }
+        if (n == 2) return attrs_mod.scanName(s, 2) != null; // leaf
+        return false;
+    }
+
+    /// Index (on `self.stack`) of the innermost open container directive that
+    /// a closing fence of `close_len` colons would close — i.e. the topmost
+    /// `.directive` whose own opening fence is no longer than `close_len`.
+    /// `null` if there is none (the fence is then just content).
+    fn innermostDirectiveIndex(self: *Parser, close_len: usize) ?usize {
+        var i = self.stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            const c = &self.stack.items[i];
+            if (c.kind == .directive) {
+                return if (c.directive_fence_len <= close_len) i else null;
+            }
+        }
+        return null;
+    }
+
+    const DirectiveOpen = struct { name: []const u8, attrs: ?attrs_mod.Parsed };
+
+    /// Parse a container directive opening fence: `n` colons already counted,
+    /// a name directly after them, an optional (ignored) `[label]`, an
+    /// optional `{attrs}`, then nothing but whitespace. `null` if malformed.
+    fn parseDirectiveOpen(self: *Parser, s: []const u8, n: usize) Allocator.Error!?DirectiveOpen {
+        const name_end = attrs_mod.scanName(s, n) orelse return null;
+        const name = s[n..name_end];
+        var i = name_end;
+        // A container directive's `[label]` isn't represented (its children
+        // are blocks, not inline) — consume and drop it if present.
+        if (i < s.len and s[i] == '[') {
+            if (inline_mod.scanBracketLabel(s, i)) |raw| i = raw.end;
+        }
+        var attrs: ?attrs_mod.Parsed = null;
+        if (i < s.len and s[i] == '{') {
+            if (try attrs_mod.parse(self.allocator, s, i)) |p| {
+                attrs = p;
+                i = p.end;
+            }
+        }
+        if (!isBlankLine(s[i..])) {
+            if (attrs) |p| p.deinit(self.allocator);
+            return null;
+        }
+        return .{ .name = name, .attrs = attrs };
+    }
+
+    /// Handle a leaf directive line `::name[label]{attrs}` (exactly two
+    /// colons). Emits the node (its `[label]` deferred to inline resolution)
+    /// and returns true, or returns false if `s` isn't a valid leaf directive.
+    fn parseLeafDirective(self: *Parser, s: []const u8, idx: usize, interrupting: bool) Allocator.Error!bool {
+        const name_end = attrs_mod.scanName(s, 2) orelse return false;
+        const name = s[2..name_end];
+        var i = name_end;
+        var label: ?[]const u8 = null;
+        if (i < s.len and s[i] == '[') {
+            if (inline_mod.scanBracketLabel(s, i)) |raw| {
+                label = raw.content;
+                i = raw.end;
+            }
+        }
+        var attrs: ?attrs_mod.Parsed = null;
+        if (i < s.len and s[i] == '{') {
+            if (try attrs_mod.parse(self.allocator, s, i)) |p| {
+                attrs = p;
+                i = p.end;
+            }
+        }
+        if (!isBlankLine(s[i..])) {
+            if (attrs) |p| p.deinit(self.allocator);
+            return false;
+        }
+        defer if (attrs) |p| p.deinit(self.allocator);
+
+        if (interrupting) try self.closeLeaf(idx);
+        try self.maybeCloseTopList(idx, null);
+        self.markListsLoose();
+
+        const kind: Node.Kind = .{ .directive = .{ .form = .leaf, .name = name } };
+        const id = if (label) |lab| blk: {
+            const seg = self.singleSegment(lab);
+            break :blk try self.addDeferredTextNode(kind, lab, &seg, idx, idx);
+        } else blk: {
+            const nid = try self.builder.addNode(kind);
+            self.builder.setSpan(nid, Span.init(self.lineStart(idx), self.lineEnd(idx)));
+            break :blk nid;
+        };
+        if (attrs) |p| try self.builder.setAttrs(id, .{ .entries = p.entries });
+        try self.appendToTop(id);
+        return true;
+    }
+
+    /// Dispatch the three directive forms for a line whose indent is already
+    /// stripped into `s`. Returns true if it consumed the line.
+    fn tryStartDirective(self: *Parser, s: []const u8, idx: usize, interrupting: bool) Allocator.Error!bool {
+        const n = countColons(s);
+        if (n < 2) return false;
+
+        if (n >= 3) {
+            // Closing fence: colons only.
+            if (isBlankLine(s[n..])) {
+                const d_idx = self.innermostDirectiveIndex(n) orelse return false;
+                self.stack.items[d_idx].end_line = idx;
+                try self.closeToDepth(d_idx, idx);
+                return true;
+            }
+            // Opening container fence.
+            if (try self.parseDirectiveOpen(s, n)) |open| {
+                // Until ownership of `open.attrs` transfers to the container
+                // below, free it on any error path.
+                errdefer if (open.attrs) |p| p.deinit(self.allocator);
+                if (interrupting) try self.closeLeaf(idx);
+                try self.maybeCloseTopList(idx, null);
+                self.markListsLoose();
+                try self.pushContainer(.directive, idx);
+                const c = self.top();
+                c.directive_name = open.name;
+                c.directive_fence_len = n;
+                c.directive_attrs = open.attrs;
+                return true;
+            }
+            return false;
+        }
+
+        // n == 2: leaf directive.
+        return self.parseLeafDirective(s, idx, interrupting);
     }
 
     /// Attempt to recognize and consume one or more new block starts
@@ -1620,6 +1795,15 @@ pub const Parser = struct {
             if (indent < 4) {
                 const s = stripUpTo3Indent(remainder);
                 const indent_bytes = remainder.len - s.len;
+
+                // Generic directives (`self.options.directives`): a container
+                // opening/closing colon-fence or a leaf directive, all led by
+                // colons — which no other CommonMark block start uses, so this
+                // can go first without shadowing anything. Consumes the whole
+                // line when it matches.
+                if (self.options.directives) {
+                    if (try self.tryStartDirective(s, idx, interrupting)) return true;
+                }
 
                 if (s.len > 0 and s[0] == '>') {
                     if (interrupting) try self.closeLeaf(idx);
@@ -3041,3 +3225,102 @@ test "frontmatter OFF: a leading '---' is an ordinary CommonMark thematic break"
     const para = r.ast.nodes[first].next_sibling.?;
     try testing.expect(r.ast.nodes[para].kind == .para);
 }
+
+// ── generic directives (`options.directives`) ───────────────────────────
+
+const directives_on: Options = .{ .directives = true };
+
+fn firstChild(ast: anytype, id: Node.Id) Node.Id {
+    return ast.nodes[id].first_child.?;
+}
+
+test "container directive: name becomes an element tag, attrs applied" {
+    const html = try renderHtml(":::note{#n .box}\nHello *world*\n:::\n", directives_on);
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings("<note id=\"n\" class=\"box\">\n<p>Hello <em>world</em></p>\n</note>\n", html);
+}
+
+test "container directive: AST node kind/form/name/attrs" {
+    var r = try parse(testing.allocator, ":::warning\ncontent\n:::\n", directives_on);
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const dir = firstChild(r.ast, r.ast.root);
+    try testing.expect(r.ast.nodes[dir].kind == .directive);
+    try testing.expectEqual(AST.DirectiveForm.container, r.ast.nodes[dir].kind.directive.form);
+    try testing.expectEqualStrings("warning", r.ast.nodes[dir].kind.directive.name);
+    const para = firstChild(r.ast, dir);
+    try testing.expect(r.ast.nodes[para].kind == .para);
+}
+
+test "container directive: nested blocks (list) parse as blocks" {
+    var r = try parse(testing.allocator, ":::box\n- a\n- b\n:::\n", directives_on);
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const dir = firstChild(r.ast, r.ast.root);
+    const list = firstChild(r.ast, dir);
+    try testing.expect(r.ast.nodes[list].kind == .bullet_list);
+}
+
+test "nested container directives, longer fence outside" {
+    const html = try renderHtml("::::outer\n:::inner\nhi\n:::\n::::\n", directives_on);
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings("<outer>\n<inner>\n<p>hi</p>\n</inner>\n</outer>\n", html);
+}
+
+test "leaf directive: single line, label is inline content" {
+    const html = try renderHtml("::youtube[A caption]{#v}\n", directives_on);
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings("<youtube id=\"v\">A caption</youtube>\n", html);
+}
+
+test "leaf directive: AST kind and no-label case" {
+    var r = try parse(testing.allocator, "::hr\n", directives_on);
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const dir = firstChild(r.ast, r.ast.root);
+    try testing.expect(r.ast.nodes[dir].kind == .directive);
+    try testing.expectEqual(AST.DirectiveForm.leaf, r.ast.nodes[dir].kind.directive.form);
+    try testing.expectEqual(@as(?Node.Id, null), r.ast.nodes[dir].first_child);
+}
+
+test "container directive interrupts a paragraph" {
+    var r = try parse(testing.allocator, "text\n:::box\nin\n:::\n", directives_on);
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const para = firstChild(r.ast, r.ast.root);
+    try testing.expect(r.ast.nodes[para].kind == .para);
+    const dir = r.ast.nodes[para].next_sibling.?;
+    try testing.expect(r.ast.nodes[dir].kind == .directive);
+}
+
+test "unterminated container directive stays open to end of document" {
+    const html = try renderHtml(":::box\nhi\n", directives_on);
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings("<box>\n<p>hi</p>\n</box>\n", html);
+}
+
+test "directives OFF: colon-fence lines are ordinary paragraphs" {
+    var r = try parse(testing.allocator, ":::note\nhi\n:::\n", .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    // Everything is one paragraph; no directive node anywhere.
+    for (r.ast.nodes) |n| try testing.expect(n.kind != .directive);
+}
+
+test "container directive inside a block quote" {
+    const html = try renderHtml("> :::box\n> hi\n> :::\n", directives_on);
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings("<blockquote>\n<box>\n<p>hi</p>\n</box>\n</blockquote>\n", html);
+}
+
+test "text directive renders inline as its named element" {
+    const html = try renderHtml("See :abbr[HTML]{title=\"HyperText\"} here.\n", directives_on);
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings("<p>See <abbr title=\"HyperText\">HTML</abbr> here.</p>\n", html);
+}
+

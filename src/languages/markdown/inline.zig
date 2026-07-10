@@ -72,6 +72,7 @@ const Builder = AST.Builder;
 const Span = @import("../../span.zig");
 const entities = @import("entities.zig");
 const Options = @import("options.zig");
+const attrs_mod = @import("attributes.zig");
 
 /// One contiguous run of a leaf block's assembled `text` that maps 1:1 onto
 /// real source bytes: `text[buf_offset..buf_offset+len]` is byte-for-byte
@@ -420,6 +421,25 @@ fn runScan(sc: *Scanner, text: []const u8) Allocator.Error![]Node.Id {
                     i = end;
                 } else {
                     try sc.buf.append(b.allocator, '@');
+                    i += 1;
+                }
+            },
+            ':' => {
+                // Text (inline) directive (`self.options.directives`):
+                // `:name[label]{attrs}` — single colon, name, optional
+                // bracketed inline label, optional attribute shorthand. The
+                // label (if present) is parsed as inline content and becomes
+                // the directive node's children.
+                const td: ?TextDirective = if (sc.options.directives) try scanTextDirective(b.allocator, text, i) else null;
+                if (td) |d| {
+                    try sc.flushBuf(i);
+                    const id = try buildTextDirective(sc, d);
+                    sc.setSpanIfMapped(id, i, d.end);
+                    if (d.label) |lab| sc.setContentSpanIfMapped(id, lab.start, lab.end);
+                    _ = try sc.appendItem(id);
+                    i = d.end;
+                } else {
+                    try sc.buf.append(b.allocator, ':');
                     i += 1;
                 }
             },
@@ -1214,7 +1234,7 @@ fn scanInlineLinkTail(text: []const u8, start: usize) ?RawLinkTail {
     return .{ .dest_raw = dest_raw, .title_raw = title_raw, .end = i + 1 };
 }
 
-const RawLabel = struct { content: []const u8, end: usize };
+pub const RawLabel = struct { content: []const u8, end: usize };
 
 /// `text[start] == '['`. Scans a link LABEL (as opposed to link TEXT --
 /// no nested brackets allowed at all, even balanced ones, per spec) up to
@@ -1222,7 +1242,7 @@ const RawLabel = struct { content: []const u8, end: usize };
 /// appears before the close (an invalid label, per spec's "cannot contain
 /// unescaped brackets" rule) or the label exceeds the spec's 999-character
 /// cap.
-fn scanBracketLabel(text: []const u8, start: usize) ?RawLabel {
+pub fn scanBracketLabel(text: []const u8, start: usize) ?RawLabel {
     var i = start + 1;
     const content_start = i;
     while (i < text.len) : (i += 1) {
@@ -1237,6 +1257,73 @@ fn scanBracketLabel(text: []const u8, start: usize) ?RawLabel {
     if (i >= text.len or text[i] != ']') return null;
     if (i - content_start > 999) return null;
     return .{ .content = text[content_start..i], .end = i + 1 };
+}
+
+// ── Phase 3: text directives (`self.options.directives`) ───────────────
+
+/// The parsed pieces of a text directive `:name[label]{attrs}`. `name`/`label`
+/// slice into the scan's `text`; `attrs` (if any) is freshly allocated and
+/// owned by the `TextDirective` — `buildTextDirective` consumes and frees it.
+/// The inner text of a directive's `[label]` and its absolute byte range
+/// within the scan's `text` (used for the directive node's `content_span`).
+const DirectiveLabel = struct { text: []const u8, start: usize, end: usize };
+
+const TextDirective = struct {
+    name: []const u8,
+    /// `null` when the directive has no `[label]` bracket.
+    label: ?DirectiveLabel,
+    attrs: ?attrs_mod.Parsed,
+    end: usize,
+};
+
+/// `text[at] == ':'`. Recognize a text directive: a single colon, a directive
+/// name (must start with a letter — so `10:30`/`ratio 3:4` never match), then
+/// an optional `[label]` and optional `{attrs}` (at least one of which, or the
+/// bare name, is enough — matching remark, where a bare `:name` is valid).
+/// Returns `null` for anything that isn't a well-formed directive; a
+/// malformed `{...}` simply ends the directive before it rather than failing
+/// the whole match (the `{` becomes literal text after the directive).
+fn scanTextDirective(allocator: Allocator, text: []const u8, at: usize) Allocator.Error!?TextDirective {
+    const name_end = attrs_mod.scanName(text, at + 1) orelse return null;
+    const name = text[at + 1 .. name_end];
+
+    var i = name_end;
+    var label: ?DirectiveLabel = null;
+    if (i < text.len and text[i] == '[') {
+        if (scanBracketLabel(text, i)) |raw| {
+            label = .{ .text = raw.content, .start = i + 1, .end = raw.end - 1 };
+            i = raw.end;
+        }
+    }
+
+    var attrs: ?attrs_mod.Parsed = null;
+    if (i < text.len and text[i] == '{') {
+        if (try attrs_mod.parse(allocator, text, i)) |p| {
+            attrs = p;
+            i = p.end;
+        }
+    }
+
+    return .{ .name = name, .label = label, .attrs = attrs, .end = i };
+}
+
+/// Build the `directive` node for a scanned text directive: parse its label as
+/// inline children, attach the shorthand attributes, and free the transient
+/// `TextDirective.attrs`.
+fn buildTextDirective(sc: *Scanner, d: TextDirective) Allocator.Error!Node.Id {
+    const b = sc.b;
+    const children: []Node.Id = if (d.label) |lab|
+        try parseInline(b, lab.text, &.{}, sc.link_refs, sc.options)
+    else
+        &.{};
+    defer if (children.len > 0) b.allocator.free(children);
+
+    const id = try b.addContainer(.{ .directive = .{ .form = .text, .name = d.name } }, children);
+    if (d.attrs) |p| {
+        defer p.deinit(b.allocator);
+        try b.setAttrs(id, .{ .entries = p.entries });
+    }
+    return id;
 }
 
 // ── Phase 3: footnote references (`self.options.footnotes`) ────────────
@@ -1962,6 +2049,60 @@ test "plain text becomes a single str node" {
     defer ast.deinit();
     const child = ast.nodes[ast.root].first_child.?;
     try testing.expectEqualStrings("hello world", ast.nodes[child].kind.str);
+}
+
+const directives_on: Options = .{ .directives = true };
+
+test "text directive with label and attrs" {
+    var ast = try parseAndFinishWithOptions(":abbr[HTML]{title=\"HyperText\" .up}", directives_on);
+    defer ast.deinit();
+    const dir = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[dir].kind == .directive);
+    try testing.expectEqual(AST.DirectiveForm.text, ast.nodes[dir].kind.directive.form);
+    try testing.expectEqualStrings("abbr", ast.nodes[dir].kind.directive.name);
+    // label parsed as inline children
+    const label_child = ast.nodes[dir].first_child.?;
+    try testing.expectEqualStrings("HTML", ast.nodes[label_child].kind.str);
+    // attrs
+    const attrs = ast.attrsOf(dir);
+    try testing.expectEqualStrings("HyperText", attrs.get("title").?);
+    try testing.expectEqualStrings("up", attrs.get("class").?);
+}
+
+test "bare text directive (no label, no attrs)" {
+    var ast = try parseAndFinishWithOptions(":here", directives_on);
+    defer ast.deinit();
+    const dir = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[dir].kind == .directive);
+    try testing.expectEqualStrings("here", ast.nodes[dir].kind.directive.name);
+    try testing.expectEqual(@as(?Node.Id, null), ast.nodes[dir].first_child);
+}
+
+test "text directive label parses nested inline" {
+    var ast = try parseAndFinishWithOptions(":span[a *b* c]", directives_on);
+    defer ast.deinit();
+    const dir = ast.nodes[ast.root].first_child.?;
+    const first = ast.nodes[dir].first_child.?;
+    try testing.expectEqualStrings("a ", ast.nodes[first].kind.str);
+    const emph = ast.nodes[first].next_sibling.?;
+    try testing.expect(ast.nodes[emph].kind == .emph);
+}
+
+test "colon not starting a valid directive stays literal" {
+    // digit-led name is not a directive; whole thing is text
+    var ast = try parseAndFinishWithOptions("ratio 3:4 mix", directives_on);
+    defer ast.deinit();
+    const child = ast.nodes[ast.root].first_child.?;
+    try testing.expectEqualStrings("ratio 3:4 mix", ast.nodes[child].kind.str);
+}
+
+test "directives disabled: no directive node is produced" {
+    var ast = try parseAndFinishWithOptions(":abbr[HTML]", .{});
+    defer ast.deinit();
+    for (ast.nodes) |n| try testing.expect(n.kind != .directive);
+    // the colon in particular is plain literal text
+    const child = ast.nodes[ast.root].first_child.?;
+    try testing.expectEqualStrings(":abbr", ast.nodes[child].kind.str);
 }
 
 test "backslash escape yields the literal punctuation character" {

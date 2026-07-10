@@ -167,6 +167,19 @@ pub const Node = struct {
         delete,
         double_quoted,
         single_quoted,
+        /// A generic directive (the CommonMark/remark "generic directives"
+        /// proposal, as implemented by `micromark-extension-directive`).
+        /// `name` is the directive TYPE (`note`, `youtube`, `abbr`, ...), no
+        /// leading colon(s); `form` distinguishes the three surface syntaxes
+        /// (see `DirectiveForm`). Any `{#id .class key=val}` shorthand goes in
+        /// the normal `attrs` side-table; a text/leaf directive's `[label]`
+        /// and a container directive's body become the node's children (inline
+        /// children for `text`/`leaf`, block children for `container`).
+        /// Distinct from `element` so a directive round-trips back to `:::`
+        /// syntax rather than to an HTML tag, and so selectors can address it
+        /// as a directive. Produced only by the Markdown parser (behind
+        /// `ParseOptions.directives`); other languages never emit it.
+        directive: struct { form: DirectiveForm, name: []const u8 },
 
         // ── Generic markup ────────────────────────────────────────────────
         /// A named element with no semantic mapping (HTML `<video>`,
@@ -239,6 +252,15 @@ pub const Attrs = struct {
         return kv.value;
     }
 };
+
+/// The three surface forms a generic `directive` can take, distinguished by
+/// the number of leading colons and whether it fences a block:
+///   - `text`: inline, single colon — `:name[label]{attrs}`.
+///   - `leaf`: block, double colon, one line — `::name[label]{attrs}`.
+///   - `container`: block, triple(+) colon fence — `:::name{attrs}` ... `:::`.
+/// Governs both how the Markdown serializer re-emits the node and how many
+/// (and what kind of) children it carries.
+pub const DirectiveForm = enum { text, leaf, container };
 
 pub const BulletListStyle = enum { dash, plus, star };
 

@@ -252,6 +252,12 @@ fn writeKindPayload(w: *Stringify, kind: Node.Kind) Writer.Error!void {
             try w.objectField("reference");
             try w.write(l.reference);
         },
+        .directive => |d| {
+            try w.objectField("form");
+            try w.write(d.form);
+            try w.objectField("name");
+            try w.write(d.name);
+        },
         .element => |e| {
             try w.objectField("name");
             try w.write(e.name);

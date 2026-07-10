@@ -197,8 +197,9 @@ fn percentEncodeHref(allocator: Allocator, url: []const u8) Allocator.Error![]u8
 /// (RCDATA elements — `textarea`/`title` — are deliberately absent: their
 /// content *is* escaped, the normal path.) Mirrors the parser's `isRawText`.
 const raw_text_elements = std.StaticStringMap(void).initComptime(.{
-    .{"script"},   .{"style"},     .{"xmp"},
-    .{"iframe"},   .{"noembed"},   .{"noframes"}, .{"plaintext"},
+    .{"script"},    .{"style"},   .{"xmp"},
+    .{"iframe"},    .{"noembed"}, .{"noframes"},
+    .{"plaintext"},
 });
 
 fn isRawTextElement(name: []const u8) bool {
@@ -386,6 +387,10 @@ pub const Renderer = struct {
             // is deliberately absent: it must preserve the enclosing list's
             // tightness for its own paragraphs to consume.
             .block_quote, .div, .section => self.tight = false,
+            // A container directive's block children are never tight (same as
+            // div/blockquote); text/leaf forms have inline children, so the
+            // reset is harmless for them.
+            .directive => self.tight = false,
             else => {},
         }
         var it = self.ast.children(id);
@@ -718,6 +723,18 @@ pub const Renderer = struct {
             .delete => try self.inTags("del", id, 0, &.{}),
             .superscript => try self.inTags("sup", id, 0, &.{}),
             .subscript => try self.inTags("sub", id, 0, &.{}),
+
+            // Generic directives render like an element whose tag name is the
+            // directive name, with the `{#id .class k=v}` shorthand applied as
+            // attributes — the documented default of remark-directive /
+            // `mdast-util-directive` (`:::main{#x}` -> `<main id="x">…</main>`).
+            // `text` is inline (no surrounding newlines); `leaf`/`container`
+            // are block-level.
+            .directive => |d| switch (d.form) {
+                .text => try self.inTags(d.name, id, 0, &.{}),
+                .leaf => try self.inTags(d.name, id, 1, &.{}),
+                .container => try self.inTags(d.name, id, 2, &.{}),
+            },
 
             // ── generic markup (net-new relative to djot/html.zig) ────────
             // See this file's module doc comment for the rationale behind

@@ -576,6 +576,22 @@ test "parse: dangling '>' and trailing junk are rejected" {
     try testing.expectError(error.InvalidSelector, parse(testing.allocator, "list !bad"));
 }
 
+test "resolveAll: a directive node is addressable by its kind name" {
+    const Markdown = @import("../languages/markdown/markdown.zig");
+    var doc = try Markdown.parse(testing.allocator, ":::note\nhi\n:::\n\n::leaf\n", .{ .directives = true });
+    doc.link_references.deinit(testing.allocator);
+    doc.footnotes.deinit(testing.allocator);
+    var ast = doc.ast;
+    defer ast.deinit();
+
+    var sel = try parse(testing.allocator, "directive");
+    defer sel.deinit();
+    const ms = try resolveAll(testing.allocator, &ast, &sel);
+    defer testing.allocator.free(ms);
+    try testing.expectEqual(@as(usize, 2), ms.len);
+    try testing.expect(ast.nodes[ms[0].id].kind == .directive);
+}
+
 test "resolveAll: matches by kind across a real markdown tree" {
     var ast = try parseMd(testing.allocator, "# One\n\n## Two\n\n- a\n- b\n");
     defer ast.deinit();

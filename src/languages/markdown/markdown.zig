@@ -130,6 +130,7 @@ pub fn parse(allocator: Allocator, source: []const u8, options: ParseOptions) Al
 
 test {
     _ = @import("entities.zig");
+    _ = @import("attributes.zig");
     _ = inline_mod;
     _ = block;
     _ = @import("html.zig");

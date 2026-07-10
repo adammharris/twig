@@ -85,6 +85,65 @@ const Renderer = struct {
         try self.writer.writeAll(rest);
     }
 
+    /// Re-emit a directive's `{#id .class key=val}` attribute shorthand from
+    /// the node's `attrs` side-table (nothing if it has none). Reverses the
+    /// parse-time accumulation: `id` -> `#id`, `class` -> `.a .b` (its
+    /// space-joined value split back into individual `.`-classes), every other
+    /// key -> `key=value`, quoting the value when it contains characters the
+    /// bare-value grammar can't hold. Order follows the side-table's stored
+    /// order, so a round-trip preserves how the attributes were written.
+    fn writeDirectiveAttrs(self: *Renderer, id: Node.Id) Writer.Error!void {
+        const attrs = self.ast.attrsOf(id);
+        if (attrs.isEmpty()) return;
+        try self.writer.writeByte('{');
+        var first = true;
+        for (attrs.entries) |kv| {
+            if (std.mem.eql(u8, kv.key, "id")) {
+                if (kv.value) |v| {
+                    if (!first) try self.writer.writeByte(' ');
+                    try self.writer.print("#{s}", .{v});
+                    first = false;
+                }
+            } else if (std.mem.eql(u8, kv.key, "class")) {
+                const v = kv.value orelse "";
+                var it = std.mem.tokenizeScalar(u8, v, ' ');
+                while (it.next()) |cls| {
+                    if (!first) try self.writer.writeByte(' ');
+                    try self.writer.print(".{s}", .{cls});
+                    first = false;
+                }
+            } else {
+                if (!first) try self.writer.writeByte(' ');
+                try self.writer.writeAll(kv.key);
+                if (kv.value) |v| {
+                    try self.writer.writeByte('=');
+                    if (needsQuoting(v)) {
+                        try self.writer.writeByte('"');
+                        for (v) |c| {
+                            if (c == '"' or c == '\\') try self.writer.writeByte('\\');
+                            try self.writer.writeByte(c);
+                        }
+                        try self.writer.writeByte('"');
+                    } else {
+                        try self.writer.writeAll(v);
+                    }
+                }
+                first = false;
+            }
+        }
+        try self.writer.writeByte('}');
+    }
+
+    /// A bare (unquoted) attribute value may only hold name characters; empty
+    /// or anything else must be quoted.
+    fn needsQuoting(v: []const u8) bool {
+        if (v.len == 0) return true;
+        for (v) |c| {
+            if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == ':')) return true;
+        }
+        return false;
+    }
+
     fn fenceTicks(text: []const u8, min: usize) usize {
         var best = min;
         var i: usize = 0;
@@ -340,6 +399,36 @@ const Renderer = struct {
                 try self.writePrefix(ctx);
                 try self.writer.writeAll(":::\n");
             },
+            .directive => |d| switch (d.form) {
+                // A block directive at block level is a leaf (`::name…`) or a
+                // container (`:::name…` … `:::`); a `text` directive only
+                // appears inline, so route a stray one there defensively.
+                .text => {
+                    try self.writePrefix(ctx);
+                    try self.renderInline(id, ctx);
+                    try self.writer.writeByte('\n');
+                },
+                .leaf => {
+                    try self.writePrefix(ctx);
+                    try self.writer.print("::{s}", .{d.name});
+                    if (self.ast.nodes[id].first_child != null) {
+                        try self.writer.writeByte('[');
+                        try self.renderInlineChildren(id, ctx);
+                        try self.writer.writeByte(']');
+                    }
+                    try self.writeDirectiveAttrs(id);
+                    try self.writer.writeByte('\n');
+                },
+                .container => {
+                    try self.writePrefix(ctx);
+                    try self.writer.print(":::{s}", .{d.name});
+                    try self.writeDirectiveAttrs(id);
+                    try self.writer.writeByte('\n');
+                    try self.renderBlocks(id, ctx, true);
+                    try self.writePrefix(ctx);
+                    try self.writer.writeAll(":::\n");
+                },
+            },
             .reference => {},
             .footnote => {},
             .element => |e| {
@@ -436,6 +525,19 @@ const Renderer = struct {
                 if (im.destination) |dest| try self.writer.print("({s})", .{dest}) else if (im.reference) |lab| try self.writer.print("[{s}]", .{lab});
             },
             .span => try self.renderInlineChildren(id, ctx),
+            .directive => |d| {
+                // Inline (text) directive `:name[label]{attrs}`. A leaf/
+                // container form shouldn't reach the inline path, but if one
+                // does, emitting the single-colon inline form is the safe
+                // lossy fallback.
+                try self.writer.print(":{s}", .{d.name});
+                if (node.first_child != null) {
+                    try self.writer.writeByte('[');
+                    try self.renderInlineChildren(id, ctx);
+                    try self.writer.writeByte(']');
+                }
+                try self.writeDirectiveAttrs(id);
+            },
             .mark => {
                 try self.writer.writeAll("==");
                 try self.renderInlineChildren(id, ctx);
@@ -586,4 +688,55 @@ test "serializeAlloc: a loose bullet list's first paragraph starts on the marker
     // to column 0.
     try testing.expect(std.mem.indexOf(u8, out, "- one\n  two\n\n- three\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "- \n") == null);
+}
+
+// ── generic directives ──────────────────────────────────────────────────
+
+const directives_on: markdown.ParseOptions = .{ .directives = true };
+
+fn serializeWith(source: []const u8, options: markdown.ParseOptions) ![]u8 {
+    var doc = try markdown.parse(testing.allocator, source, options);
+    defer doc.deinit();
+    return serializeAlloc(testing.allocator, &doc);
+}
+
+test "container directive serializes back to :::name{attrs}" {
+    const out = try serializeWith(":::note{#n .box}\nHello\n:::\n", directives_on);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(":::note{#n .box}\nHello\n:::\n", out);
+}
+
+test "leaf directive serializes back to ::name[label]{attrs}" {
+    const out = try serializeWith("::youtube[A caption]{#v}\n", directives_on);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("::youtube[A caption]{#v}\n", out);
+}
+
+test "text directive serializes back to :name[label]{attrs}" {
+    // An all-alphanumeric value needs no quotes, so it canonicalizes bare.
+    const out = try serializeWith("See :abbr[HTML]{title=HyperText} ok.\n", directives_on);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("See :abbr[HTML]{title=HyperText} ok.\n", out);
+}
+
+test "attribute value with a space is quoted on the way out" {
+    const out = try serializeWith(":span[x]{title=\"a b\"}\n", directives_on);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(":span[x]{title=\"a b\"}\n", out);
+}
+
+test "directive round-trips are stable (parse->print->parse->print)" {
+    const cases = [_][]const u8{
+        ":::warning\ntext\n:::\n",
+        "::hr\n",
+        ":here\n",
+        ":::box{.a .b key=val}\n- x\n- y\n:::\n",
+    };
+    for (cases) |src| {
+        const first = try serializeWith(src, directives_on);
+        defer testing.allocator.free(first);
+        const second = try serializeWith(first, directives_on);
+        defer testing.allocator.free(second);
+        try testing.expectEqualStrings(first, second);
+    }
 }
