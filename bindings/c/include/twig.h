@@ -18,10 +18,24 @@ typedef enum TwigStatus {
     TWIG_STATUS_PARSE_ERROR = 2,
     TWIG_STATUS_OUT_OF_MEMORY = 3,
     TWIG_STATUS_UNSUPPORTED_FORMAT = 4,
+    // Editor-only. A locator resolved to no node (out-of-bounds index path, or
+    // a selector with zero matches).
+    TWIG_STATUS_NOT_FOUND = 5,
+    // Editor-only. A selector locator matched more than one node.
+    TWIG_STATUS_AMBIGUOUS = 6,
+    // Editor-only. The target node has no editable span/interior.
+    TWIG_STATUS_NOT_EDITABLE = 7,
+    // Editor-only. The edit produced a document that no longer parses; it was
+    // rolled back and nothing changed.
+    TWIG_STATUS_EDIT_CONFLICT = 8,
     TWIG_STATUS_INTERNAL_ERROR = 255,
 } TwigStatus;
 
 typedef struct TwigDocument TwigDocument;
+
+// A span-splice editor over a document: applies lossless, in-place edits and
+// reparses after each one. Independent of TwigDocument.
+typedef struct TwigEditor TwigEditor;
 
 // A byte range [start, end) into the source.
 typedef struct TwigSpan {
@@ -110,6 +124,108 @@ TwigStatus twig_document_ast_json(
 // destroyed.
 TwigStatus twig_document_query(
     TwigDocument *doc,
+    const uint8_t *selector,
+    size_t selector_len,
+    const TwigQueryMatch **out_ptr,
+    size_t *out_len
+);
+
+// ── Editor ──────────────────────────────────────────────────────────────────
+// Lossless, in-place span-splice editing. Create an editor over some source,
+// apply edits addressed by a `locator` — either a dot-separated index path
+// ("0.3.1") or a selector that must match exactly one node (`heading("Status")`)
+// — and read the edited bytes back. Each successful edit reparses, so a
+// locator is resolved against the tree as it stands at that call; a failed edit
+// leaves the document byte-for-byte unchanged. Use twig_editor_query /
+// twig_editor_ast_json to inspect the current tree between edits.
+
+// Create an editor over a private copy of `input`, parsed as `format` (a
+// TWIG_FORMAT_* code).
+TwigStatus twig_editor_create(
+    const uint8_t *input,
+    size_t input_len,
+    int format,
+    TwigEditor **out_editor
+);
+
+// Destroy an editor handle.
+void twig_editor_destroy(TwigEditor *editor);
+
+// Replace the whole source of the located node with `text`.
+TwigStatus twig_editor_replace(
+    TwigEditor *editor,
+    const uint8_t *locator,
+    size_t locator_len,
+    const uint8_t *text,
+    size_t text_len
+);
+
+// Replace the interior (between-delimiters content) of the located container.
+TwigStatus twig_editor_replace_content(
+    TwigEditor *editor,
+    const uint8_t *locator,
+    size_t locator_len,
+    const uint8_t *text,
+    size_t text_len
+);
+
+// Insert `text` immediately before the located node.
+TwigStatus twig_editor_insert_before(
+    TwigEditor *editor,
+    const uint8_t *locator,
+    size_t locator_len,
+    const uint8_t *text,
+    size_t text_len
+);
+
+// Insert `text` immediately after the located node.
+TwigStatus twig_editor_insert_after(
+    TwigEditor *editor,
+    const uint8_t *locator,
+    size_t locator_len,
+    const uint8_t *text,
+    size_t text_len
+);
+
+// Insert `text` as the `child_index`-th child of the located container (an
+// index at or past the child count appends).
+TwigStatus twig_editor_insert_child(
+    TwigEditor *editor,
+    const uint8_t *locator,
+    size_t locator_len,
+    size_t child_index,
+    const uint8_t *text,
+    size_t text_len
+);
+
+// Delete the located node (removes exactly its span; no whitespace cleanup).
+TwigStatus twig_editor_delete(
+    TwigEditor *editor,
+    const uint8_t *locator,
+    size_t locator_len
+);
+
+// The editor's current (edited) source bytes. Borrowed from `editor` and valid
+// until the next successful edit on this handle, or until it is destroyed.
+TwigStatus twig_editor_source(
+    TwigEditor *editor,
+    const uint8_t **out_ptr,
+    size_t *out_len
+);
+
+// Encode the editor's current tree as pretty-printed JSON. Borrowed from
+// `editor` and valid until the next twig_editor_ast_json call, or until it is
+// destroyed.
+TwigStatus twig_editor_ast_json(
+    TwigEditor *editor,
+    const uint8_t **out_ptr,
+    size_t *out_len
+);
+
+// Resolve a selector against the editor's current tree. Borrowed from `editor`
+// and valid until the next twig_editor_query call, or until it is destroyed.
+TwigStatus twig_editor_query(
+    TwigEditor *editor,
     const uint8_t *selector,
     size_t selector_len,
     const TwigQueryMatch **out_ptr,

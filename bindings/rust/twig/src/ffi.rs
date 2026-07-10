@@ -11,6 +11,10 @@ impl TwigStatus {
     pub const PARSE_ERROR: c_int = 2;
     pub const OUT_OF_MEMORY: c_int = 3;
     pub const UNSUPPORTED_FORMAT: c_int = 4;
+    pub const NOT_FOUND: c_int = 5;
+    pub const AMBIGUOUS: c_int = 6;
+    pub const NOT_EDITABLE: c_int = 7;
+    pub const EDIT_CONFLICT: c_int = 8;
     pub const INTERNAL_ERROR: c_int = 255;
 }
 
@@ -24,6 +28,8 @@ pub enum TwigFormat {
 }
 
 pub enum TwigDocument {}
+
+pub enum TwigEditor {}
 
 /// C ABI mirror of Zig's `TwigSpan` — a byte range `[start, end)`.
 #[repr(C)]
@@ -75,6 +81,72 @@ unsafe extern "C" {
     ) -> TwigStatus;
     pub fn twig_document_query(
         doc: *mut TwigDocument,
+        selector: *const u8,
+        selector_len: usize,
+        out_ptr: *mut *const TwigQueryMatch,
+        out_len: *mut usize,
+    ) -> TwigStatus;
+
+    pub fn twig_editor_create(
+        input: *const u8,
+        input_len: usize,
+        format: c_int,
+        out_editor: *mut *mut TwigEditor,
+    ) -> TwigStatus;
+    pub fn twig_editor_destroy(editor: *mut TwigEditor);
+    pub fn twig_editor_replace(
+        editor: *mut TwigEditor,
+        locator: *const u8,
+        locator_len: usize,
+        text: *const u8,
+        text_len: usize,
+    ) -> TwigStatus;
+    pub fn twig_editor_replace_content(
+        editor: *mut TwigEditor,
+        locator: *const u8,
+        locator_len: usize,
+        text: *const u8,
+        text_len: usize,
+    ) -> TwigStatus;
+    pub fn twig_editor_insert_before(
+        editor: *mut TwigEditor,
+        locator: *const u8,
+        locator_len: usize,
+        text: *const u8,
+        text_len: usize,
+    ) -> TwigStatus;
+    pub fn twig_editor_insert_after(
+        editor: *mut TwigEditor,
+        locator: *const u8,
+        locator_len: usize,
+        text: *const u8,
+        text_len: usize,
+    ) -> TwigStatus;
+    pub fn twig_editor_insert_child(
+        editor: *mut TwigEditor,
+        locator: *const u8,
+        locator_len: usize,
+        child_index: usize,
+        text: *const u8,
+        text_len: usize,
+    ) -> TwigStatus;
+    pub fn twig_editor_delete(
+        editor: *mut TwigEditor,
+        locator: *const u8,
+        locator_len: usize,
+    ) -> TwigStatus;
+    pub fn twig_editor_source(
+        editor: *mut TwigEditor,
+        out_ptr: *mut *const u8,
+        out_len: *mut usize,
+    ) -> TwigStatus;
+    pub fn twig_editor_ast_json(
+        editor: *mut TwigEditor,
+        out_ptr: *mut *const u8,
+        out_len: *mut usize,
+    ) -> TwigStatus;
+    pub fn twig_editor_query(
+        editor: *mut TwigEditor,
         selector: *const u8,
         selector_len: usize,
         out_ptr: *mut *const TwigQueryMatch,

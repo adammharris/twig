@@ -8,6 +8,15 @@ pub enum Error {
     ParseError,
     OutOfMemory,
     UnsupportedFormat,
+    /// A locator resolved to no node (editor).
+    NotFound,
+    /// A selector locator matched more than one node (editor).
+    Ambiguous,
+    /// The target node has no editable span/interior (editor).
+    NotEditable,
+    /// The edit produced a document that no longer parses; it was rolled back
+    /// (editor).
+    EditConflict,
     Internal,
 }
 
@@ -19,6 +28,10 @@ impl Error {
             ffi::TwigStatus::PARSE_ERROR => Err(Self::ParseError),
             ffi::TwigStatus::OUT_OF_MEMORY => Err(Self::OutOfMemory),
             ffi::TwigStatus::UNSUPPORTED_FORMAT => Err(Self::UnsupportedFormat),
+            ffi::TwigStatus::NOT_FOUND => Err(Self::NotFound),
+            ffi::TwigStatus::AMBIGUOUS => Err(Self::Ambiguous),
+            ffi::TwigStatus::NOT_EDITABLE => Err(Self::NotEditable),
+            ffi::TwigStatus::EDIT_CONFLICT => Err(Self::EditConflict),
             _ => Err(Self::Internal),
         }
     }
@@ -31,6 +44,10 @@ impl fmt::Display for Error {
             Error::ParseError => f.write_str("parse error"),
             Error::OutOfMemory => f.write_str("out of memory"),
             Error::UnsupportedFormat => f.write_str("unsupported format"),
+            Error::NotFound => f.write_str("locator matched no node"),
+            Error::Ambiguous => f.write_str("selector matched more than one node"),
+            Error::NotEditable => f.write_str("node has no editable span"),
+            Error::EditConflict => f.write_str("edit produced an unparseable document"),
             Error::Internal => f.write_str("internal error"),
         }
     }

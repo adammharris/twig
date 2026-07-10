@@ -85,9 +85,8 @@ impl Document {
     /// Render the document to HTML. For Djot/Markdown this is the rich
     /// rendering path that resolves reference/footnote side tables.
     pub fn render_html(&mut self) -> Result<Vec<u8>, Error> {
-        self.borrowed_bytes(|doc, ptr, len| unsafe {
-            ffi::twig_document_render_html(doc, ptr, len)
-        })
+        let raw = self.raw.as_ptr();
+        collect_bytes(|ptr, len| unsafe { ffi::twig_document_render_html(raw, ptr, len) })
     }
 
     /// Serialize the document to `format`'s own source syntax: a round-trip
@@ -96,18 +95,18 @@ impl Document {
     /// [`Error::UnsupportedFormat`] when the requested direction has no
     /// serializer (today: converting into XML from another format).
     pub fn serialize(&mut self, format: Format) -> Result<Vec<u8>, Error> {
+        let raw = self.raw.as_ptr();
         let ffi_format: ffi::TwigFormat = format.into();
-        self.borrowed_bytes(|doc, ptr, len| unsafe {
-            ffi::twig_document_serialize(doc, ffi_format as i32, ptr, len)
+        collect_bytes(|ptr, len| unsafe {
+            ffi::twig_document_serialize(raw, ffi_format as i32, ptr, len)
         })
     }
 
     /// Encode the document's AST as pretty-printed JSON (the same encoding as
     /// `twig convert -o ast`).
     pub fn ast_json(&mut self) -> Result<Vec<u8>, Error> {
-        self.borrowed_bytes(|doc, ptr, len| unsafe {
-            ffi::twig_document_ast_json(doc, ptr, len)
-        })
+        let raw = self.raw.as_ptr();
+        collect_bytes(|ptr, len| unsafe { ffi::twig_document_ast_json(raw, ptr, len) })
     }
 
     /// Resolve a CSS-lite selector (e.g. `heading[level=2]`,
@@ -119,66 +118,10 @@ impl Document {
     /// `verbatim` / `code_block` / `raw_inline` / `raw_block` selector recovers
     /// those, and every other node kind is reachable too.
     pub fn query(&mut self, selector: &str) -> Result<Vec<QueryMatch>, Error> {
-        let mut ptr = std::ptr::null();
-        let mut len = 0usize;
-        let status = unsafe {
-            ffi::twig_document_query(
-                self.raw.as_ptr(),
-                selector.as_ptr(),
-                selector.len(),
-                &mut ptr,
-                &mut len,
-            )
-        };
-        Error::from_status(status)?;
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        if ptr.is_null() {
-            return Err(Error::Internal);
-        }
-        let matches = unsafe { std::slice::from_raw_parts(ptr, len) };
-        matches
-            .iter()
-            .map(|m| {
-                let kind = unsafe { std::ffi::CStr::from_ptr(m.kind) }
-                    .to_str()
-                    .map_err(|_| Error::Internal)?
-                    .to_owned();
-                Ok(QueryMatch {
-                    node_id: m.node_id,
-                    span: m.span.start..m.span.end,
-                    content_span: if m.has_content_span != 0 {
-                        Some(m.content_span.start..m.content_span.end)
-                    } else {
-                        None
-                    },
-                    kind,
-                })
-            })
-            .collect()
-    }
-
-    /// Shared plumbing for the accessors that return a caller-borrowed byte
-    /// buffer (`render_html`/`serialize`/`ast_json`): run `call`, then copy the
-    /// borrowed bytes into an owned `Vec` before returning (the buffer is only
-    /// valid until the next same-accessor call on this handle).
-    fn borrowed_bytes(
-        &mut self,
-        call: impl FnOnce(*mut ffi::TwigDocument, *mut *const u8, *mut usize) -> ffi::TwigStatus,
-    ) -> Result<Vec<u8>, Error> {
-        let mut ptr = std::ptr::null();
-        let mut len = 0usize;
-        let status = call(self.raw.as_ptr(), &mut ptr, &mut len);
-        Error::from_status(status)?;
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        if ptr.is_null() {
-            return Err(Error::Internal);
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-        Ok(bytes.to_vec())
+        let raw = self.raw.as_ptr();
+        collect_matches(|ptr, len| unsafe {
+            ffi::twig_document_query(raw, selector.as_ptr(), selector.len(), ptr, len)
+        })
     }
 }
 
@@ -186,6 +129,195 @@ impl Drop for Document {
     fn drop(&mut self) {
         unsafe { ffi::twig_document_destroy(self.raw.as_ptr()) }
     }
+}
+
+/// A span-splice editor over a document: applies lossless, in-place edits and
+/// reparses after each one, so node addressing stays valid as the document
+/// evolves. Every op is addressed by a `locator` — a dot-separated index path
+/// (`"0.3.1"`) or a selector that must match exactly one node
+/// (`heading("Status")`). A failed edit leaves the document unchanged.
+#[derive(Debug)]
+pub struct Editor {
+    raw: NonNull<ffi::TwigEditor>,
+}
+
+impl Editor {
+    /// Create an editor over a private copy of `input`, parsed as `format`.
+    pub fn new(input: &[u8], format: Format) -> Result<Self, Error> {
+        let mut raw = std::ptr::null_mut();
+        let ffi_format: ffi::TwigFormat = format.into();
+        let status =
+            unsafe { ffi::twig_editor_create(input.as_ptr(), input.len(), ffi_format as i32, &mut raw) };
+        Error::from_status(status)?;
+        let raw = NonNull::new(raw).ok_or(Error::Internal)?;
+        Ok(Self { raw })
+    }
+
+    pub fn new_str(input: &str, format: Format) -> Result<Self, Error> {
+        Self::new(input.as_bytes(), format)
+    }
+
+    /// Replace the whole source of the located node with `text`.
+    pub fn replace(&mut self, locator: &str, text: &str) -> Result<(), Error> {
+        self.apply(locator, text, |ed, loc, loc_len, txt, txt_len| unsafe {
+            ffi::twig_editor_replace(ed, loc, loc_len, txt, txt_len)
+        })
+    }
+
+    /// Replace the interior (between-delimiters content) of the located
+    /// container.
+    pub fn replace_content(&mut self, locator: &str, text: &str) -> Result<(), Error> {
+        self.apply(locator, text, |ed, loc, loc_len, txt, txt_len| unsafe {
+            ffi::twig_editor_replace_content(ed, loc, loc_len, txt, txt_len)
+        })
+    }
+
+    /// Insert `text` immediately before the located node.
+    pub fn insert_before(&mut self, locator: &str, text: &str) -> Result<(), Error> {
+        self.apply(locator, text, |ed, loc, loc_len, txt, txt_len| unsafe {
+            ffi::twig_editor_insert_before(ed, loc, loc_len, txt, txt_len)
+        })
+    }
+
+    /// Insert `text` immediately after the located node.
+    pub fn insert_after(&mut self, locator: &str, text: &str) -> Result<(), Error> {
+        self.apply(locator, text, |ed, loc, loc_len, txt, txt_len| unsafe {
+            ffi::twig_editor_insert_after(ed, loc, loc_len, txt, txt_len)
+        })
+    }
+
+    /// Insert `text` as the `index`-th child of the located container (an index
+    /// at or past the child count appends).
+    pub fn insert_child(&mut self, locator: &str, index: usize, text: &str) -> Result<(), Error> {
+        let status = unsafe {
+            ffi::twig_editor_insert_child(
+                self.raw.as_ptr(),
+                locator.as_ptr(),
+                locator.len(),
+                index,
+                text.as_ptr(),
+                text.len(),
+            )
+        };
+        Error::from_status(status)
+    }
+
+    /// Delete the located node (removes exactly its span; no whitespace
+    /// cleanup).
+    pub fn delete(&mut self, locator: &str) -> Result<(), Error> {
+        let status = unsafe {
+            ffi::twig_editor_delete(self.raw.as_ptr(), locator.as_ptr(), locator.len())
+        };
+        Error::from_status(status)
+    }
+
+    /// The editor's current (edited) source bytes.
+    pub fn source(&mut self) -> Result<Vec<u8>, Error> {
+        let raw = self.raw.as_ptr();
+        collect_bytes(|ptr, len| unsafe { ffi::twig_editor_source(raw, ptr, len) })
+    }
+
+    /// The editor's current source bytes as a UTF-8 string.
+    pub fn source_str(&mut self) -> Result<String, Error> {
+        String::from_utf8(self.source()?).map_err(|_| Error::Internal)
+    }
+
+    /// Encode the editor's current tree as pretty-printed JSON — the live
+    /// counterpart of [`Document::ast_json`], for inspecting between edits.
+    pub fn ast_json(&mut self) -> Result<Vec<u8>, Error> {
+        let raw = self.raw.as_ptr();
+        collect_bytes(|ptr, len| unsafe { ffi::twig_editor_ast_json(raw, ptr, len) })
+    }
+
+    /// Resolve a selector against the editor's current tree — the live
+    /// counterpart of [`Document::query`].
+    pub fn query(&mut self, selector: &str) -> Result<Vec<QueryMatch>, Error> {
+        let raw = self.raw.as_ptr();
+        collect_matches(|ptr, len| unsafe {
+            ffi::twig_editor_query(raw, selector.as_ptr(), selector.len(), ptr, len)
+        })
+    }
+
+    /// Shared plumbing for the `(locator, text)` edit ops.
+    fn apply(
+        &mut self,
+        locator: &str,
+        text: &str,
+        op: impl FnOnce(*mut ffi::TwigEditor, *const u8, usize, *const u8, usize) -> ffi::TwigStatus,
+    ) -> Result<(), Error> {
+        let status = op(
+            self.raw.as_ptr(),
+            locator.as_ptr(),
+            locator.len(),
+            text.as_ptr(),
+            text.len(),
+        );
+        Error::from_status(status)
+    }
+}
+
+impl Drop for Editor {
+    fn drop(&mut self) {
+        unsafe { ffi::twig_editor_destroy(self.raw.as_ptr()) }
+    }
+}
+
+/// Run `call` (which writes a borrowed `(ptr, len)` byte buffer) and copy the
+/// result into an owned `Vec` — the buffer is only valid until the next
+/// same-accessor call on the handle, so we copy before returning. Shared by
+/// [`Document`] and [`Editor`].
+fn collect_bytes(
+    call: impl FnOnce(*mut *const u8, *mut usize) -> ffi::TwigStatus,
+) -> Result<Vec<u8>, Error> {
+    let mut ptr = std::ptr::null();
+    let mut len = 0usize;
+    let status = call(&mut ptr, &mut len);
+    Error::from_status(status)?;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err(Error::Internal);
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    Ok(bytes.to_vec())
+}
+
+/// Run `call` (which writes a borrowed `(ptr, len)` match array) and copy each
+/// match into an owned [`QueryMatch`]. Shared by [`Document`] and [`Editor`].
+fn collect_matches(
+    call: impl FnOnce(*mut *const ffi::TwigQueryMatch, *mut usize) -> ffi::TwigStatus,
+) -> Result<Vec<QueryMatch>, Error> {
+    let mut ptr = std::ptr::null();
+    let mut len = 0usize;
+    let status = call(&mut ptr, &mut len);
+    Error::from_status(status)?;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err(Error::Internal);
+    }
+    let matches = unsafe { std::slice::from_raw_parts(ptr, len) };
+    matches
+        .iter()
+        .map(|m| {
+            let kind = unsafe { std::ffi::CStr::from_ptr(m.kind) }
+                .to_str()
+                .map_err(|_| Error::Internal)?
+                .to_owned();
+            Ok(QueryMatch {
+                node_id: m.node_id,
+                span: m.span.start..m.span.end,
+                content_span: if m.has_content_span != 0 {
+                    Some(m.content_span.start..m.content_span.end)
+                } else {
+                    None
+                },
+                kind,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -259,5 +391,61 @@ mod tests {
     fn query_rejects_a_malformed_selector() {
         let mut doc = Document::parse_str("hi\n", Format::Markdown).expect("parse markdown");
         assert_eq!(doc.query("list >"), Err(Error::InvalidArgument));
+    }
+
+    #[test]
+    fn editor_edits_by_index_path() {
+        let mut ed = Editor::new_str("<a><b>hi</b></a>", Format::Xml).expect("editor");
+        ed.replace_content("0.0", "bye").expect("replace_content");
+        assert_eq!(ed.source_str().expect("source"), "<a><b>bye</b></a>");
+    }
+
+    #[test]
+    fn editor_insert_child_and_delete() {
+        let mut ed = Editor::new_str("<r><a/><c/></r>", Format::Xml).expect("editor");
+        ed.insert_child("0", 1, "<b/>").expect("insert_child");
+        assert_eq!(ed.source_str().expect("source"), "<r><a/><b/><c/></r>");
+        ed.delete("0.1").expect("delete");
+        assert_eq!(ed.source_str().expect("source"), "<r><a/><c/></r>");
+    }
+
+    #[test]
+    fn editor_edits_by_selector() {
+        let mut ed = Editor::new_str("# One\n\n## Two\n", Format::Markdown).expect("editor");
+        ed.replace("heading(\"Two\")", "## Renamed").expect("replace");
+        assert_eq!(ed.source_str().expect("source"), "# One\n\n## Renamed\n");
+    }
+
+    #[test]
+    fn editor_locator_errors_are_distinct() {
+        let mut ed = Editor::new_str("<r><a/><a/></r>", Format::Xml).expect("editor");
+        assert_eq!(ed.replace("0.9", "x"), Err(Error::NotFound));
+        assert_eq!(ed.replace("element", "x"), Err(Error::Ambiguous));
+        assert_eq!(ed.replace("element(", "x"), Err(Error::InvalidArgument));
+        // Untouched by the failed edits.
+        assert_eq!(ed.source_str().expect("source"), "<r><a/><a/></r>");
+    }
+
+    #[test]
+    fn editor_reparse_break_rolls_back() {
+        let mut ed = Editor::new_str("<a>ok</a>", Format::Xml).expect("editor");
+        assert_eq!(ed.replace_content("0", "<b>"), Err(Error::EditConflict));
+        assert_eq!(ed.source_str().expect("source"), "<a>ok</a>");
+    }
+
+    #[test]
+    fn editor_leaf_content_is_not_editable() {
+        let mut ed = Editor::new_str("<a>hi</a>", Format::Xml).expect("editor");
+        assert_eq!(ed.replace_content("0.0", "x"), Err(Error::NotEditable));
+    }
+
+    #[test]
+    fn editor_query_reflects_current_tree() {
+        let mut ed = Editor::new_str("<r><a/></r>", Format::Xml).expect("editor");
+        ed.insert_child("0", 1, "<b/>").expect("insert_child");
+        // Root <r> plus <a/> and <b/>.
+        assert_eq!(ed.query("element").expect("query").len(), 3);
+        let json = ed.ast_json().expect("ast_json");
+        assert!(String::from_utf8_lossy(&json).contains("\"kind\": \"doc\""));
     }
 }
