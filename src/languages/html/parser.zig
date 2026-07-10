@@ -400,15 +400,35 @@ pub const Parser = struct {
         }
     }
 
+    /// Wrap each maximal run of inline content in a list item into a paragraph,
+    /// leaving block-level children (block quotes, nested lists, headings, …)
+    /// as siblings. Wrapping a block inside a `<p>` would be invalid markup and
+    /// would dedent it during serialization. Rewrites `children` in place: the
+    /// output count never exceeds the input, and each write lands at or before
+    /// the run the builder already consumed, so it never clobbers unread ids.
     fn wrapListItemInParagraph(self: *Parser, children: *[]Node.Id) ParseError!void {
-        if (children.*.len == 0 or self.builder.nodes.items[children.*[0]].kind == .para) return;
-        const first = self.builder.nodes.items[children.*[0]].span.start;
-        const last = self.builder.nodes.items[children.*[children.*.len - 1]].span.end;
-        const para = try self.builder.addContainer(.para, children.*);
-        self.builder.setSpan(para, Span.init(first, last));
-        self.builder.setContentSpan(para, Span.init(first, last));
-        children.*[0] = para;
-        children.* = children.*[0..1];
+        const items = children.*;
+        var out: usize = 0;
+        var i: usize = 0;
+        while (i < items.len) {
+            if (self.isBlockKind(items[i])) {
+                items[out] = items[i];
+                out += 1;
+                i += 1;
+                continue;
+            }
+            const run_start = i;
+            while (i < items.len and !self.isBlockKind(items[i])) i += 1;
+            const run = items[run_start..i];
+            const span_start = self.builder.nodes.items[run[0]].span.start;
+            const span_end = self.builder.nodes.items[run[run.len - 1]].span.end;
+            const para = try self.builder.addContainer(.para, run);
+            self.builder.setSpan(para, Span.init(span_start, span_end));
+            self.builder.setContentSpan(para, Span.init(span_start, span_end));
+            items[out] = para;
+            out += 1;
+        }
+        children.* = items[0..out];
     }
 
     fn listIsTight(self: *const Parser, children: []const Node.Id) bool {
@@ -753,6 +773,29 @@ test "HTML tight-list item text stays on the marker's line through djot/markdown
     const md = try @import("../markdown/serializer.zig").serializeAstAlloc(testing.allocator, &ast);
     defer testing.allocator.free(md);
     try testing.expectEqualStrings("- one\n- two\n", md);
+}
+
+test "HTML block-level child of a list item is not wrapped in a paragraph" {
+    // `wrapListItemInParagraph` must group only inline runs; a `<blockquote>`
+    // (or nested list) stays a sibling of the text paragraph, never a child of
+    // it — a block inside a `<p>` is invalid and dedents on serialization.
+    const html = "<ul><li>text<blockquote>quoted</blockquote></li></ul>";
+    var parser = Parser.init(testing.allocator, html);
+    defer parser.deinit();
+    var ast = try parser.parse();
+    defer ast.deinit();
+
+    const list = ast.nodes[ast.root].first_child.?;
+    const item = ast.nodes[list].first_child.?;
+    const para = ast.nodes[item].first_child.?;
+    try testing.expect(ast.nodes[para].kind == .para);
+    // The paragraph holds only the inline text, not the block quote.
+    const para_child = ast.nodes[para].first_child.?;
+    try testing.expect(ast.nodes[para_child].kind == .str);
+    try testing.expect(ast.nodes[para_child].next_sibling == null);
+    // The block quote is the paragraph's sibling under the list item.
+    const bq = ast.nodes[para].next_sibling.?;
+    try testing.expect(ast.nodes[bq].kind == .block_quote);
 }
 
 test "HTML soft-wrapped list-item paragraph keeps continuation indent in djot/markdown" {

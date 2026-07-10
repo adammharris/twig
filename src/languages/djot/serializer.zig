@@ -8,9 +8,19 @@ const Document = djot.Document;
 const AST = djot.AST;
 const Node = AST.Node;
 
+/// One segment of a block's continuation prefix: `"> "` for a block quote, or
+/// the spaces that indent a list item / definition / div body. Chained
+/// parent→child on the call stack so the prefix is emitted in *nesting order*.
+/// A flat indent+quote-depth pair can't express that order — a block quote
+/// inside a list item needs `  > `, a list inside a block quote needs `> ` —
+/// so the two must be interleaved as encountered, not summed.
+const Prefix = struct {
+    parent: ?*const Prefix,
+    segment: []const u8,
+};
+
 const Ctx = struct {
-    indent: usize = 0,
-    quote_depth: usize = 0,
+    prefix: ?*const Prefix = null,
 };
 
 fn fenceTicks(text: []const u8, min: usize) usize {
@@ -34,10 +44,15 @@ const Renderer = struct {
     writer: *Writer,
 
     fn writePrefix(self: *Renderer, ctx: Ctx) Writer.Error!void {
-        var i: usize = 0;
-        while (i < ctx.quote_depth) : (i += 1) try self.writer.writeAll("> ");
-        i = 0;
-        while (i < ctx.indent) : (i += 1) try self.writer.writeByte(' ');
+        try self.writePrefixNode(ctx.prefix);
+    }
+
+    /// Emit prefix segments outermost-first by recursing to the root before
+    /// writing, so nesting order is preserved (`  > `, not `>   `).
+    fn writePrefixNode(self: *Renderer, node: ?*const Prefix) Writer.Error!void {
+        const p = node orelse return;
+        try self.writePrefixNode(p.parent);
+        try self.writer.writeAll(p.segment);
     }
 
     fn writeDjotAttrs(self: *Renderer, id: Node.Id) Writer.Error!void {
@@ -137,7 +152,8 @@ const Renderer = struct {
             try self.writer.writeByte('\n');
             return;
         };
-        const item_ctx: Ctx = .{ .indent = ctx.indent + 2, .quote_depth = ctx.quote_depth };
+        const item_prefix = Prefix{ .parent = ctx.prefix, .segment = "  " };
+        const item_ctx: Ctx = .{ .prefix = &item_prefix };
         // A leading paragraph always starts on the marker's own line (`- text`,
         // never `- \n  text`), whether the list is tight or loose — djot's
         // (and Markdown's) list-item syntax has no other way to write a
@@ -222,7 +238,10 @@ const Renderer = struct {
                 try self.writePrefix(ctx);
                 try self.writer.writeAll("* * *\n");
             },
-            .block_quote => try self.renderBlocks(id, .{ .indent = ctx.indent, .quote_depth = ctx.quote_depth + 1 }, true),
+            .block_quote => {
+                const p = Prefix{ .parent = ctx.prefix, .segment = "> " };
+                try self.renderBlocks(id, .{ .prefix = &p }, true);
+            },
             .div => {
                 try self.writePrefix(ctx);
                 try self.writer.writeAll(":::");
@@ -231,7 +250,8 @@ const Renderer = struct {
                     try self.writeDjotAttrs(id);
                 }
                 try self.writer.writeByte('\n');
-                try self.renderBlocks(id, .{ .indent = ctx.indent + 2, .quote_depth = ctx.quote_depth }, true);
+                const p = Prefix{ .parent = ctx.prefix, .segment = "  " };
+                try self.renderBlocks(id, .{ .prefix = &p }, true);
                 try self.writePrefix(ctx);
                 try self.writer.writeAll(":::\n");
             },
@@ -302,7 +322,8 @@ const Renderer = struct {
                                         try self.writer.writeByte('\n');
                                     } else {
                                         try self.writer.writeByte('\n');
-                                        try self.renderBlocks(cid, .{ .indent = ctx.indent + 2, .quote_depth = ctx.quote_depth }, true);
+                                        const p = Prefix{ .parent = ctx.prefix, .segment = "  " };
+                                        try self.renderBlocks(cid, .{ .prefix = &p }, true);
                                     }
                                 } else try self.writer.writeByte('\n');
                             },
@@ -509,6 +530,27 @@ test "serializeAlloc: fenced code language abuts the fence, no space" {
     defer testing.allocator.free(out);
     try testing.expect(std.mem.startsWith(u8, out, "```fig\n"));
     try testing.expect(std.mem.indexOf(u8, out, "``` fig") == null);
+}
+
+test "serializeAlloc: nested block prefixes are emitted in nesting order" {
+    // A block quote inside a list item needs `  > ` (indent then marker); a
+    // list inside a block quote needs `> ` — flat indent/quote counts can't
+    // express the order, so both interleavings are checked.
+    {
+        var doc = try djot.parse(testing.allocator, "- > q one\n  > q two\n");
+        defer doc.deinit();
+        const out = try serializeAlloc(testing.allocator, &doc);
+        defer testing.allocator.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "  > q one") != null);
+        try testing.expect(std.mem.indexOf(u8, out, ">   q one") == null);
+    }
+    {
+        var doc = try djot.parse(testing.allocator, "> - item one\n> - item two\n");
+        defer doc.deinit();
+        const out = try serializeAlloc(testing.allocator, &doc);
+        defer testing.allocator.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "> - item one") != null);
+    }
 }
 
 test "serializeAlloc includes detached reference definitions" {
