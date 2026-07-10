@@ -1,0 +1,777 @@
+//! A deliberately small, forgiving HTML tokenizer and tree builder.  It is
+//! not a browser-grade implementation of the HTML parsing algorithm, but it
+//! does the useful, unsurprising parts for document conversion: HTML syntax,
+//! character references, void elements, raw-text/RCDATA elements, and the
+//! common optional end tags.  Unlike the XML parser, malformed input is
+//! recovered into a best-effort tree instead of being rejected.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const AST = @import("../../ast/ast.zig");
+const Node = AST.Node;
+const Span = @import("../../span.zig");
+
+pub const ParseError = Allocator.Error;
+
+pub const Parser = struct {
+    allocator: Allocator,
+    source: []const u8,
+    pos: usize = 0,
+    builder: AST.Builder,
+
+    pub fn init(allocator: Allocator, source: []const u8) Parser {
+        return .{ .allocator = allocator, .source = source, .builder = AST.Builder.init(allocator) };
+    }
+
+    pub fn deinit(self: *Parser) void {
+        self.builder.deinit();
+    }
+
+    pub fn parse(self: *Parser) ParseError!AST {
+        const children = try self.parseChildren(null);
+        defer self.allocator.free(children);
+        const doc = try self.builder.addContainer(.doc, self.dropFormattingWhitespace(children));
+        self.builder.setSpan(doc, Span.init(0, self.source.len));
+        return self.builder.finish(doc);
+    }
+
+    fn isSpace(c: u8) bool {
+        return c == ' ' or c == '\t' or c == '\r' or c == '\n' or c == '\x0c';
+    }
+
+    fn isNameByte(c: u8) bool {
+        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == ':' or c == '_' or c == '-';
+    }
+
+    fn skipSpace(self: *Parser) void {
+        while (self.pos < self.source.len and isSpace(self.source[self.pos])) self.pos += 1;
+    }
+
+    fn atIgnoreCase(self: *Parser, needle: []const u8) bool {
+        return self.pos + needle.len <= self.source.len and
+            std.ascii.eqlIgnoreCase(self.source[self.pos..][0..needle.len], needle);
+    }
+
+    fn lowerDup(self: *Parser, text: []const u8) Allocator.Error![]u8 {
+        const out = try self.allocator.alloc(u8, text.len);
+        for (text, out) |c, *dst| dst.* = std.ascii.toLower(c);
+        return out;
+    }
+
+    fn readNameLower(self: *Parser) ParseError![]u8 {
+        const start = self.pos;
+        while (self.pos < self.source.len and isNameByte(self.source[self.pos])) self.pos += 1;
+        // Callers only use this after checking the first byte; treating an
+        // odd punctuation byte as text is handled before reaching here.
+        return self.lowerDup(self.source[start..self.pos]);
+    }
+
+    fn endTagMatches(self: *Parser, name: []const u8) bool {
+        if (self.pos + 3 > self.source.len or self.source[self.pos] != '<' or self.source[self.pos + 1] != '/') return false;
+        var i = self.pos + 2;
+        const start = i;
+        while (i < self.source.len and isNameByte(self.source[i])) i += 1;
+        return i > start and std.ascii.eqlIgnoreCase(self.source[start..i], name) and
+            (i == self.source.len or isSpace(self.source[i]) or self.source[i] == '>');
+    }
+
+    fn consumeEndTag(self: *Parser) void {
+        self.pos += 2;
+        while (self.pos < self.source.len and isNameByte(self.source[self.pos])) self.pos += 1;
+        while (self.pos < self.source.len and self.source[self.pos] != '>') self.pos += 1;
+        if (self.pos < self.source.len) self.pos += 1;
+    }
+
+    fn isVoid(name: []const u8) bool {
+        return std.mem.eql(u8, name, "area") or std.mem.eql(u8, name, "base") or
+            std.mem.eql(u8, name, "br") or std.mem.eql(u8, name, "col") or
+            std.mem.eql(u8, name, "embed") or std.mem.eql(u8, name, "hr") or
+            std.mem.eql(u8, name, "img") or std.mem.eql(u8, name, "input") or
+            std.mem.eql(u8, name, "link") or std.mem.eql(u8, name, "meta") or
+            std.mem.eql(u8, name, "param") or std.mem.eql(u8, name, "source") or
+            std.mem.eql(u8, name, "track") or std.mem.eql(u8, name, "wbr");
+    }
+
+    fn isRawText(name: []const u8) bool {
+        return std.mem.eql(u8, name, "script") or std.mem.eql(u8, name, "style") or
+            std.mem.eql(u8, name, "xmp") or std.mem.eql(u8, name, "iframe") or
+            std.mem.eql(u8, name, "noembed") or std.mem.eql(u8, name, "noframes") or
+            std.mem.eql(u8, name, "plaintext");
+    }
+
+    fn isRcdata(name: []const u8) bool {
+        return std.mem.eql(u8, name, "textarea") or std.mem.eql(u8, name, "title");
+    }
+
+    /// Enough of HTML's optional-end-tag rules to make ordinary hand-authored
+    /// HTML tree correctly (the rules people encounter most often in lists,
+    /// paragraphs, tables, and select menus).
+    fn implicitlyCloses(parent: []const u8, child: []const u8) bool {
+        if (std.mem.eql(u8, parent, "li")) return std.mem.eql(u8, child, "li");
+        if (std.mem.eql(u8, parent, "dt") or std.mem.eql(u8, parent, "dd"))
+            return std.mem.eql(u8, child, "dt") or std.mem.eql(u8, child, "dd");
+        if (std.mem.eql(u8, parent, "p")) return isBlockStart(child);
+        if (std.mem.eql(u8, parent, "rt") or std.mem.eql(u8, parent, "rp"))
+            return std.mem.eql(u8, child, "rt") or std.mem.eql(u8, child, "rp");
+        if (std.mem.eql(u8, parent, "option")) return std.mem.eql(u8, child, "option") or std.mem.eql(u8, child, "optgroup");
+        if (std.mem.eql(u8, parent, "optgroup")) return std.mem.eql(u8, child, "optgroup");
+        if (std.mem.eql(u8, parent, "thead") or std.mem.eql(u8, parent, "tbody")) return std.mem.eql(u8, child, "tbody") or std.mem.eql(u8, child, "tfoot");
+        if (std.mem.eql(u8, parent, "tr")) return std.mem.eql(u8, child, "tr");
+        if (std.mem.eql(u8, parent, "td") or std.mem.eql(u8, parent, "th")) return std.mem.eql(u8, child, "td") or std.mem.eql(u8, child, "th");
+        return false;
+    }
+
+    fn isBlockStart(name: []const u8) bool {
+        const names = [_][]const u8{ "address", "article", "aside", "blockquote", "div", "dl", "fieldset", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "main", "menu", "nav", "ol", "p", "pre", "section", "table", "ul" };
+        for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+        return false;
+    }
+
+    fn parseChildren(self: *Parser, parent: ?[]const u8) ParseError![]Node.Id {
+        var children = std.ArrayList(Node.Id).empty;
+        errdefer children.deinit(self.allocator);
+        while (self.pos < self.source.len) {
+            if (self.source[self.pos] != '<') {
+                if (try self.parseTextUntil(self.source.len, true)) |id| try children.append(self.allocator, id);
+                continue;
+            }
+            if (self.atIgnoreCase("<!--")) {
+                try children.append(self.allocator, try self.parseComment());
+            } else if (self.atIgnoreCase("<!doctype")) {
+                try children.append(self.allocator, try self.parseDoctype());
+            } else if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '?') {
+                try children.append(self.allocator, try self.parseProcessingInstruction());
+            } else if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '/') {
+                // Let every nested parser see a close tag.  The matching
+                // ancestor consumes it; this is essential after an implicit
+                // close such as `<ul><li>one<li>two</ul>`.
+                if (parent != null) break;
+                // A stray close tag is ignored by HTML parsers.  Consume it
+                // so recovery always makes progress.
+                self.consumeEndTag();
+            } else if (self.pos + 1 < self.source.len and isNameByte(self.source[self.pos + 1])) {
+                const start = self.pos + 1;
+                var end = start;
+                while (end < self.source.len and isNameByte(self.source[end])) end += 1;
+                if (parent) |name| if (implicitlyCloses(name, self.source[start..end])) break;
+                try children.append(self.allocator, try self.parseElement());
+            } else if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '!') {
+                // HTML calls unknown declarations "bogus comments".
+                try children.append(self.allocator, try self.parseBogusComment());
+            } else {
+                const start = self.pos;
+                self.pos += 1;
+                const id = try self.builder.addLeaf(.{ .str = self.source[start..self.pos] });
+                self.builder.setSpan(id, Span.init(start, self.pos));
+                try children.append(self.allocator, id);
+            }
+        }
+        return children.toOwnedSlice(self.allocator);
+    }
+
+    fn parseElement(self: *Parser) ParseError!Node.Id {
+        const start = self.pos;
+        self.pos += 1;
+        const name = try self.readNameLower();
+        defer self.allocator.free(name);
+        const attrs = try self.parseAttributes();
+        defer self.freeAttrs(attrs);
+
+        var self_closing = false;
+        if (self.pos < self.source.len and self.source[self.pos] == '/') {
+            self_closing = true;
+            self.pos += 1;
+            self.skipSpace();
+        }
+        if (self.pos < self.source.len and self.source[self.pos] == '>') self.pos += 1;
+        const content_start = self.pos;
+
+        if (self_closing or isVoid(name)) {
+            var no_children: []Node.Id = &.{};
+            const kind = try self.semanticKind(name, attrs, &no_children);
+            // `semanticKind` may synthesize children for a void element (e.g.
+            // an `<img>`'s alt text becomes the image node's content, which is
+            // how the shared model carries alt). Free any such allocation
+            // after the builder has copied the child links out.
+            defer if (no_children.len > 0) self.allocator.free(no_children);
+            const id = try self.builder.addContainer(kind, no_children);
+            self.builder.setSpan(id, Span.init(start, self.pos));
+            try self.builder.setAttrs(id, .{ .entries = attrs });
+            return id;
+        }
+
+        var children: []Node.Id = undefined;
+        var content_end = self.pos;
+        if (isRawText(name) or isRcdata(name)) {
+            const raw_start = self.pos;
+            const end = self.rawTextEnd(name);
+            self.pos = end;
+            if (try self.parseTextRange(raw_start, end, isRcdata(name))) |id| {
+                children = try self.allocator.dupe(Node.Id, &.{id});
+            } else children = try self.allocator.alloc(Node.Id, 0);
+            content_end = self.pos;
+            if (self.pos < self.source.len and self.endTagMatches(name)) self.consumeEndTag();
+        } else {
+            children = try self.parseChildren(name);
+            content_end = self.pos;
+            if (self.pos < self.source.len and self.endTagMatches(name)) self.consumeEndTag();
+        }
+        // `semanticKind` may shrink `children` to a sub-slice (dropping layout
+        // whitespace, wrapping list items). Free the *original* allocation —
+        // freeing a length-shrunk view mismatches the allocator's size class.
+        const owned_children = children;
+        defer self.allocator.free(owned_children);
+
+        const kind = try self.semanticKind(name, attrs, &children);
+        const id = try self.builder.addContainer(kind, children);
+        self.builder.setSpan(id, Span.init(start, self.pos));
+        self.builder.setContentSpan(id, Span.init(content_start, content_end));
+        try self.builder.setAttrs(id, .{ .entries = attrs });
+        return id;
+    }
+
+    /// Map the subset of HTML that Twig's own HTML renderer emits back to the
+    /// shared semantic vocabulary.  Unknown elements intentionally remain
+    /// generic markup, so this is a semantic upgrade rather than an attempt
+    /// to turn HTML into a lossy Djot-only parser.
+    fn semanticKind(self: *Parser, name: []const u8, attrs: []const AST.KeyVal, children: *[]Node.Id) ParseError!Node.Kind {
+        if (std.mem.eql(u8, name, "p")) return .para;
+        if (std.mem.eql(u8, name, "h1")) return .{ .heading = .{ .level = 1 } };
+        if (std.mem.eql(u8, name, "h2")) return .{ .heading = .{ .level = 2 } };
+        if (std.mem.eql(u8, name, "h3")) return .{ .heading = .{ .level = 3 } };
+        if (std.mem.eql(u8, name, "h4")) return .{ .heading = .{ .level = 4 } };
+        if (std.mem.eql(u8, name, "h5")) return .{ .heading = .{ .level = 5 } };
+        if (std.mem.eql(u8, name, "h6")) return .{ .heading = .{ .level = 6 } };
+        if (std.mem.eql(u8, name, "hr")) return .thematic_break;
+        if (std.mem.eql(u8, name, "br")) return .hard_break;
+        if (std.mem.eql(u8, name, "blockquote")) {
+            children.* = self.dropFormattingWhitespace(children.*);
+            return .block_quote;
+        }
+        if (std.mem.eql(u8, name, "div")) {
+            children.* = self.dropFormattingWhitespace(children.*);
+            return .div;
+        }
+        // These are structural containers with no Djot syntax of their own;
+        // `section` renders its children directly in the Djot serializer.
+        if (std.mem.eql(u8, name, "html") or std.mem.eql(u8, name, "body") or std.mem.eql(u8, name, "main") or std.mem.eql(u8, name, "section")) {
+            children.* = self.dropFormattingWhitespace(children.*);
+            return .section;
+        }
+        if (std.mem.eql(u8, name, "ul")) {
+            children.* = self.dropFormattingWhitespace(children.*);
+            return .{ .bullet_list = .{ .style = .dash, .tight = self.listIsTight(children.*) } };
+        }
+        if (std.mem.eql(u8, name, "ol")) {
+            children.* = self.dropFormattingWhitespace(children.*);
+            const start = if (attrValue(attrs, "start")) |value| std.fmt.parseInt(u32, value, 10) catch null else null;
+            return .{ .ordered_list = .{ .style = .{ .numbering = .decimal, .delim = .period }, .tight = self.listIsTight(children.*), .start = start } };
+        }
+        if (std.mem.eql(u8, name, "li")) {
+            children.* = self.dropFormattingWhitespace(children.*);
+            try self.wrapListItemInParagraph(children);
+            return .list_item;
+        }
+        if (std.mem.eql(u8, name, "em") or std.mem.eql(u8, name, "i")) return .emph;
+        if (std.mem.eql(u8, name, "strong") or std.mem.eql(u8, name, "b")) return .strong;
+        if (std.mem.eql(u8, name, "mark")) return .mark;
+        if (std.mem.eql(u8, name, "ins")) return .insert;
+        if (std.mem.eql(u8, name, "del") or std.mem.eql(u8, name, "s")) return .delete;
+        if (std.mem.eql(u8, name, "sup")) return .superscript;
+        if (std.mem.eql(u8, name, "sub")) return .subscript;
+        if (std.mem.eql(u8, name, "span")) return .span;
+        if (std.mem.eql(u8, name, "a")) {
+            if (attrValue(attrs, "href")) |destination|
+                return .{ .link = .{ .destination = destination, .reference = null } };
+        }
+        if (std.mem.eql(u8, name, "img")) {
+            if (attrValue(attrs, "src")) |destination| {
+                // The shared `image` model carries alt text as child content,
+                // not as an attribute; give the void node a `str` child so the
+                // serializer reproduces `alt=`. The `src`/`alt` attributes are
+                // still preserved on the node — the serializer dedups them
+                // against the synthesized `src`/`alt` so neither doubles up.
+                if (attrValue(attrs, "alt")) |alt| {
+                    const child = try self.builder.addLeaf(.{ .str = alt });
+                    children.* = try self.allocator.dupe(Node.Id, &.{child});
+                }
+                return .{ .image = .{ .destination = destination, .reference = null } };
+            }
+        }
+        if (std.mem.eql(u8, name, "code") and children.*.len == 1) {
+            switch (self.builder.nodes.items[children.*[0]].kind) {
+                .str => |text| return .{ .verbatim = text },
+                else => {},
+            }
+        }
+        if (std.mem.eql(u8, name, "pre") and children.*.len == 1) {
+            const child = children.*[0];
+            switch (self.builder.nodes.items[child].kind) {
+                .verbatim => |text| {
+                    const class = self.builderAttrs(child).get("class") orelse "";
+                    const lang = languageFromClass(class);
+                    return .{ .code_block = .{ .lang = lang, .text = text } };
+                },
+                else => {},
+            }
+        }
+        return .{ .element = .{ .name = name } };
+    }
+
+    fn attrValue(attrs: []const AST.KeyVal, key: []const u8) ?[]const u8 {
+        for (attrs) |attr| if (std.mem.eql(u8, attr.key, key)) return attr.value;
+        return null;
+    }
+
+    fn builderAttrs(self: *const Parser, id: Node.Id) AST.Attrs {
+        const attr_id = self.builder.nodes.items[id].attrs orelse return .{};
+        return self.builder.attrs.items[attr_id];
+    }
+
+    fn languageFromClass(class: []const u8) ?[]const u8 {
+        var classes = std.mem.tokenizeScalar(u8, class, ' ');
+        while (classes.next()) |item| {
+            if (std.mem.startsWith(u8, item, "language-") and item.len > "language-".len)
+                return item["language-".len..];
+        }
+        return null;
+    }
+
+    fn isFormattingWhitespace(self: *const Parser, id: Node.Id) bool {
+        return switch (self.builder.nodes.items[id].kind) {
+            .str => |text| std.mem.trim(u8, text, " \t\r\n").len == 0,
+            else => false,
+        };
+    }
+
+    /// The shared HTML printer deliberately puts newlines between block tags.
+    /// Those are layout, not document text, so do not turn them into blank
+    /// Djot paragraphs when parsing a printer-produced document.
+    fn dropFormattingWhitespace(self: *Parser, children: []Node.Id) []Node.Id {
+        var out: usize = 0;
+        for (children) |id| {
+            if (self.isFormattingWhitespace(id)) continue;
+            children[out] = id;
+            out += 1;
+        }
+        const kept = children[0..out];
+        // A text run adjacent to a block boundary — the container edge, or a
+        // block-level sibling — carries only layout whitespace at that side.
+        // The serializer re-emits that whitespace as a structural newline, so
+        // leaving it in makes blank lines accumulate without bound on each
+        // parse→serialize round-trip. Trim those block-facing edges (never the
+        // side facing inline content, where whitespace is significant).
+        for (kept, 0..) |id, i| {
+            if (self.builder.nodes.items[id].kind != .str) continue;
+            if (i == 0 or self.isBlockKind(kept[i - 1])) self.trimTextEdge(id, .leading);
+            if (i + 1 == kept.len or self.isBlockKind(kept[i + 1])) self.trimTextEdge(id, .trailing);
+        }
+        return kept;
+    }
+
+    fn isBlockKind(self: *const Parser, id: Node.Id) bool {
+        return switch (self.builder.nodes.items[id].kind) {
+            .para, .heading, .thematic_break, .section, .div, .code_block, .block_quote, .bullet_list, .ordered_list, .task_list, .definition_list, .table, .list_item, .task_list_item, .definition_list_item, .term, .definition => true,
+            else => false,
+        };
+    }
+
+    fn trimTextEdge(self: *Parser, id: Node.Id, side: enum { leading, trailing }) void {
+        const node = &self.builder.nodes.items[id];
+        const text = switch (node.kind) {
+            .str => |t| t,
+            else => return,
+        };
+        const ws = " \t\r\n\x0c";
+        const trimmed = switch (side) {
+            .leading => std.mem.trimStart(u8, text, ws),
+            .trailing => std.mem.trimEnd(u8, text, ws),
+        };
+        if (trimmed.len == text.len) return;
+        // Whitespace is never part of a character reference, so the trimmed
+        // byte count maps 1:1 onto source bytes at this edge — the span (which
+        // indexes the original source) stays accurate.
+        const removed = text.len - trimmed.len;
+        node.kind = .{ .str = trimmed };
+        switch (side) {
+            .leading => node.span.start += removed,
+            .trailing => node.span.end -= removed,
+        }
+    }
+
+    fn wrapListItemInParagraph(self: *Parser, children: *[]Node.Id) ParseError!void {
+        if (children.*.len == 0 or self.builder.nodes.items[children.*[0]].kind == .para) return;
+        const first = self.builder.nodes.items[children.*[0]].span.start;
+        const last = self.builder.nodes.items[children.*[children.*.len - 1]].span.end;
+        const para = try self.builder.addContainer(.para, children.*);
+        self.builder.setSpan(para, Span.init(first, last));
+        self.builder.setContentSpan(para, Span.init(first, last));
+        children.*[0] = para;
+        children.* = children.*[0..1];
+    }
+
+    fn listIsTight(self: *const Parser, children: []const Node.Id) bool {
+        for (children) |item| {
+            if (self.builder.nodes.items[item].kind != .list_item) continue;
+            const first = self.builder.nodes.items[item].first_child orelse continue;
+            const para = self.builder.nodes.items[first];
+            if (para.kind != .para or para.span.start >= self.source.len or !std.mem.startsWith(u8, self.source[para.span.start..], "<p")) return true;
+        }
+        return false;
+    }
+
+    fn rawTextEnd(self: *Parser, name: []const u8) usize {
+        if (std.mem.eql(u8, name, "plaintext")) return self.source.len;
+        var i = self.pos;
+        while (i + 2 < self.source.len) : (i += 1) {
+            if (self.source[i] != '<' or self.source[i + 1] != '/') continue;
+            var j = i + 2;
+            while (j < self.source.len and isNameByte(self.source[j])) j += 1;
+            if (j > i + 2 and std.ascii.eqlIgnoreCase(self.source[i + 2 .. j], name) and
+                (j == self.source.len or isSpace(self.source[j]) or self.source[j] == '>')) return i;
+        }
+        return self.source.len;
+    }
+
+    fn parseAttributes(self: *Parser) ParseError![]AST.KeyVal {
+        var attrs = std.ArrayList(AST.KeyVal).empty;
+        errdefer {
+            for (attrs.items) |kv| {
+                self.allocator.free(kv.key);
+                if (kv.value) |value| self.allocator.free(value);
+            }
+            attrs.deinit(self.allocator);
+        }
+        while (self.pos < self.source.len) {
+            self.skipSpace();
+            if (self.pos >= self.source.len or self.source[self.pos] == '>' or self.source[self.pos] == '/') break;
+            if (!isNameByte(self.source[self.pos])) {
+                self.pos += 1;
+                continue;
+            }
+            const key = try self.readNameLower();
+            var value: ?[]u8 = null;
+            self.skipSpace();
+            if (self.pos < self.source.len and self.source[self.pos] == '=') {
+                self.pos += 1;
+                self.skipSpace();
+                value = self.readAttributeValue() catch |err| {
+                    self.allocator.free(key);
+                    return err;
+                };
+            }
+            attrs.append(self.allocator, .{ .key = key, .value = value }) catch |err| {
+                self.allocator.free(key);
+                if (value) |v| self.allocator.free(v);
+                return err;
+            };
+        }
+        return attrs.toOwnedSlice(self.allocator);
+    }
+
+    fn freeAttrs(self: *Parser, attrs: []const AST.KeyVal) void {
+        for (attrs) |kv| {
+            self.allocator.free(kv.key);
+            if (kv.value) |value| self.allocator.free(value);
+        }
+        self.allocator.free(attrs);
+    }
+
+    fn readAttributeValue(self: *Parser) ParseError![]u8 {
+        const start = self.pos;
+        var end = self.pos;
+        if (self.pos < self.source.len and (self.source[self.pos] == '\'' or self.source[self.pos] == '"')) {
+            const quote = self.source[self.pos];
+            self.pos += 1;
+            const quoted_start = self.pos;
+            while (self.pos < self.source.len and self.source[self.pos] != quote) self.pos += 1;
+            end = self.pos;
+            if (self.pos < self.source.len) self.pos += 1;
+            return self.decodeText(self.source[quoted_start..end]);
+        }
+        while (self.pos < self.source.len and !isSpace(self.source[self.pos]) and self.source[self.pos] != '>' and self.source[self.pos] != '/') self.pos += 1;
+        end = self.pos;
+        return self.decodeText(self.source[start..end]);
+    }
+
+    fn parseTextUntil(self: *Parser, limit: usize, decode_entities: bool) ParseError!?Node.Id {
+        const start = self.pos;
+        while (self.pos < limit and self.source[self.pos] != '<') self.pos += 1;
+        return self.parseTextRange(start, self.pos, decode_entities);
+    }
+
+    fn parseTextRange(self: *Parser, start: usize, end: usize, decode_entities: bool) ParseError!?Node.Id {
+        if (end == start) return null;
+        const text = if (decode_entities) try self.decodeText(self.source[start..end]) else try self.allocator.dupe(u8, self.source[start..end]);
+        defer self.allocator.free(text);
+        const id = try self.builder.addLeaf(.{ .str = text });
+        self.builder.setSpan(id, Span.init(start, end));
+        return id;
+    }
+
+    fn decodeText(self: *Parser, text: []const u8) ParseError![]u8 {
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(self.allocator);
+        var i: usize = 0;
+        while (i < text.len) {
+            if (text[i] != '&') {
+                try out.append(self.allocator, text[i]);
+                i += 1;
+                continue;
+            }
+            const semi = std.mem.indexOfScalarPos(u8, text, i + 1, ';') orelse {
+                try out.append(self.allocator, '&');
+                i += 1;
+                continue;
+            };
+            const body = text[i + 1 .. semi];
+            if (try appendEntity(&out, self.allocator, body)) {
+                i = semi + 1;
+            } else {
+                try out.appendSlice(self.allocator, text[i .. semi + 1]);
+                i = semi + 1;
+            }
+        }
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn parseComment(self: *Parser) ParseError!Node.Id {
+        const start = self.pos;
+        self.pos += 4;
+        const content_start = self.pos;
+        const end = std.mem.indexOfPos(u8, self.source, self.pos, "-->") orelse self.source.len;
+        self.pos = if (end < self.source.len) end + 3 else end;
+        const id = try self.builder.addLeaf(.{ .comment = self.source[content_start..end] });
+        self.builder.setSpan(id, Span.init(start, self.pos));
+        return id;
+    }
+
+    fn parseBogusComment(self: *Parser) ParseError!Node.Id {
+        const start = self.pos;
+        self.pos += 2;
+        const content_start = self.pos;
+        while (self.pos < self.source.len and self.source[self.pos] != '>') self.pos += 1;
+        const end = self.pos;
+        if (self.pos < self.source.len) self.pos += 1;
+        const id = try self.builder.addLeaf(.{ .comment = self.source[content_start..end] });
+        self.builder.setSpan(id, Span.init(start, self.pos));
+        return id;
+    }
+
+    fn parseDoctype(self: *Parser) ParseError!Node.Id {
+        const start = self.pos;
+        self.pos += "<!doctype".len;
+        const content_start = self.pos;
+        while (self.pos < self.source.len and self.source[self.pos] != '>') self.pos += 1;
+        const end = self.pos;
+        if (self.pos < self.source.len) self.pos += 1;
+        const id = try self.builder.addLeaf(.{ .doctype = self.source[content_start..end] });
+        self.builder.setSpan(id, Span.init(start, self.pos));
+        return id;
+    }
+
+    fn parseProcessingInstruction(self: *Parser) ParseError!Node.Id {
+        const start = self.pos;
+        self.pos += 2;
+        const target_start = self.pos;
+        while (self.pos < self.source.len and isNameByte(self.source[self.pos])) self.pos += 1;
+        const target = self.source[target_start..self.pos];
+        self.skipSpace();
+        const data_start = self.pos;
+        const end = std.mem.indexOfPos(u8, self.source, self.pos, "?>") orelse self.source.len;
+        self.pos = if (end < self.source.len) end + 2 else end;
+        const id = try self.builder.addLeaf(.{ .processing_instruction = .{ .target = target, .data = self.source[data_start..end] } });
+        self.builder.setSpan(id, Span.init(start, self.pos));
+        return id;
+    }
+};
+
+fn appendEntity(out: *std.ArrayList(u8), allocator: Allocator, body: []const u8) Allocator.Error!bool {
+    if (body.len > 1 and body[0] == '#') {
+        const cp: u21 = if (body.len > 2 and (body[1] == 'x' or body[1] == 'X'))
+            std.fmt.parseInt(u21, body[2..], 16) catch return false
+        else
+            std.fmt.parseInt(u21, body[1..], 10) catch return false;
+        var bytes: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(cp, &bytes) catch return false;
+        try out.appendSlice(allocator, bytes[0..len]);
+        return true;
+    }
+    const replacement: ?[]const u8 = if (std.mem.eql(u8, body, "amp")) "&" else if (std.mem.eql(u8, body, "lt")) "<" else if (std.mem.eql(u8, body, "gt")) ">" else if (std.mem.eql(u8, body, "quot")) "\"" else if (std.mem.eql(u8, body, "apos")) "'" else if (std.mem.eql(u8, body, "nbsp")) "\xc2\xa0" else if (std.mem.eql(u8, body, "copy")) "\xc2\xa9" else if (std.mem.eql(u8, body, "reg")) "\xc2\xae" else if (std.mem.eql(u8, body, "hellip")) "\xe2\x80\xa6" else if (std.mem.eql(u8, body, "ndash")) "\xe2\x80\x93" else if (std.mem.eql(u8, body, "mdash")) "\xe2\x80\x94" else if (std.mem.eql(u8, body, "lsquo")) "\xe2\x80\x98" else if (std.mem.eql(u8, body, "rsquo")) "\xe2\x80\x99" else if (std.mem.eql(u8, body, "ldquo")) "\xe2\x80\x9c" else if (std.mem.eql(u8, body, "rdquo")) "\xe2\x80\x9d" else null;
+    if (replacement) |value| {
+        try out.appendSlice(allocator, value);
+        return true;
+    }
+    return false;
+}
+
+const testing = std.testing;
+
+test "HTML parser maps block markup and decodes character references" {
+    var parser = Parser.init(testing.allocator, "<!doctype html><DIV class=x disabled>Hi &amp; &#x1f642;</DIV>");
+    defer parser.deinit();
+    var ast = try parser.parse();
+    defer ast.deinit();
+    const doctype = ast.nodes[ast.root].first_child.?;
+    const div = ast.nodes[doctype].next_sibling.?;
+    const text = ast.nodes[div].first_child.?;
+    try testing.expectEqualStrings(" html", ast.nodes[doctype].kind.doctype);
+    try testing.expect(ast.nodes[div].kind == .div);
+    try testing.expectEqualStrings("x", ast.attrsOf(div).get("class").?);
+    try testing.expect(ast.attrsOf(div).find("disabled").?.value == null);
+    try testing.expectEqualStrings("Hi & 🙂", ast.nodes[text].kind.str);
+}
+
+test "HTML parser closes li and p implicitly and keeps script raw" {
+    var parser = Parser.init(testing.allocator, "<ul><li>one<li>two</ul><p>a<div>b</div><script>a < b &amp;</script>");
+    defer parser.deinit();
+    var ast = try parser.parse();
+    defer ast.deinit();
+    const ul = ast.nodes[ast.root].first_child.?;
+    const first_li = ast.nodes[ul].first_child.?;
+    const second_li = ast.nodes[first_li].next_sibling.?;
+    const p = ast.nodes[ul].next_sibling.?;
+    const div = ast.nodes[p].next_sibling.?;
+    const script = ast.nodes[div].next_sibling.?;
+    try testing.expect(ast.nodes[first_li].kind == .list_item);
+    try testing.expect(ast.nodes[second_li].kind == .list_item);
+    try testing.expect(ast.nodes[p].kind == .para);
+    try testing.expect(ast.nodes[div].kind == .div);
+    const script_text = ast.nodes[script].first_child.?;
+    try testing.expectEqualStrings("a < b &amp;", ast.nodes[script_text].kind.str);
+}
+
+test "HTML parser restores Twig printer semantics and ignores layout whitespace" {
+    const source =
+        \\<h1>Title</h1>
+        \\<p>hello <a href="/u"><em>world</em></a></p>
+        \\<ul>
+        \\<li>
+        \\<p>one</p>
+        \\</li>
+        \\<li>
+        \\<p>two</p>
+        \\</li>
+        \\</ul>
+        \\<pre><code class="language-zig">const x = 1;
+        \\</code></pre>
+    ;
+    var parser = Parser.init(testing.allocator, source);
+    defer parser.deinit();
+    var ast = try parser.parse();
+    defer ast.deinit();
+
+    const heading = ast.nodes[ast.root].first_child.?;
+    const para = ast.nodes[heading].next_sibling.?;
+    const list = ast.nodes[para].next_sibling.?;
+    const code = ast.nodes[list].next_sibling.?;
+    try testing.expectEqual(@as(u32, 1), ast.nodes[heading].kind.heading.level);
+    try testing.expect(ast.nodes[para].kind == .para);
+    const link = ast.nodes[ast.nodes[para].first_child.?].next_sibling.?;
+    try testing.expectEqualStrings("/u", ast.nodes[link].kind.link.destination.?);
+    try testing.expect(!ast.nodes[list].kind.bullet_list.tight);
+    const item = ast.nodes[list].first_child.?;
+    try testing.expect(ast.nodes[item].kind == .list_item);
+    try testing.expect(ast.nodes[ast.nodes[item].first_child.?].kind == .para);
+    try testing.expectEqualStrings("zig", ast.nodes[code].kind.code_block.lang.?);
+    try testing.expectEqualStrings("const x = 1;\n", ast.nodes[code].kind.code_block.text);
+}
+
+test "HTML round-trip does not duplicate attributes promoted to semantic fields" {
+    // A semantic upgrade (`a`->link, `img`->image, `ol`->ordered_list) pulls
+    // `href`/`src`/`start` into a field *and* keeps the raw attribute; the
+    // serializer must emit each key exactly once. `<img>`'s alt text becomes
+    // node content so it survives the void-element round-trip.
+    const cases = [_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = "<a href=\"/x\" class=\"c\">hi</a>", .out = "<a href=\"/x\" class=\"c\">hi</a>" },
+        .{ .in = "<img src=\"/p.png\" alt=\"pic\" class=\"t\">", .out = "<img alt=\"pic\" src=\"/p.png\" class=\"t\">" },
+        .{ .in = "<ol start=\"3\"><li>x</ol>", .out = "<ol start=\"3\">\n<li>\nx\n</li>\n</ol>\n" },
+    };
+    for (cases) |c| {
+        var parser = Parser.init(testing.allocator, c.in);
+        defer parser.deinit();
+        var ast = try parser.parse();
+        defer ast.deinit();
+        const html = try @import("serializer.zig").serializeAlloc(testing.allocator, &ast, null);
+        defer testing.allocator.free(html);
+        try testing.expectEqualStrings(c.out, html);
+    }
+}
+
+fn parseToHtml(source: []const u8) ![]u8 {
+    var parser = Parser.init(testing.allocator, source);
+    defer parser.deinit();
+    var ast = try parser.parse();
+    defer ast.deinit();
+    return @import("serializer.zig").serializeAlloc(testing.allocator, &ast, null);
+}
+
+test "HTML raw-text elements are serialized literally, not escaped" {
+    // `<`/`&` inside script/style have no character-reference meaning: escaping
+    // them would corrupt the JS/CSS and double-escape on every re-parse.
+    const html = try parseToHtml("<script>if (a < b && c) x();</script><style>.a>.b{x:1}</style>");
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings("<script>if (a < b && c) x();</script><style>.a>.b{x:1}</style>", html);
+}
+
+test "HTML parse->serialize is a fixpoint (no whitespace accumulation)" {
+    // The serializer inserts structural newlines between block tags. Re-parsing
+    // its own output must not fold those into text and re-emit them, or blank
+    // lines grow without bound across edit cycles.
+    const sources = [_][]const u8{
+        "<ul><li>one<li>two</ul>",
+        "<blockquote><p>q</p></blockquote>",
+        "<p>a<b>bold</b></p>trailing",
+        "<ul><li>a<ul><li>b</li></ul></li></ul>",
+        "<div>hello <em>there</em> world</div>",
+    };
+    for (sources) |src| {
+        const pass1 = try parseToHtml(src);
+        defer testing.allocator.free(pass1);
+        const pass2 = try parseToHtml(pass1);
+        defer testing.allocator.free(pass2);
+        try testing.expectEqualStrings(pass1, pass2);
+    }
+}
+
+test "HTML tight-list item text stays on the marker's line through djot/markdown" {
+    // The shared printer emits a tight `<li>` as `<li>\ntext\n</li>`. If the
+    // parser keeps that leading newline as item text, the djot/Markdown
+    // serializer emits a bare `- \n  text` instead of `- text`. (Regression
+    // for the html->djot / html->markdown list round-trip.)
+    const tight_list_html = "<ul>\n<li>\none\n</li>\n<li>\ntwo\n</li>\n</ul>\n";
+    var parser = Parser.init(testing.allocator, tight_list_html);
+    defer parser.deinit();
+    var ast = try parser.parse();
+    defer ast.deinit();
+
+    const djot = try @import("../djot/serializer.zig").serializeAstAlloc(testing.allocator, &ast);
+    defer testing.allocator.free(djot);
+    try testing.expectEqualStrings("- one\n- two\n", djot);
+
+    const md = try @import("../markdown/serializer.zig").serializeAstAlloc(testing.allocator, &ast);
+    defer testing.allocator.free(md);
+    try testing.expectEqualStrings("- one\n- two\n", md);
+}
+
+test "HTML soft-wrapped list-item paragraph keeps continuation indent in djot/markdown" {
+    // An HTML paragraph keeps its soft-wrapped lines as one `str` with embedded
+    // newlines (unlike native Markdown's str/soft_break split). The djot/
+    // Markdown serializer must re-indent the continuation line under the list
+    // marker (`  two`), not dedent it to column 0. (Regression for the
+    // html->djot / html->markdown wrapped-list-item round-trip.)
+    const html = "<ul>\n<li>\n<p>one\ntwo</p>\n</li>\n</ul>\n";
+    var parser = Parser.init(testing.allocator, html);
+    defer parser.deinit();
+    var ast = try parser.parse();
+    defer ast.deinit();
+
+    const djot = try @import("../djot/serializer.zig").serializeAstAlloc(testing.allocator, &ast);
+    defer testing.allocator.free(djot);
+    try testing.expectEqualStrings("- one\n  two\n", djot);
+
+    const md = try @import("../markdown/serializer.zig").serializeAstAlloc(testing.allocator, &ast);
+    defer testing.allocator.free(md);
+    try testing.expectEqualStrings("- one\n  two\n", md);
+}

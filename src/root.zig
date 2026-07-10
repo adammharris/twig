@@ -24,12 +24,11 @@ pub const Djot = @import("languages/djot/djot.zig");
 /// module doc comment.
 pub const Xml = @import("languages/xml/xml.zig");
 
-/// HTML support: `Html.serialize`/`Html.serializeAlloc`, a generic `AST` ->
-/// HTML printer covering the full shared kind vocabulary (djot's semantic
-/// kinds plus XML/HTML's generic-markup kinds). Takes an optional
-/// `Html.Context` to resolve djot-style reference/footnote side tables
-/// without this module depending on `Djot`. No `parse` yet — see
-/// `languages/html/html.zig`'s module doc comment.
+/// HTML support: `Html.parse` builds generic-markup AST nodes from forgiving
+/// HTML; `Html.serialize`/`Html.serializeAlloc` render the full shared
+/// vocabulary.  The printer takes an optional `Html.Context` to resolve
+/// djot-style reference/footnote side tables without this module depending on
+/// `Djot`.
 pub const Html = @import("languages/html/html.zig");
 
 /// Markdown support: `Markdown.parse(allocator, source, options) !Markdown.Document`

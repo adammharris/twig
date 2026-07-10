@@ -91,9 +91,23 @@ const Renderer = struct {
         }
     }
 
-    fn renderInlineChildren(self: *Renderer, parent: Node.Id) Writer.Error!void {
+    fn renderInlineChildren(self: *Renderer, parent: Node.Id, ctx: Ctx) Writer.Error!void {
         var it = self.ast.children(parent);
-        while (it.next()) |child| try self.renderInline(child.id);
+        while (it.next()) |child| try self.renderInline(child.id, ctx);
+    }
+
+    /// Write inline text, re-emitting `ctx`'s block prefix after each embedded
+    /// newline so a soft-wrapped line stays inside its list item / block quote.
+    /// A trailing newline gets no prefix (it would be trailing whitespace on an
+    /// otherwise-blank line).
+    fn writeInlineText(self: *Renderer, s: []const u8, ctx: Ctx) Writer.Error!void {
+        var rest = s;
+        while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
+            try self.writer.writeAll(rest[0 .. nl + 1]);
+            rest = rest[nl + 1 ..];
+            if (rest.len > 0) try self.writePrefix(ctx);
+        }
+        try self.writer.writeAll(rest);
     }
 
     fn writeCodeFence(self: *Renderer, ctx: Ctx, info: ?[]const u8, text: []const u8) Writer.Error!void {
@@ -101,11 +115,11 @@ const Renderer = struct {
         try self.writePrefix(ctx);
         var i: usize = 0;
         while (i < ticks) : (i += 1) try self.writer.writeByte('`');
+        // The language directly abuts the fence (` ```fig`, not ` ``` fig`) —
+        // the canonical form, and a byte-identical round-trip of the usual
+        // hand-written spelling. (djot strips a leading space either way.)
         if (info) |lang| {
-            if (lang.len > 0) {
-                try self.writer.writeByte(' ');
-                try self.writer.writeAll(lang);
-            }
+            if (lang.len > 0) try self.writer.writeAll(lang);
         }
         try self.writer.writeByte('\n');
         if (text.len > 0) try self.writer.writeAll(text);
@@ -132,7 +146,7 @@ const Renderer = struct {
         // (a loose list's first paragraph, or any later sibling block) falls
         // through to `renderBlocksFrom`.
         if (self.ast.nodes[first].kind == .para) {
-            try self.renderInlineChildren(first);
+            try self.renderInlineChildren(first, item_ctx);
             try self.writer.writeByte('\n');
             if (tight and self.ast.nodes[first].next_sibling == null) return;
             var it: AST.ChildIterator = .{ .ast = self.ast, .next_id = self.ast.nodes[first].next_sibling };
@@ -191,7 +205,7 @@ const Renderer = struct {
             .section => try self.renderBlocks(id, ctx, true),
             .para => {
                 try self.writePrefix(ctx);
-                try self.renderInlineChildren(id);
+                try self.renderInlineChildren(id, ctx);
                 try self.writeDjotAttrs(id);
                 try self.writer.writeByte('\n');
             },
@@ -200,7 +214,7 @@ const Renderer = struct {
                 var i: u32 = 0;
                 while (i < h.level) : (i += 1) try self.writer.writeByte('#');
                 try self.writer.writeByte(' ');
-                try self.renderInlineChildren(id);
+                try self.renderInlineChildren(id, ctx);
                 try self.writeDjotAttrs(id);
                 try self.writer.writeByte('\n');
             },
@@ -275,7 +289,7 @@ const Renderer = struct {
                         switch (self.ast.nodes[cid].kind) {
                             .term => {
                                 try self.writePrefix(ctx);
-                                try self.renderInlineChildren(cid);
+                                try self.renderInlineChildren(cid, ctx);
                                 try self.writer.writeByte('\n');
                             },
                             .definition => {
@@ -284,7 +298,7 @@ const Renderer = struct {
                                 const first = self.ast.nodes[cid].first_child;
                                 if (first) |f| {
                                     if (self.ast.nodes[f].kind == .para and self.ast.nodes[f].next_sibling == null) {
-                                        try self.renderInlineChildren(f);
+                                        try self.renderInlineChildren(f, ctx);
                                         try self.writer.writeByte('\n');
                                     } else {
                                         try self.writer.writeByte('\n');
@@ -306,7 +320,7 @@ const Renderer = struct {
                     var cell_it = self.ast.children(row.id);
                     while (cell_it.next()) |cell| {
                         try self.writer.writeByte(' ');
-                        try self.renderInlineChildren(cell.id);
+                        try self.renderInlineChildren(cell.id, ctx);
                         try self.writer.writeAll(" |");
                     }
                     try self.writer.writeByte('\n');
@@ -317,18 +331,27 @@ const Renderer = struct {
             .list_item, .task_list_item, .definition_list_item, .term, .definition, .row, .cell, .caption => try self.renderBlocks(id, ctx, false),
             else => {
                 try self.writePrefix(ctx);
-                try self.renderInline(id);
+                try self.renderInline(id, ctx);
                 try self.writer.writeByte('\n');
             },
         }
     }
 
-    fn renderInline(self: *Renderer, id: Node.Id) Writer.Error!void {
+    fn renderInline(self: *Renderer, id: Node.Id, ctx: Ctx) Writer.Error!void {
         const node = self.ast.nodes[id];
         switch (node.kind) {
-            .str => |s| try self.writer.writeAll(s),
-            .soft_break => try self.writer.writeByte('\n'),
-            .hard_break => try self.writer.writeAll("\\\n"),
+            // Text may carry embedded newlines (an HTML-parsed paragraph keeps
+            // its soft-wrapped lines as one `str`); re-emit the block prefix on
+            // each continuation line so it stays inside its container.
+            .str => |s| try self.writeInlineText(s, ctx),
+            .soft_break => {
+                try self.writer.writeByte('\n');
+                try self.writePrefix(ctx);
+            },
+            .hard_break => {
+                try self.writer.writeAll("\\\n");
+                try self.writePrefix(ctx);
+            },
             .non_breaking_space => try self.writer.writeAll("\\ "),
             .symb => |s| try self.writer.print(":{s}:", .{s}),
             .verbatim => |v| {
@@ -348,68 +371,68 @@ const Renderer = struct {
             .smart_punctuation => |sp| try self.writer.writeAll(sp.text),
             .emph => {
                 try self.writer.writeByte('_');
-                try self.renderInlineChildren(id);
+                try self.renderInlineChildren(id, ctx);
                 try self.writer.writeByte('_');
             },
             .strong => {
                 try self.writer.writeByte('*');
-                try self.renderInlineChildren(id);
+                try self.renderInlineChildren(id, ctx);
                 try self.writer.writeByte('*');
             },
             .link => |l| {
                 try self.writer.writeByte('[');
-                try self.renderInlineChildren(id);
+                try self.renderInlineChildren(id, ctx);
                 try self.writer.writeByte(']');
                 if (l.destination) |dest| try self.writer.print("({s})", .{dest}) else if (l.reference) |lab| try self.writer.print("[{s}]", .{lab});
             },
             .image => |im| {
                 try self.writer.writeAll("![");
-                try self.renderInlineChildren(id);
+                try self.renderInlineChildren(id, ctx);
                 try self.writer.writeByte(']');
                 if (im.destination) |dest| try self.writer.print("({s})", .{dest}) else if (im.reference) |lab| try self.writer.print("[{s}]", .{lab});
             },
             .span => {
                 try self.writer.writeByte('[');
-                try self.renderInlineChildren(id);
+                try self.renderInlineChildren(id, ctx);
                 try self.writer.writeByte(']');
                 try self.writeDjotAttrs(id);
             },
             .mark => {
                 try self.writer.writeByte('=');
-                try self.renderInlineChildren(id);
+                try self.renderInlineChildren(id, ctx);
                 try self.writer.writeByte('=');
             },
             .superscript => {
                 try self.writer.writeByte('^');
-                try self.renderInlineChildren(id);
+                try self.renderInlineChildren(id, ctx);
                 try self.writer.writeByte('^');
             },
             .subscript => {
                 try self.writer.writeByte('~');
-                try self.renderInlineChildren(id);
+                try self.renderInlineChildren(id, ctx);
                 try self.writer.writeByte('~');
             },
             .insert => {
                 try self.writer.writeAll("{+");
-                try self.renderInlineChildren(id);
+                try self.renderInlineChildren(id, ctx);
                 try self.writer.writeAll("+}");
             },
             .delete => {
                 try self.writer.writeAll("{-");
-                try self.renderInlineChildren(id);
+                try self.renderInlineChildren(id, ctx);
                 try self.writer.writeAll("-}");
             },
             .double_quoted => {
                 try self.writer.writeByte('"');
-                try self.renderInlineChildren(id);
+                try self.renderInlineChildren(id, ctx);
                 try self.writer.writeByte('"');
             },
             .single_quoted => {
                 try self.writer.writeByte('\'');
-                try self.renderInlineChildren(id);
+                try self.renderInlineChildren(id, ctx);
                 try self.writer.writeByte('\'');
             },
-            else => try self.renderInlineChildren(id),
+            else => try self.renderInlineChildren(id, ctx),
         }
     }
 };
@@ -479,6 +502,15 @@ test "serializeAlloc renders basic djot content" {
     try testing.expect(std.mem.indexOf(u8, out, "*world*") != null);
 }
 
+test "serializeAlloc: fenced code language abuts the fence, no space" {
+    var doc = try djot.parse(testing.allocator, "```fig\nx = 1\n```\n");
+    defer doc.deinit();
+    const out = try serializeAlloc(testing.allocator, &doc);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.startsWith(u8, out, "```fig\n"));
+    try testing.expect(std.mem.indexOf(u8, out, "``` fig") == null);
+}
+
 test "serializeAlloc includes detached reference definitions" {
     var doc = try djot.parse(testing.allocator, "[x][a]\n\n[a]: /u\n");
     defer doc.deinit();
@@ -492,6 +524,9 @@ test "serializeAlloc: a loose bullet list's first paragraph starts on the marker
     defer doc.deinit();
     const out = try serializeAlloc(testing.allocator, &doc);
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "- one\ntwo\n\n- three\n") != null);
+    // The soft-wrapped continuation line is indented to align under the list
+    // marker (`  two`), a byte-identical round-trip of the input — not dedented
+    // to column 0.
+    try testing.expect(std.mem.indexOf(u8, out, "- one\n  two\n\n- three\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "- \n") == null);
 }

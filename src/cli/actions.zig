@@ -83,12 +83,12 @@ pub fn runHelp(w: *Writer, binary_name: []const u8) !void {
         \\
         \\options:
         \\  -i, --input <format>   override input-format detection
-        \\                         (djot/dj, markdown/md, xml)
+        \\                         (djot/dj, markdown/md, xml, html/htm)
         \\  -o, --output <format>  select convert's output (html, ast, canonical)
         \\  --dry-run              (edit) print the result instead of writing it
         \\
         \\Input format is normally inferred from the file extension
-        \\(.dj/.djot, .md/.markdown, .xml). Pass `-` as the file to read from
+        \\(.dj/.djot, .md/.markdown, .xml, .html/.htm). Pass `-` as the file to read from
         \\stdin — this requires an explicit `-i`, since there is no extension
         \\to infer from.
         \\

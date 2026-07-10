@@ -27,12 +27,7 @@ pub const InputFormat = enum {
     djot,
     markdown,
     xml,
-    // `html` is deliberately not a variant yet: Twig has an HTML *printer*
-    // (`twig.Html`) but no HTML *parser* to feed a `registry` entry's
-    // `parse` — see `languages/html/html.zig`'s module doc comment. Add the
-    // variant, a `registry` entry wrapping the future `twig.Html.parse`, and
-    // an `.html`/`.htm` extension mapping once that lands; nothing else in
-    // this file or `args.zig`/`actions.zig` needs to change.
+    html,
 };
 
 /// What `-o`/`--output` selects: not a source language like `InputFormat`,
@@ -79,6 +74,7 @@ pub const ParsedDoc = union(InputFormat) {
     djot: twig.Djot.Document,
     markdown: twig.Markdown.Document,
     xml: twig.AST,
+    html: twig.AST,
 
     /// The shared `AST` underneath, regardless of variant.
     pub fn ast(self: *const ParsedDoc) *const twig.AST {
@@ -86,6 +82,7 @@ pub const ParsedDoc = union(InputFormat) {
             .djot => |*d| &d.ast,
             .markdown => |*d| &d.ast,
             .xml => |*a| a,
+            .html => |*a| a,
         };
     }
 
@@ -94,6 +91,7 @@ pub const ParsedDoc = union(InputFormat) {
             .djot => |*d| d.deinit(),
             .markdown => |*d| d.deinit(),
             .xml => |*a| a.deinit(),
+            .html => |*a| a.deinit(),
         }
     }
 };
@@ -108,6 +106,10 @@ fn parseMarkdown(allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
 
 fn parseXml(allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
     return .{ .xml = try twig.Xml.parse(allocator, source) };
+}
+
+fn parseHtml(allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
+    return .{ .html = try twig.Html.parse(allocator, source) };
 }
 
 // ── editor reparse adapters ────────────────────────────────────────────────
@@ -138,6 +140,10 @@ fn parseToAstXml(allocator: Allocator, source: []const u8) anyerror!twig.AST {
     return twig.Xml.parse(allocator, source);
 }
 
+fn parseToAstHtml(allocator: Allocator, source: []const u8) anyerror!twig.AST {
+    return twig.Html.parse(allocator, source);
+}
+
 /// Djot needs its own HTML rendering path (`Djot.html.render`) rather than
 /// the generic printer: it resolves reference/footnote labels against
 /// `Document`'s side tables at render time (see `djot/html.zig`'s module doc
@@ -148,7 +154,7 @@ fn renderHtmlDjot(allocator: Allocator, doc: *const ParsedDoc, writer: *Writer) 
     try twig.Djot.html.render(allocator, &doc.djot, writer, .{});
 }
 
-/// Every other language (xml; a future html parse) has no side tables to
+/// Every other language (XML and HTML) has no side tables to
 /// resolve, so the shared, language-neutral printer
 /// (`languages/html/serializer.zig`) is the whole story — `ctx = null`.
 fn renderHtmlGeneric(allocator: Allocator, doc: *const ParsedDoc, writer: *Writer) anyerror!void {
@@ -178,8 +184,6 @@ fn serializeCanonicalDjot(allocator: Allocator, doc: *const ParsedDoc) anyerror!
 fn serializeCanonicalMarkdown(allocator: Allocator, doc: *const ParsedDoc) anyerror![]u8 {
     return markdown_serializer.serializeAlloc(allocator, &doc.markdown);
 }
-
-
 
 fn serializeFromAstDjot(allocator: Allocator, ast: *const twig.AST) anyerror![]u8 {
     return djot_serializer.serializeAstAlloc(allocator, ast);
@@ -261,6 +265,13 @@ pub const registry = [_]FormatEntry{
         // (`heading`/`emph`/`link`/...), so cross-format conversion INTO xml
         // from another format isn't meaningful yet — same-format `-o
         // canonical`/`-o xml` (via `serializeCanonical` above) still works.
+    },
+    .{
+        .id = .html,
+        .extensions = &.{ "html", "htm" },
+        .parse = parseHtml,
+        .parseToAst = parseToAstHtml,
+        .renderHtml = renderHtmlGeneric,
     },
 };
 
@@ -363,6 +374,8 @@ test "detectFromExtension matches known extensions case-insensitively, else null
     try testing.expectEqual(@as(?InputFormat, .markdown), detectFromExtension("readme.md"));
     try testing.expectEqual(@as(?InputFormat, .markdown), detectFromExtension("readme.markdown"));
     try testing.expectEqual(@as(?InputFormat, .xml), detectFromExtension("feed.xml"));
+    try testing.expectEqual(@as(?InputFormat, .html), detectFromExtension("doc.html"));
+    try testing.expectEqual(@as(?InputFormat, .html), detectFromExtension("doc.HTM"));
     try testing.expectEqual(@as(?InputFormat, null), detectFromExtension("noext"));
     try testing.expectEqual(@as(?InputFormat, null), detectFromExtension("data.json"));
     try testing.expectEqual(@as(?InputFormat, null), detectFromExtension("-"));
@@ -374,6 +387,7 @@ test "parseFormatName accepts both canonical names and aliases" {
     try testing.expectEqual(@as(?InputFormat, .markdown), parseFormatName("markdown"));
     try testing.expectEqual(@as(?InputFormat, .markdown), parseFormatName("md"));
     try testing.expectEqual(@as(?InputFormat, .xml), parseFormatName("xml"));
+    try testing.expectEqual(@as(?InputFormat, .html), parseFormatName("html"));
     try testing.expectEqual(@as(?InputFormat, null), parseFormatName("bogus"));
 }
 

@@ -124,6 +124,19 @@ fn isVoidElement(name: []const u8) bool {
     return void_elements.has(name);
 }
 
+/// Elements whose content is *raw text*: it has no character-reference
+/// escaping mechanism, so on serialization the text is emitted literally.
+/// (RCDATA elements — `textarea`/`title` — are deliberately absent: their
+/// content *is* escaped, the normal path.) Mirrors the parser's `isRawText`.
+const raw_text_elements = std.StaticStringMap(void).initComptime(.{
+    .{"script"},   .{"style"},     .{"xmp"},
+    .{"iframe"},   .{"noembed"},   .{"noframes"}, .{"plaintext"},
+});
+
+fn isRawTextElement(name: []const u8) bool {
+    return raw_text_elements.has(name);
+}
+
 pub const Renderer = struct {
     allocator: Allocator,
     ast: *const AST,
@@ -234,9 +247,14 @@ pub const Renderer = struct {
                 try self.writer.writeByte('"');
             }
         }
-        const extra_has_class = hasKey(extra, "class");
         for (attrs.entries) |kv| {
-            if (std.mem.eql(u8, kv.key, "class") and extra_has_class) continue;
+            // An `extra` value takes precedence: `class` was merged above, and
+            // any other key an `extra` already emitted (e.g. `href`/`src`/
+            // `start` synthesized from a semantic field) must not be repeated —
+            // duplicate attribute keys are malformed HTML. Parser-produced
+            // nodes preserve the original attribute alongside the field, so
+            // this dedup is what keeps the two from both reaching the output.
+            if (hasKey(extra, kv.key)) continue;
             if (kv.value) |value| {
                 try self.writer.print(" {s}=\"", .{kv.key});
                 try self.writeEscapedAttr(value);
@@ -289,6 +307,19 @@ pub const Renderer = struct {
         var it = self.ast.children(id);
         while (it.next()) |child| try self.renderNode(child.id);
         self.tight = old_tight;
+    }
+
+    /// Write a raw-text element's children literally (no escaping). The parser
+    /// yields such content as a single `str`/`verbatim` node; any other child
+    /// kind falls back to normal rendering so nothing is silently dropped.
+    fn renderRawTextChildren(self: *Renderer, id: Node.Id) RenderError!void {
+        var it = self.ast.children(id);
+        while (it.next()) |child| {
+            switch (self.ast.nodes[child.id].kind) {
+                .str, .verbatim => |t| try self.writer.writeAll(t),
+                else => try self.renderNode(child.id),
+            }
+        }
     }
 
     // ── footnotes ────────────────────────────────────────────────────────
@@ -580,7 +611,15 @@ pub const Renderer = struct {
             .element => |e| {
                 try self.renderTag(e.name, id, &.{});
                 if (isVoidElement(e.name)) return;
-                try self.renderChildren(id);
+                if (isRawTextElement(e.name)) {
+                    // Raw-text content (script/style/…) has no escaping
+                    // mechanism in HTML: it must be written verbatim. Escaping
+                    // it would corrupt the JS/CSS and double-escape on
+                    // re-parse (`<` → `&lt;` → `&amp;lt;`).
+                    try self.renderRawTextChildren(id);
+                } else {
+                    try self.renderChildren(id);
+                }
                 try self.renderCloseTag(e.name);
             },
             .comment => |text| {

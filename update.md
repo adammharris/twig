@@ -15,11 +15,13 @@ project to `fig` (which does the same for config formats).
   event-stream → AST) + HTML output. Renders through the shared HTML printer.
 - **XML** (`src/languages/xml/`) — recursive-descent parser + serializer
   (byte-identical round-trip for canonical input).
-- **HTML printer** (`src/languages/html/`) — general shared-AST → HTML
-  serializer over the *whole* vocabulary. Takes an optional `Context` carrying
-  djot-only render-time state (reference/footnote resolution); `ctx=null` for
-  generic input. Djot's `html.zig` is now a 137-line adapter over it. The HTML
-  **parser** (HTML→AST) is deferred.
+- **HTML** (`src/languages/html/`) — forgiving, document-oriented parser plus
+  general shared-AST → HTML serializer over the *whole* vocabulary. The parser
+  produces generic-markup nodes, decodes common/numeric character references,
+  handles RAWTEXT/RCDATA and common optional closures (`li`, `p`, table/select
+  cells), and preserves source spans. The printer takes an optional `Context`
+  carrying djot-only render-time state (reference/footnote resolution);
+  `ctx=null` for generic input. Djot's `html.zig` is now a 137-line adapter over it.
 - **Markdown** (`src/languages/markdown/`) — CommonMark parser targeting the
   shared AST, rendered via the shared HTML printer. Extensions gated by
   `ParseOptions` (CommonMark+GFM+extras: math opt-in, rest on). Raw HTML →
@@ -40,7 +42,7 @@ project to `fig` (which does the same for config formats).
     render-side only (Phase 4, below).
 - **CLI** (`src/main.zig` + `src/cli/`) — `twig convert [-i F] [-o html|ast|
   canonical] <file|->`, `twig identify`, and `twig edit`. Extension inference +
-  `-i` override; extensible format registry (one entry per language — `parse`,
+  `-i` override (including `.html`/`.htm`); extensible format registry (one entry per language — `parse`,
   `parseToAst`, `renderHtml`, optional `serializeCanonical`). `-o ast` = pretty
   JSON dump; `-o canonical` = round-trip serializer (XML, Djot, Markdown).
 - **Editor** (`src/ast/editor.zig`, reader path-nav, `twig edit`) — the
@@ -109,9 +111,9 @@ divergences from issues #1/#3 below — i.e. remaining markdown work is render-s
    in text; tight-list `<li>text</li>`; GFM table `align=` attr vs `style=`;
    task-list `<input>` self-close; `<dd>` trailing newline. PLUS fix the latent
    tightness-leak bug (issue #1).
-2. **HTML parser** (deferred "HTML phase") — forked tokenizer (RCDATA/RAWTEXT,
-   entity refs), implicit tag closing (`<li>`/`<p>`), conservative tree
-   construction. Then upgrade markdown's raw-HTML nodes to parsed `element`s.
+2. **HTML parser follow-up** — expand the named-character-reference table and
+   optional-end-tag coverage toward full HTML5 tree construction. Then upgrade
+   markdown's raw-HTML nodes to parsed `element`s.
 3. **`section("Title")` selector** — "edit everything under a heading"; layers on
    `ast/select.zig` (heading → section span) plus a small CLI change so the edit
    uses the Match's section span rather than the heading node's own. (Descendant/
@@ -122,4 +124,5 @@ divergences from issues #1/#3 below — i.e. remaining markdown work is render-s
    lang is editable without whole-node replace); smart delete (whitespace/
    separator cleanup); move/reorder ops; richer container interiors so
    empty-container inserts work everywhere.
-5. **CLI follow-ups** — add HTML as an input format once the parser lands.
+5. **CLI follow-ups** — HTML is now an input format; add canonical HTML
+   serialization only after defining its normalization contract.
