@@ -585,21 +585,61 @@ fn detectHtmlBlockStart(s: []const u8) ?u8 {
 
 // ── label normalization (link reference definitions) ───────────────────
 
-/// Trim + collapse internal whitespace runs to a single space + ASCII
-/// lowercase (see this file's module doc comment: not full Unicode case
-/// folding).
+/// Simple Unicode case fold for the common bicameral scripts, applied to
+/// reference labels (CommonMark matches labels under Unicode case folding, not
+/// just ASCII). Like the flanking punctuation table this is a *curated* subset
+/// -- ASCII, Latin-1, Latin Extended sharp-s, Greek, and Cyrillic -- covering
+/// the scripts real labels use rather than the whole `CaseFolding.txt`. Most
+/// folds are the +0x20 upper→lower offset; `ß`/`ẞ` fold to the two bytes "ss"
+/// (a length-changing fold), so this writes straight into `out`.
+fn foldCodepointInto(allocator: Allocator, out: *std.ArrayList(u8), cp: u21) Allocator.Error!void {
+    if (cp == 0x00DF or cp == 0x1E9E) { // ß, ẞ → "ss"
+        try out.appendSlice(allocator, "ss");
+        return;
+    }
+    const folded: u21 = switch (cp) {
+        'A'...'Z' => cp + 32,
+        0x00C0...0x00D6, 0x00D8...0x00DE => cp + 32, // Latin-1 À–Þ (skip × at 0xD7)
+        0x0391...0x03A1, 0x03A3...0x03AB => cp + 32, // Greek capitals (skip 0x03A2 hole)
+        0x0410...0x042F => cp + 32, // Cyrillic А–Я
+        else => cp,
+    };
+    var buf: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(folded, &buf) catch return; // unencodable: drop
+    try out.appendSlice(allocator, buf[0..n]);
+}
+
+/// Trim + collapse internal whitespace runs to a single space + Unicode case
+/// fold (`foldCodepointInto`). ASCII stays on a byte-wise fast path; only
+/// multibyte code points are decoded and folded.
 fn normalizeLabel(allocator: Allocator, s: []const u8) Allocator.Error![]u8 {
     const trimmed = std.mem.trim(u8, s, " \t\r\n");
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     var in_ws = false;
-    for (trimmed) |c| {
+    var i: usize = 0;
+    while (i < trimmed.len) {
+        const c = trimmed[i];
         if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
             if (!in_ws) try out.append(allocator, ' ');
             in_ws = true;
-        } else {
+            i += 1;
+        } else if (c < 0x80) {
             try out.append(allocator, std.ascii.toLower(c));
             in_ws = false;
+            i += 1;
+        } else {
+            const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+            const end = @min(i + len, trimmed.len);
+            const cp = std.unicode.utf8Decode(trimmed[i..end]) catch {
+                try out.append(allocator, c);
+                in_ws = false;
+                i += 1;
+                continue;
+            };
+            try foldCodepointInto(allocator, &out, cp);
+            in_ws = false;
+            i = end;
         }
     }
     return out.toOwnedSlice(allocator);
@@ -1230,8 +1270,10 @@ pub const Parser = struct {
                         if (try self.tryStartDefinitionList(lf, line, cur, idx)) return;
                     }
                     if (trySetextUnderline(stripUpTo3Indent(remainder))) |level| {
-                        try self.closeParagraphAsHeading(level, idx);
-                        return;
+                        // If the paragraph was entirely link reference
+                        // definitions, no heading is produced and this line
+                        // falls through to be parsed as fresh content.
+                        if (try self.closeParagraphAsHeading(level, idx)) return;
                     }
                 },
             }
@@ -1352,16 +1394,24 @@ pub const Parser = struct {
         lf.end_line = idx;
     }
 
-    fn closeParagraphAsHeading(self: *Parser, level: u32, idx: usize) Allocator.Error!void {
+    /// Turn the open paragraph into a setext heading. Leading link reference
+    /// definitions are NOT part of the paragraph the underline applies to, so
+    /// they're stripped (and registered) first -- exactly as `finishParagraph`
+    /// does. Returns `false` (having closed the leaf, its refs registered)
+    /// when nothing but ref definitions remained: there is then no paragraph
+    /// for the `===`/`---` line to underline, so the caller must let that line
+    /// fall through and be parsed as fresh content (spec ex215/216).
+    fn closeParagraphAsHeading(self: *Parser, level: u32, idx: usize) Allocator.Error!bool {
         var lf = self.leaf.?;
         self.leaf = null;
         defer lf.deinit(self.allocator);
-        const trimmed = std.mem.trim(u8, lf.text.items, " \t\r\n");
-        if (trimmed.len > 0) {
-            const segs = try rebaseSegments(self.allocator, lf.text_segs.items, lf.text.items, trimmed);
-            defer self.allocator.free(segs);
-            try self.emitTextBlock(.{ .heading = .{ .level = level } }, trimmed, segs, lf.start_line, idx);
-        }
+        const remaining = try self.stripLinkReferenceDefinitions(lf.text.items);
+        const trimmed = std.mem.trim(u8, remaining, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        const segs = try rebaseSegments(self.allocator, lf.text_segs.items, lf.text.items, trimmed);
+        defer self.allocator.free(segs);
+        try self.emitTextBlock(.{ .heading = .{ .level = level } }, trimmed, segs, lf.start_line, idx);
+        return true;
     }
 
     // ── indented code ────────────────────────────────────────────────────

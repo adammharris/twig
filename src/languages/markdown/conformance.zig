@@ -82,13 +82,20 @@ const spec_json = @embedFile("testdata/commonmark-spec-0.31.2.json");
 /// differ line-to-line, so a lazily-aligned continuation is measured against
 /// the wrong origin. Fixing them needs block-quote-*relative* column tracking
 /// (cmark's per-container offset model) — deferred as its own change. The rest
-/// of the ~11 failures are Unicode reference-label case-folding (ex206/540),
-/// two link-ref-definition/setext-heading interactions (ex215/216 — a leading
-/// ref def is not part of the paragraph a following `===` would underline, so
-/// it must be stripped before the setext check), tabs, and raw-HTML corners —
-/// still not the kind of structural bug `other` counts (`other` is 0). Bump
-/// this as further work lands; never let it drift down.
-pub const BASELINE: usize = 641;
+///   - HTML5-aligned inline comment grammar (`<!-->`/`<!--->`/`--` allowed),
+///     stripping leading ref definitions before a setext underline is applied,
+///     and Unicode simple case-folding of reference labels (Greek/Cyrillic/
+///     Latin-1/sharp-s) closed 6 more (Raw HTML, Link-ref-defs, Links).
+/// The final 5 failures are two column-model gaps, each needing dedicated
+/// infrastructure: (1) partial-tab expansion — a tab straddling a container
+/// prefix must materialize its leftover columns as content spaces (spec
+/// ex5/6/7, a documented simplification in this file's block parser); (2)
+/// block-quote-*relative* column tracking for list-item continuation, since a
+/// nested quote's prefix width can vary line-to-line (ex259/260). Both are
+/// column-arithmetic reworks of the block parser with real regression surface,
+/// deferred as focused changes. `other` remains 0 (no structural parse bugs).
+/// Bump this as further work lands; never let it drift down.
+pub const BASELINE: usize = 647;
 
 const SpecExample = struct {
     markdown: []const u8,

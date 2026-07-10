@@ -980,24 +980,59 @@ fn builderAttrsOf(b: *Builder, id: Node.Id) AST.Attrs {
     return b.attrs.items[idx];
 }
 
-/// Trim + collapse internal whitespace runs to a single space + ASCII
-/// lowercase -- duplicated from `block.zig`'s (private) `normalizeLabel`
-/// rather than shared across files, so this file's link-label resolution
-/// stays self-contained. Must stay byte-for-byte in sync with that
-/// function, since both normalize against the SAME `Document.link_references`
-/// keys.
+/// Unicode simple case fold for the common bicameral scripts -- duplicated
+/// from `block.zig`'s `foldCodepointInto`, and must stay byte-for-byte in sync
+/// with it (both feed the SAME `Document.link_references` keys).
+fn foldRefCodepointInto(allocator: Allocator, out: *std.ArrayList(u8), cp: u21) Allocator.Error!void {
+    if (cp == 0x00DF or cp == 0x1E9E) { // ß, ẞ → "ss"
+        try out.appendSlice(allocator, "ss");
+        return;
+    }
+    const folded: u21 = switch (cp) {
+        'A'...'Z' => cp + 32,
+        0x00C0...0x00D6, 0x00D8...0x00DE => cp + 32, // Latin-1 À–Þ (skip × at 0xD7)
+        0x0391...0x03A1, 0x03A3...0x03AB => cp + 32, // Greek capitals (skip 0x03A2 hole)
+        0x0410...0x042F => cp + 32, // Cyrillic А–Я
+        else => cp,
+    };
+    var buf: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(folded, &buf) catch return;
+    try out.appendSlice(allocator, buf[0..n]);
+}
+
+/// Trim + collapse internal whitespace runs to a single space + Unicode case
+/// fold -- duplicated from `block.zig`'s (private) `normalizeLabel` rather
+/// than shared across files, so this file's link-label resolution stays
+/// self-contained. Must stay byte-for-byte in sync with that function, since
+/// both normalize against the SAME `Document.link_references` keys.
 fn normalizeRefLabel(allocator: Allocator, s: []const u8) Allocator.Error![]u8 {
     const trimmed = std.mem.trim(u8, s, " \t\r\n");
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     var in_ws = false;
-    for (trimmed) |c| {
+    var i: usize = 0;
+    while (i < trimmed.len) {
+        const c = trimmed[i];
         if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
             if (!in_ws) try out.append(allocator, ' ');
             in_ws = true;
-        } else {
+            i += 1;
+        } else if (c < 0x80) {
             try out.append(allocator, std.ascii.toLower(c));
             in_ws = false;
+            i += 1;
+        } else {
+            const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+            const end = @min(i + len, trimmed.len);
+            const cp = std.unicode.utf8Decode(trimmed[i..end]) catch {
+                try out.append(allocator, c);
+                in_ws = false;
+                i += 1;
+                continue;
+            };
+            try foldRefCodepointInto(allocator, &out, cp);
+            in_ws = false;
+            i = end;
         }
     }
     return out.toOwnedSlice(allocator);
@@ -1576,14 +1611,16 @@ fn scanHtmlCloseTag(text: []const u8, at: usize) ?usize {
 /// and (implied by "does not contain --", since the closer itself starts
 /// with `--`) does not end with `-`.
 fn scanHtmlComment(text: []const u8, at: usize) ?usize {
-    var j = at + 4;
-    if (j < text.len and text[j] == '>') return null;
-    if (j + 1 < text.len and text[j] == '-' and text[j + 1] == '>') return null;
-    while (j + 1 < text.len) : (j += 1) {
-        if (text[j] == '-' and text[j + 1] == '-') {
-            if (j + 2 < text.len and text[j + 2] == '>') return j + 3;
-            return null;
-        }
+    // CommonMark 0.31 (HTML5-aligned): an HTML comment is `<!-->`, `<!--->`,
+    // or `<!--` followed by any characters not containing the string `-->`
+    // and then `-->`. Searching for the FIRST `-->` guarantees the interior
+    // excludes it, and a bare `--` inside is now allowed (the pre-0.31 rule
+    // rejected `--` and the two empty forms -- spec ex625/626).
+    var j = at + 4; // past "<!--"
+    if (j < text.len and text[j] == '>') return j + 1; // <!-->
+    if (j + 1 < text.len and text[j] == '-' and text[j + 1] == '>') return j + 2; // <!--->
+    while (j + 2 < text.len) : (j += 1) {
+        if (text[j] == '-' and text[j + 1] == '-' and text[j + 2] == '>') return j + 3;
     }
     return null;
 }
