@@ -388,7 +388,10 @@ fn applyEditByLocator(
         .insert_before => editor.insertBeforeById(id, text),
         .insert_after => editor.insertAfterById(id, text),
         .insert_child => editor.insertChildById(id, child_index, text),
-        .delete => editor.deleteNodeById(id),
+        // Block-aware delete: for a whole-line node it also tidies the
+        // surrounding blank lines; for an inline node it degrades to the exact
+        // delete. See `Editor.deleteNodeSmart`.
+        .delete => editor.deleteNodeSmartById(id),
     };
     result catch |err| {
         switch (err) {

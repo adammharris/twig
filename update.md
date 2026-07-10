@@ -68,12 +68,19 @@ project to `fig` (which does the same for config formats).
   span-splice layer: lossless in-place edits via index paths. Primitive
   `replaceAtSpan` (splice → reparse → byte-for-byte rollback on failure); ops
   `replaceNode`/`replaceContent`/`insertBefore`/`insertAfter`/`insertChild`/
-  `deleteNode`. Runtime-dispatched over a `parseToAst` callback (djot/markdown
-  adapters free the `Document` side-table maps, hand back the bare `AST`).
-  Limits: no per-field spans (payload edits = whole-node replace), empty-djot-
-  container inserts need a `content_span` the parser leaves null, delete does no
-  whitespace cleanup — all candidates for editor increment 2. Ops now come in
-  path and `…ById` (node-id) forms; both converge on `replaceAtSpan`.
+  `deleteNode`/`deleteNodeSmart`. Runtime-dispatched over a `parseToAst`
+  callback whose signature carries an opaque parse-config `ctx`
+  (`Editor.ParseFn`), so an edited Markdown document reparses with the same
+  extension flags (`--directives`, …) on every keystroke; djot/markdown
+  adapters free the `Document` side-table maps and hand back the bare `AST`.
+  `deleteNodeSmart` (the CLI `--delete` default) is block-aware whitespace
+  cleanup: for a whole-line node it also swallows the block's terminating
+  newline and one blank-line separator (`A⏎⏎B⏎⏎C` → `A⏎⏎C`, trimming a dangling
+  separator at a document edge), and for a mid-line inline node it degrades to
+  the exact-span `deleteNode` (`tidyDeletionSpan`). Remaining limits: no
+  per-field spans (payload edits = whole-node replace), empty-djot-container
+  inserts need a `content_span` the parser leaves null. Ops come in path and
+  `…ById` (node-id) forms; both converge on `replaceAtSpan`.
 - **Selectors** (`src/ast/select.zig`, `twig query`) — content-based node
   addressing, the friendly alternative to raw index paths. CSS-lite:
   `heading[level=2]`, `heading("Status")`, `item[2]`, `link[dest^="http"]`,

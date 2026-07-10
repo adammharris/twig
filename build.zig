@@ -61,6 +61,27 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    // `zig build bench -- <file>`: parse a document under a counting allocator
+    // and report allocation counts/bytes. Force ReleaseFast unless the user
+    // overrode `-Doptimize` — bench numbers from a Debug build are noise.
+    const bench = b.addExecutable(.{
+        .name = "twig-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/main.zig"),
+            .target = target,
+            .optimize = if (b.user_input_options.contains("optimize")) optimize else .ReleaseFast,
+            .imports = &.{
+                .{ .name = "twig", .module = mod },
+            },
+        }),
+    });
+    const bench_step = b.step("bench", "Parse a file under a counting allocator (bench [--format f] [--iters N] <file>)");
+    const bench_cmd = b.addRunArtifact(bench);
+    bench_step.dependOn(&bench_cmd.step);
+    if (b.args) |args| {
+        bench_cmd.addArgs(args);
+    }
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
@@ -81,8 +102,17 @@ pub fn build(b: *std.Build) void {
 
     const run_c_lib_tests = b.addRunArtifact(c_lib_tests);
 
+    // The bench harness (`src/bench/`) isn't reachable from `mod`/`exe`, so its
+    // own `test {}` blocks (e.g. the counting allocator's) need a dedicated
+    // artifact to run under `zig build test`.
+    const bench_tests = b.addTest(.{
+        .root_module = bench.root_module,
+    });
+    const run_bench_tests = b.addRunArtifact(bench_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_c_lib_tests.step);
+    test_step.dependOn(&run_bench_tests.step);
 }

@@ -32,7 +32,9 @@
 //!     node's source. Per-field spans are future parser work.
 //!   - `deleteNode` removes exactly the node's span and nothing else (no
 //!     surrounding-whitespace cleanup) — predictable and lossless, but it can
-//!     leave a blank line behind. "Smart" delete is a later increment.
+//!     leave a blank line behind. `deleteNodeSmart` is the block-aware variant
+//!     that tidies the surrounding blank lines (and falls back to the exact
+//!     delete for an inline, mid-line node); the CLI's `--delete` uses it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -214,15 +216,99 @@ pub const Editor = struct {
         try self.replaceAtSpan(Span.init(at, at), text);
     }
 
-    /// Delete the node (remove exactly its span; no whitespace cleanup — see
-    /// the module doc comment).
+    /// Delete the node (remove exactly its span; no whitespace cleanup). The
+    /// predictable primitive — see `deleteNodeSmart` for the block-aware
+    /// variant that also tidies the surrounding blank lines.
     pub fn deleteNode(self: *Editor, path: []const usize) !void {
         try self.deleteNodeById(try self.ast.getIdByPath(path));
     }
     pub fn deleteNodeById(self: *Editor, id: Node.Id) !void {
         try self.replaceAtSpan(try self.nodeSpan(id), "");
     }
+
+    /// Delete the node, tidying surrounding whitespace so no dangling blank
+    /// line is left behind. For a node that occupies WHOLE LINES (a block —
+    /// paragraph, heading, list, container directive, …) this also removes the
+    /// block's terminating newline and one blank-line separator, collapsing
+    /// `A⏎⏎B⏎⏎C` down to `A⏎⏎C` when `B` is deleted (and trimming the now-
+    /// dangling separator at a document edge). For a MID-LINE node (an inline
+    /// — emphasis, a link) line surgery would be wrong, so it falls back to the
+    /// exact-span delete of `deleteNode`. See `tidyDeletionSpan`.
+    pub fn deleteNodeSmart(self: *Editor, path: []const usize) !void {
+        try self.deleteNodeSmartById(try self.ast.getIdByPath(path));
+    }
+    pub fn deleteNodeSmartById(self: *Editor, id: Node.Id) !void {
+        const span = try self.nodeSpan(id);
+        try self.replaceAtSpan(tidyDeletionSpan(self.source.items, span), "");
+    }
 };
+
+// ── smart-delete whitespace tidying ────────────────────────────────────────
+
+/// A line's content (its bytes excluding the terminating newline) is "blank"
+/// if it holds only spaces/tabs (and a lone `\r` from a CRLF ending).
+fn isBlankRun(s: []const u8) bool {
+    for (s) |c| {
+        if (c != ' ' and c != '\t' and c != '\r') return false;
+    }
+    return true;
+}
+
+/// From `from` (a line start), consume consecutive blank lines, returning the
+/// offset of the first non-blank line (or `source.len`). A trailing blank
+/// "line" with no newline (just whitespace before EOF) is consumed too.
+fn consumeBlankLinesForward(source: []const u8, from: usize) usize {
+    var i = from;
+    while (i < source.len) {
+        var j = i;
+        while (j < source.len and source[j] != '\n') j += 1;
+        if (!isBlankRun(source[i..j])) break;
+        i = if (j < source.len) j + 1 else j;
+        if (j >= source.len) break; // trailing blank without a newline
+    }
+    return i;
+}
+
+/// From `from` (a line start), consume consecutive PRECEDING blank lines,
+/// returning the start offset of the earliest one (or `from` if the previous
+/// line isn't blank / there is none).
+fn consumeBlankLinesBackward(source: []const u8, from: usize) usize {
+    var s = from;
+    while (s > 0 and source[s - 1] == '\n') {
+        const nl = s - 1; // the newline terminating the previous line
+        var pstart = nl;
+        while (pstart > 0 and source[pstart - 1] != '\n') pstart -= 1;
+        if (!isBlankRun(source[pstart..nl])) break;
+        s = pstart;
+    }
+    return s;
+}
+
+/// The range to delete for a "tidy" removal of a node whose exact span is
+/// `span`. If `span` occupies whole lines (starts at a line start and ends at
+/// a line end — i.e. a block), the returned range also swallows the block's
+/// terminating newline and the blank-line separator on one side: the trailing
+/// blanks normally (leaving the leading blank as the surviving neighbors'
+/// separator), or — when the block was the LAST thing in the document — the
+/// leading blanks too, so nothing dangles at EOF. A mid-line span (an inline
+/// node) is returned unchanged: exact delete, since line surgery there would
+/// clip unrelated text.
+fn tidyDeletionSpan(source: []const u8, span: Span) Span {
+    const len = source.len;
+    var s = span.start;
+    var e = span.end;
+
+    const at_line_start = (s == 0) or (s <= len and source[s - 1] == '\n');
+    const at_line_end = (e == len) or (e < len and (source[e] == '\n' or source[e] == '\r'));
+    if (!at_line_start or !at_line_end) return span;
+
+    if (e < len and source[e] == '\r') e += 1;
+    if (e < len and source[e] == '\n') e += 1;
+    e = consumeBlankLinesForward(source, e);
+    if (e >= len) s = consumeBlankLinesBackward(source, s);
+
+    return Span.init(s, e);
+}
 
 // ── tests ────────────────────────────────────────────────────────────────
 // XML is the test vehicle: it has real spans + `content_span` and, uniquely
@@ -307,4 +393,58 @@ test "path navigation reports out-of-bounds" {
     defer ed.deinit();
     try testing.expectError(error.PathOutOfBounds, ed.astView().getIdByPath(&.{ 0, 5 }));
     try testing.expectError(error.PathOutOfBounds, ed.astView().getIdByPath(&.{ 0, 0, 0 }));
+}
+
+// ── smart-delete (tidyDeletionSpan) ─────────────────────────────────────────
+
+/// Apply `tidyDeletionSpan` to `src` at `[start,end)` and return the resulting
+/// bytes (what a smart delete of that span would leave behind).
+fn tidyDelete(src: []const u8, start: usize, end: usize) [256]u8 {
+    var buf: [256]u8 = undefined;
+    const del = tidyDeletionSpan(src, Span.init(start, end));
+    const n = del.start + (src.len - del.end);
+    @memcpy(buf[0..del.start], src[0..del.start]);
+    @memcpy(buf[del.start..n], src[del.end..]);
+    return buf;
+}
+
+fn expectTidy(src: []const u8, start: usize, end: usize, want: []const u8) !void {
+    const buf = tidyDelete(src, start, end);
+    const del = tidyDeletionSpan(src, Span.init(start, end));
+    const got = buf[0 .. del.start + (src.len - del.end)];
+    try testing.expectEqualStrings(want, got);
+}
+
+test "tidyDeletionSpan: middle block leaves exactly one blank-line separator" {
+    // "A\n\nB\n\nC\n", delete B ([3,4)).
+    try expectTidy("A\n\nB\n\nC\n", 3, 4, "A\n\nC\n");
+}
+
+test "tidyDeletionSpan: first block leaves the rest clean at the top" {
+    try expectTidy("A\n\nB\n\nC\n", 0, 1, "B\n\nC\n");
+}
+
+test "tidyDeletionSpan: last block trims the now-dangling trailing blank" {
+    // "A\n\nB\n\nC\n", delete C ([6,7)) -> no trailing blank left after B.
+    try expectTidy("A\n\nB\n\nC\n", 6, 7, "A\n\nB\n");
+}
+
+test "tidyDeletionSpan: adjacent blocks with no blank line between them" {
+    try expectTidy("# A\n# B\n# C\n", 4, 7, "# A\n# C\n");
+}
+
+test "tidyDeletionSpan: a multi-line block plus its blank separator" {
+    // A two-line block between two others; delete it and one separator.
+    const src = "top\n\n:::x\nbody\n:::\n\nbottom\n";
+    // block span = the ":::x\nbody\n:::" region = [5, 18)
+    try expectTidy(src, 5, 18, "top\n\nbottom\n");
+}
+
+test "tidyDeletionSpan: the only block empties the document" {
+    try expectTidy("A\n", 0, 1, "");
+}
+
+test "tidyDeletionSpan: a mid-line (inline) span is deleted exactly, no line surgery" {
+    // "a *b* c\n", delete the "*b*" at [2,5): must NOT swallow the line.
+    try expectTidy("a *b* c\n", 2, 5, "a  c\n");
 }
