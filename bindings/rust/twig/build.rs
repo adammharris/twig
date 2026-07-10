@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -31,10 +32,20 @@ fn main() {
         panic!("`zig build` failed with status {status}");
     }
 
-    println!(
-        "cargo:rustc-link-search=native={}",
-        prefix.join("lib").display()
-    );
+    // Apple's `ld` rejects static-archive members that aren't 8-byte aligned,
+    // and Zig 0.16's built-in archiver can emit an unaligned `libtwig_zcu.o`
+    // (whether it trips depends on the object's size, so it surfaces as the
+    // library grows). Repack the archive with the system `ar`, which writes
+    // aligned members, on Apple targets; other linkers accept Zig's archive
+    // as-is.
+    let lib_dir = prefix.join("lib");
+    let link_dir = if cargo_target.contains("apple") {
+        repack_archive_for_apple_ld(&lib_dir.join("libtwig.a"), &out_dir)
+    } else {
+        lib_dir
+    };
+
+    println!("cargo:rustc-link-search=native={}", link_dir.display());
     println!("cargo:rustc-link-lib=static=twig");
 
     println!("cargo:rerun-if-env-changed=TWIG_ZIG_ROOT");
@@ -51,6 +62,68 @@ fn main() {
         source_root.join("bindings/c/include/twig.h").display()
     );
 }
+
+/// Rebuild `libtwig.a` with the system `ar` so every member is 8-byte aligned
+/// (see the call site). Returns a directory containing the repacked
+/// `libtwig.a` for `rustc-link-search`. Falls back to the original archive's
+/// directory if any step fails, so a missing `ar` degrades to the (possibly
+/// failing) direct link rather than a confusing build-script panic.
+fn repack_archive_for_apple_ld(orig: &Path, out_dir: &Path) -> PathBuf {
+    let fallback = || orig.parent().unwrap().to_path_buf();
+
+    let work = out_dir.join("repack");
+    let _ = fs::remove_dir_all(&work);
+    if fs::create_dir_all(&work).is_err() {
+        return fallback();
+    }
+
+    // Extract, then repack. Zig writes members with no permission bits, so the
+    // extracted objects must be made readable before `ar` can re-add them.
+    if !run_ok(Command::new("ar").arg("x").arg(orig).current_dir(&work)) {
+        return fallback();
+    }
+
+    let mut objects = Vec::new();
+    let Ok(entries) = fs::read_dir(&work) else {
+        return fallback();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "o") {
+            make_readable(&path);
+            objects.push(path);
+        }
+    }
+    if objects.is_empty() {
+        return fallback();
+    }
+
+    let repacked = work.join("libtwig.a");
+    let _ = fs::remove_file(&repacked);
+    let mut cmd = Command::new("ar");
+    cmd.arg("crs").arg(&repacked).args(&objects);
+    if !run_ok(&mut cmd) || !repacked.is_file() {
+        return fallback();
+    }
+    work
+}
+
+fn run_ok(cmd: &mut Command) -> bool {
+    cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn make_readable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(perms.mode() | 0o600);
+        let _ = fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(not(unix))]
+fn make_readable(_path: &Path) {}
 
 fn zig_source_root(manifest_dir: &Path) -> PathBuf {
     if let Some(dir) = env::var_os("TWIG_ZIG_ROOT") {

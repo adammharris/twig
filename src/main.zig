@@ -21,7 +21,6 @@ const Io = std.Io;
 const cli_args = @import("cli/args.zig");
 const cli_format = @import("cli/format.zig");
 const cli_actions = @import("cli/actions.zig");
-const cli_ast_json = @import("cli/ast_json.zig");
 
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
@@ -83,5 +82,4 @@ test {
     _ = cli_args;
     _ = cli_format;
     _ = cli_actions;
-    _ = cli_ast_json;
 }

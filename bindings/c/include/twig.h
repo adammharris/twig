@@ -10,6 +10,7 @@ extern "C" {
 #define TWIG_FORMAT_DJOT 1
 #define TWIG_FORMAT_MARKDOWN 2
 #define TWIG_FORMAT_XML 3
+#define TWIG_FORMAT_HTML 4
 
 typedef enum TwigStatus {
     TWIG_STATUS_OK = 0,
@@ -22,22 +23,33 @@ typedef enum TwigStatus {
 
 typedef struct TwigDocument TwigDocument;
 
-// A byte range [start, end) into the source. One entry per code-like AST
-// node (inline code span, fenced/indented code block, raw inline/block
-// escape) from `twig_document_code_spans` — everything a plain-text scan
-// for a link-like construct (e.g. a wikilink `[[...]]`) should treat as
-// opaque, since it is code, not prose.
+// A byte range [start, end) into the source.
 typedef struct TwigSpan {
     size_t start;
     size_t end;
 } TwigSpan;
+
+// One node matched by `twig_document_query`. `content_span` is only meaningful
+// when `has_content_span` is non-zero (a leaf, or a container the parser left
+// without a known interior, reports has_content_span == 0 and a zeroed
+// content_span). `kind` is a NUL-terminated node-kind name (e.g. "heading",
+// "code_block") in static, library-owned storage: never free it; it stays
+// valid for the process lifetime.
+typedef struct TwigQueryMatch {
+    uint32_t node_id;
+    TwigSpan span;
+    TwigSpan content_span;
+    int has_content_span;
+    const char *kind;
+} TwigQueryMatch;
 
 // Packed as (major << 16) | (minor << 8) | patch.
 uint32_t twig_version(void);
 // Null-terminated "major.minor.patch" string in static library-owned storage.
 const char *twig_version_string(void);
 
-// Parse input bytes into a document handle.
+// Parse input bytes into a document handle. `format` is one of the
+// TWIG_FORMAT_* codes.
 TwigStatus twig_parse(
     const uint8_t *input,
     size_t input_len,
@@ -48,7 +60,8 @@ TwigStatus twig_parse(
 // Destroy a document handle.
 void twig_document_destroy(TwigDocument *doc);
 
-// Render a parsed document to HTML.
+// Render a parsed document to HTML. For Djot/Markdown this is the rich
+// rendering path that resolves reference/footnote side tables.
 //
 // The returned bytes are borrowed from `doc` and remain valid until the next
 // `twig_document_render_html` call on that same handle, or until the handle is
@@ -59,16 +72,47 @@ TwigStatus twig_document_render_html(
     size_t *out_len
 );
 
-// Find every code-like span (inline code, code blocks, raw inline/block
-// escapes) in a parsed document, so a caller doing its own text-level scan
-// for link-like constructs can exclude matches that fall inside one.
+// Serialize a parsed document to `format`'s own source syntax: a round-trip
+// when `format` matches the document's own format, cross-format conversion
+// otherwise (e.g. parse Markdown, serialize as Djot). Returns
+// TWIG_STATUS_UNSUPPORTED_FORMAT when the requested direction has no
+// serializer (today: converting into XML from another format).
 //
-// The returned spans are borrowed from `doc` and remain valid until the next
-// `twig_document_code_spans` call on that same handle, or until the handle
-// is destroyed.
-TwigStatus twig_document_code_spans(
+// The returned bytes are borrowed from `doc` and remain valid until the next
+// `twig_document_serialize` call on that same handle, or until the handle is
+// destroyed.
+TwigStatus twig_document_serialize(
     TwigDocument *doc,
-    const TwigSpan **out_ptr,
+    int format,
+    const uint8_t **out_ptr,
+    size_t *out_len
+);
+
+// Encode the parsed document's AST as pretty-printed JSON (the same encoding
+// as `twig convert -o ast`).
+//
+// The returned bytes are borrowed from `doc` and remain valid until the next
+// `twig_document_ast_json` call on that same handle, or until the handle is
+// destroyed.
+TwigStatus twig_document_ast_json(
+    TwigDocument *doc,
+    const uint8_t **out_ptr,
+    size_t *out_len
+);
+
+// Resolve a CSS-lite selector (e.g. "heading[level=2]", "link[dest^=\"http\"]",
+// "code", "list > item") against a parsed document, yielding one match per
+// node in document order. A malformed selector returns
+// TWIG_STATUS_INVALID_ARGUMENT.
+//
+// The returned matches are borrowed from `doc` and remain valid until the next
+// `twig_document_query` call on that same handle, or until the handle is
+// destroyed.
+TwigStatus twig_document_query(
+    TwigDocument *doc,
+    const uint8_t *selector,
+    size_t selector_len,
+    const TwigQueryMatch **out_ptr,
     size_t *out_len
 );
 

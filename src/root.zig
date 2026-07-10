@@ -51,6 +51,12 @@ pub const Editor = @import("ast/editor.zig").Editor;
 /// See `ast/select.zig`'s module doc comment.
 pub const Select = @import("ast/select.zig");
 
+/// A stable, inspectable JSON encoding of the shared `AST`
+/// (`ast_json.encode`/`encodeAlloc`) — the engine behind `twig convert -o ast`
+/// and the C ABI's `twig_document_ast_json`. See `ast/json.zig`'s module doc
+/// comment.
+pub const ast_json = @import("ast/json.zig");
+
 test {
     _ = AST;
     _ = Djot;
@@ -59,4 +65,5 @@ test {
     _ = Markdown;
     _ = @import("ast/editor.zig");
     _ = Select;
+    _ = ast_json;
 }

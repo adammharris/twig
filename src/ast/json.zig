@@ -1,10 +1,14 @@
-//! `convert -o ast`'s implementation: a stable, inspectable JSON encoding of
-//! the shared `AST`, for debugging parsers and diffing tree shapes across
-//! runs. Every node becomes an object with a `"kind"` tag (the `Node.Kind`
-//! union's tag name, e.g. `"heading"`, `"str"`), a `"span"` byte range, that
-//! kind's own payload fields inlined (switching exhaustively over
-//! `AST.Node.Kind` — see `writeKindPayload`), and `"attrs"`/`"children"` when
-//! non-empty.
+//! A stable, inspectable JSON encoding of the shared `AST`, for debugging
+//! parsers and diffing tree shapes across runs. This is a LIBRARY module
+//! (exported from `root.zig` as `twig.ast_json`) so every surface can reach
+//! it: `twig convert -o ast` (`cli/actions.zig`) and the C ABI's
+//! `twig_document_ast_json` (`c_abi.zig`) both call `encode`/`encodeAlloc`
+//! here rather than each carrying their own encoder.
+//!
+//! Every node becomes an object with a `"kind"` tag (the `Node.Kind` union's
+//! tag name, e.g. `"heading"`, `"str"`), a `"span"` byte range, that kind's
+//! own payload fields inlined (switching exhaustively over `AST.Node.Kind` —
+//! see `writeKindPayload`), and `"attrs"`/`"children"` when non-empty.
 //!
 //! Escaping correctness comes for free from `std.json.Stringify.write`,
 //! which is used for every leaf value (strings, ints, bools, `?T`, and even
@@ -17,11 +21,11 @@
 //! `[]node`-shaped value `write`'s reflection could walk on its own.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 const Stringify = std.json.Stringify;
 
-const twig = @import("twig");
-const AST = twig.AST;
+const AST = @import("ast.zig");
 const Node = AST.Node;
 
 /// Encode `ast` (rooted at `ast.root`) as pretty-printed (2-space indent)
@@ -32,6 +36,18 @@ pub fn encode(ast: *const AST, writer: *Writer) Writer.Error!void {
     var w: Stringify = .{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
     try writeNode(&w, ast, ast.root);
     try writer.writeByte('\n');
+}
+
+/// `encode` into a freshly allocated, caller-owned buffer. The underlying
+/// `Writer.Allocating` only ever fails on allocation, so the encoder's
+/// `Writer.Error` collapses to `Allocator.Error` here.
+pub fn encodeAlloc(allocator: Allocator, ast: *const AST) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    encode(ast, &out.writer) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    return out.toOwnedSlice();
 }
 
 fn writeNode(w: *Stringify, ast: *const AST, id: Node.Id) Writer.Error!void {
@@ -262,16 +278,6 @@ fn writeKindPayload(w: *Stringify, kind: Node.Kind) Writer.Error!void {
 }
 
 const testing = std.testing;
-const Allocator = std.mem.Allocator;
-
-fn encodeAlloc(allocator: Allocator, ast: *const AST) ![]u8 {
-    var out: Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    encode(ast, &out.writer) catch |err| switch (err) {
-        error.WriteFailed => return error.OutOfMemory,
-    };
-    return out.toOwnedSlice();
-}
 
 test "encode: leaf node gets kind/span, omits content_span/attrs/children when absent" {
     var b = AST.Builder.init(testing.allocator);

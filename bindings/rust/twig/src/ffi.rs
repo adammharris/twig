@@ -20,6 +20,7 @@ pub enum TwigFormat {
     Djot = 1,
     Markdown = 2,
     Xml = 3,
+    Html = 4,
 }
 
 pub enum TwigDocument {}
@@ -30,6 +31,20 @@ pub enum TwigDocument {}
 pub struct TwigSpan {
     pub start: usize,
     pub end: usize,
+}
+
+/// C ABI mirror of Zig's `TwigQueryMatch` — one node returned by
+/// `twig_document_query`. `content_span` is only meaningful when
+/// `has_content_span` is non-zero. `kind` is a NUL-terminated node-kind name
+/// in static, library-owned storage (never freed).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TwigQueryMatch {
+    pub node_id: u32,
+    pub span: TwigSpan,
+    pub content_span: TwigSpan,
+    pub has_content_span: c_int,
+    pub kind: *const c_char,
 }
 
 unsafe extern "C" {
@@ -47,9 +62,22 @@ unsafe extern "C" {
         out_ptr: *mut *const u8,
         out_len: *mut usize,
     ) -> TwigStatus;
-    pub fn twig_document_code_spans(
+    pub fn twig_document_serialize(
         doc: *mut TwigDocument,
-        out_ptr: *mut *const TwigSpan,
+        format: c_int,
+        out_ptr: *mut *const u8,
+        out_len: *mut usize,
+    ) -> TwigStatus;
+    pub fn twig_document_ast_json(
+        doc: *mut TwigDocument,
+        out_ptr: *mut *const u8,
+        out_len: *mut usize,
+    ) -> TwigStatus;
+    pub fn twig_document_query(
+        doc: *mut TwigDocument,
+        selector: *const u8,
+        selector_len: usize,
+        out_ptr: *mut *const TwigQueryMatch,
         out_len: *mut usize,
     ) -> TwigStatus;
 }

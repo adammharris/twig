@@ -23,7 +23,10 @@ const twig = @import("twig");
 
 const format = @import("format.zig");
 const args_mod = @import("args.zig");
-const ast_json = @import("ast_json.zig");
+// The AST-JSON encoder lives in the library now (`twig.ast_json`) so the CLI
+// and the C ABI share one implementation; this alias keeps the call sites
+// below (`ast_json.encode`) unchanged.
+const ast_json = twig.ast_json;
 
 /// The single error every action in this file returns after it has already
 /// printed (and flushed) an explanatory message to `stderr` — see this
