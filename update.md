@@ -160,11 +160,21 @@ divergences from issues #1/#3 below — i.e. remaining markdown work is render-s
 
 ## Next steps
 
-0. **Document metadata (`---<lang>`)** — proposal in
-   [`document-metadata.md`](./document-metadata.md): replace the frontmatter
-   `raw_block` hack with a first-class `metadata{lang,text}` node, front-and/or-
-   endmatter at the document edges, parsed into a `fig` value and projected to
-   HTML as a `<script type>` data island.
+0. **Document metadata (`---<lang>`)** — design in
+   [`document-metadata.md`](./document-metadata.md).
+   - DONE (1a): first-class `metadata{lang,text}` node replacing the frontmatter
+     `raw_block` hack; tagged `---<lang>` fences (`---` = yaml, `+++` = toml,
+     `----` stays a thematic break); stored as-written (lossless), HTML
+     projected to a `<script type="application/<lang>">` data island; a
+     `</script` detect-and-refuse guard (`error.UnsafeMetadata`, C ABI
+     `unsafe_metadata`, Rust `Error::UnsafeMetadata`); selectors `metadata`/
+     `meta`/`frontmatter` + `[lang=…]`; Markdown/Djot canonical round-trip.
+   - DONE (1b): trailing **endmatter** — a tagged `---<lang>` … `---` block at
+     the document tail (blank-separated from the body), appended as the doc's
+     last child. Front+end coexist as two sibling `metadata` nodes.
+   - TODO (Stage 2): hoist front+end blocks into ONE parsed doc-level `fig`
+     record (needs the merge/collision policy + per-key provenance decisions,
+     and is where a per-format safe `</script` re-encode would live).
 1. **Markdown Phase 4 — CommonMark-faithful HTML rendering.** The ~150 residual
    conformance failures are all rendering conventions, needing a "CommonMark
    mode" on the shared printer (which djot depends on, so this needs a design

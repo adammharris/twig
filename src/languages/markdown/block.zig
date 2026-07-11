@@ -839,6 +839,15 @@ pub const Parser = struct {
     /// `processLine` checks this first and no-ops for any `idx` still below
     /// it, so the driving loop doesn't need to change at all.
     skip_until_line: usize = 0,
+    /// The trailing mirror of `skip_until_line`: `processLine` no-ops for any
+    /// `idx` at or above this. Set by `tryConsumeEndmatter` to the endmatter
+    /// opener line so the body scan never sees the trailing metadata block.
+    /// `maxInt` (the default) means "no endmatter" — nothing is trailing-skipped.
+    stop_at_line: usize = std.math.maxInt(usize),
+    /// The endmatter `metadata` node, built up-front by `tryConsumeEndmatter`
+    /// but appended to the doc as its LAST child only after the body scan (so
+    /// it lands after every body block). Null when there is no endmatter.
+    endmatter_id: ?Node.Id = null,
 
     pub fn init(allocator: Allocator, source: []const u8, options: Options) Allocator.Error!Parser {
         var lines = std.ArrayList([]const u8).empty;
@@ -908,7 +917,10 @@ pub const Parser = struct {
     }
 
     pub fn parse(self: *Parser) Allocator.Error!BlockResult {
-        if (self.options.frontmatter) try self.tryConsumeFrontmatter();
+        if (self.options.frontmatter) {
+            try self.tryConsumeFrontmatter();
+            try self.tryConsumeEndmatter();
+        }
         for (self.lines, 0..) |line, idx| {
             try self.processLine(line, idx);
         }
@@ -917,9 +929,21 @@ pub const Parser = struct {
         // front of a closing paragraph, which the loop above and this
         // final `closeLeaf` cover) -- safe to resolve every deferred leaf
         // text block's inline content now, forward references included.
-        try self.closeLeaf(if (self.lines.len == 0) 0 else self.lines.len - 1);
-        while (self.stack.items.len > 1) try self.popContainer(if (self.lines.len == 0) 0 else self.lines.len - 1);
+        //
+        // Close the body at its last line. With endmatter present that's the
+        // line just below the opener (`stop_at_line - 1`, the mandatory blank
+        // separator), NOT the document's final line — otherwise a trailing
+        // open container's span would stretch across the endmatter block.
+        const close_idx = if (self.endmatter_id != null)
+            self.stop_at_line - 1
+        else if (self.lines.len == 0) 0 else self.lines.len - 1;
+        try self.closeLeaf(close_idx);
+        while (self.stack.items.len > 1) try self.popContainer(close_idx);
         try self.resolvePendingInline();
+
+        // Endmatter is appended last, after every body block, so it lands as
+        // the doc's final child (the root is the sole remaining stack entry).
+        if (self.endmatter_id) |id| try self.appendToTop(id);
 
         var root = self.stack.pop().?;
         defer root.deinit(self.allocator);
@@ -1322,6 +1346,8 @@ pub const Parser = struct {
         // definition list, or frontmatter block) started at an earlier
         // `idx` -- see `skip_until_line`'s doc comment.
         if (idx < self.skip_until_line) return;
+        // Part of a trailing endmatter block -- see `stop_at_line`.
+        if (idx >= self.stop_at_line) return;
         const m = self.matchContainers(line);
         const cur = m.cur;
 
@@ -2062,11 +2088,11 @@ pub const Parser = struct {
     /// the SAME delimiter. If no such closing line exists, this is NOT
     /// frontmatter at all (falls through to ordinary parsing — a bare
     /// leading `---` with no closer is just a thematic break, same as with
-    /// the flag off). On success, the whole block becomes a single
-    /// `raw_block{format="yaml"|"toml"}` node (see this file's/the
-    /// mission's rationale: the shared HTML printer only ever emits
-    /// `raw_block` text for `format == "html"`, so this renders as nothing
-    /// in the HTML body while staying fully inspectable via `-o ast`).
+    /// the flag off). On success, the whole block becomes a single inert
+    /// `metadata{lang,text}` node (see `document-metadata.md`): it never
+    /// renders into the HTML body — the printer projects it to a
+    /// `<script type=…>` data island — while staying fully inspectable via
+    /// `-o ast`. See `tryConsumeEndmatter` for the trailing counterpart.
     fn tryConsumeFrontmatter(self: *Parser) Allocator.Error!void {
         if (self.lines.len == 0) return;
         const first = std.mem.trimEnd(u8, self.lines[0], " \t");
@@ -2109,6 +2135,64 @@ pub const Parser = struct {
             return;
         }
         // No closing delimiter anywhere in the document: not frontmatter.
+    }
+
+    /// A trailing `---<lang>` … `---` endmatter block (the back-of-book
+    /// counterpart to frontmatter; see `document-metadata.md`). Tried ONCE
+    /// after `tryConsumeFrontmatter`, before the main scan. Unlike frontmatter,
+    /// endmatter MUST carry an explicit language tag: a bare `---` away from
+    /// the top is a CommonMark thematic break (and after a paragraph, a setext
+    /// underline), so only a tagged `---<lang>` opener is unambiguous. It must
+    /// also be separated from the body by a blank line — that blank both reads
+    /// naturally and lets the body scan close cleanly at it, so the trailing
+    /// block never tangles with an open paragraph/list. The node is built here
+    /// but appended by `parse` as the doc's LAST child. Recognition rules:
+    ///   - the last non-blank line is exactly `---` (the closer);
+    ///   - scanning up from it, the nearest `---<lang>` line is the opener;
+    ///   - the line just above the opener is blank, and sits at or after the
+    ///     frontmatter boundary (`skip_until_line`) so the two never overlap.
+    /// Any of these failing means "no endmatter" — the tail parses normally.
+    fn tryConsumeEndmatter(self: *Parser) Allocator.Error!void {
+        if (self.lines.len == 0) return;
+
+        // The closer: the last non-blank line, which must be a bare `---`.
+        var last = self.lines.len;
+        while (last > 0) : (last -= 1) {
+            if (!isBlankLine(self.lines[last - 1])) break;
+        }
+        if (last == 0) return; // all blank
+        last -= 1;
+        if (!std.mem.eql(u8, std.mem.trimEnd(u8, self.lines[last], " \t"), "---")) return;
+        if (last < self.skip_until_line + 2) return; // no room for opener+blank+closer
+
+        // The opener: the nearest tagged `---<lang>` line above the closer,
+        // not scanning into consumed frontmatter.
+        var open = last;
+        const lo = self.skip_until_line;
+        while (open > lo) {
+            open -= 1;
+            const t = std.mem.trimEnd(u8, self.lines[open], " \t");
+            if (!std.mem.startsWith(u8, t, "---")) continue;
+            const rest = std.mem.trim(u8, t[3..], " \t");
+            if (!isLangTag(rest)) continue;
+            // Found a tagged opener. It's endmatter only if the separator
+            // blank sits above it (and after any frontmatter).
+            if (open == 0 or open - 1 < self.skip_until_line) return;
+            if (!isBlankLine(self.lines[open - 1])) return;
+
+            var text = std.ArrayList(u8).empty;
+            defer text.deinit(self.allocator);
+            for (self.lines[open + 1 .. last]) |content_line| {
+                try text.appendSlice(self.allocator, content_line);
+                try text.append(self.allocator, '\n');
+            }
+            const id = try self.builder.addLeaf(.{ .metadata = .{ .lang = rest, .text = text.items } });
+            self.builder.setSpan(id, Span.init(self.lineStart(open), self.lineEnd(last)));
+            self.endmatter_id = id;
+            self.stop_at_line = open;
+            return;
+        }
+        // No tagged opener above the closer: not endmatter.
     }
 
     // ── Phase 3: GFM tables ──────────────────────────────────────────────
@@ -3300,6 +3384,78 @@ test "frontmatter: a lone `<script` (no close) is inert raw text and still rende
     const html = try Html.serializeAlloc(testing.allocator, &r.ast, null);
     defer testing.allocator.free(html);
     try testing.expect(std.mem.startsWith(u8, html, "<script type=\"application/figl\">\n"));
+}
+
+test "endmatter: a trailing `---<lang>` block becomes the doc's last child" {
+    var r = try parse(testing.allocator, "# Body\n\ntext\n\n---toml\nisbn = \"1-2-3\"\n---\n", .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+
+    // Body first (heading, paragraph), metadata LAST.
+    const root = r.ast.root;
+    var last: Node.Id = r.ast.nodes[root].first_child.?;
+    while (r.ast.nodes[last].next_sibling) |n| last = n;
+    try testing.expect(r.ast.nodes[last].kind == .metadata);
+    try testing.expectEqualStrings("toml", r.ast.nodes[last].kind.metadata.lang);
+    try testing.expectEqualStrings("isbn = \"1-2-3\"\n", r.ast.nodes[last].kind.metadata.text);
+
+    // The heading really is first — endmatter didn't swallow the body.
+    const first = r.ast.nodes[root].first_child.?;
+    try testing.expect(r.ast.nodes[first].kind == .heading);
+}
+
+test "endmatter: front AND end matter coexist on one document" {
+    var r = try parse(testing.allocator, "---figl\ntitle = Twig\n---\n\n# Body\n\n---toml\nisbn = \"x\"\n---\n", .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+
+    const first = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[first].kind == .metadata);
+    try testing.expectEqualStrings("figl", r.ast.nodes[first].kind.metadata.lang);
+
+    var last: Node.Id = first;
+    while (r.ast.nodes[last].next_sibling) |n| last = n;
+    try testing.expect(r.ast.nodes[last].kind == .metadata);
+    try testing.expectEqualStrings("toml", r.ast.nodes[last].kind.metadata.lang);
+    try testing.expect(first != last);
+}
+
+test "endmatter: round-trips through the Markdown serializer" {
+    const src = "# Body\n\n---toml\nisbn = \"x\"\n---\n";
+    var r = try parse(testing.allocator, src, .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const md = try @import("serializer.zig").serializeAstAlloc(testing.allocator, &r.ast);
+    defer testing.allocator.free(md);
+    // The trailing block re-emits as `---toml` … `---`.
+    try testing.expect(std.mem.indexOf(u8, md, "---toml\nisbn = \"x\"\n---\n") != null);
+}
+
+test "endmatter: an untagged trailing `---` block is NOT endmatter (thematic breaks)" {
+    // Bare `---` is ambiguous away from the top, so it parses as ordinary
+    // CommonMark: `text` + thematic break + `k = v` paragraph + thematic break.
+    var r = try parse(testing.allocator, "text\n\n---\nk = v\n---\n", .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    var last: Node.Id = r.ast.nodes[r.ast.root].first_child.?;
+    while (r.ast.nodes[last].next_sibling) |n| last = n;
+    try testing.expect(r.ast.nodes[last].kind != .metadata);
+}
+
+test "endmatter: a tagged trailing block with no blank separator is NOT endmatter" {
+    // Without the mandatory blank line above the opener, the tail parses
+    // normally (here the `---toml` is a lazy paragraph continuation).
+    var r = try parse(testing.allocator, "text\n---toml\nk = v\n---\n", .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    var last: Node.Id = r.ast.nodes[r.ast.root].first_child.?;
+    while (r.ast.nodes[last].next_sibling) |n| last = n;
+    try testing.expect(r.ast.nodes[last].kind != .metadata);
 }
 
 test "frontmatter: `----` (four dashes) is a thematic break, not a metadata fence" {

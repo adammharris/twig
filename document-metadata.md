@@ -56,6 +56,15 @@ Concretely, a `---<lang>` block may appear:
 - at the **bottom** of the document (endmatter),
 - **not** in the middle.
 
+Both are **implemented** (Markdown parser). Frontmatter is a leading `---`/
+`+++`/`---<lang>` fence. Endmatter is a trailing `---<lang>` fence — it *must*
+carry a language tag (a bare `---` away from the top is a thematic break /
+setext underline, so only a tagged opener is unambiguous) and *must* be
+separated from the body by a blank line (which also lets the body scan close
+cleanly at it). A front and an end block on the same document coexist as two
+distinct sibling `metadata` nodes today; collapsing them into one logical
+record is the Stage-2 hoist (see below).
+
 ### The book analogy
 
 This maps exactly onto how a physical book carries metadata:
