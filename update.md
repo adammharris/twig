@@ -172,9 +172,17 @@ divergences from issues #1/#3 below — i.e. remaining markdown work is render-s
    - DONE (1b): trailing **endmatter** — a tagged `---<lang>` … `---` block at
      the document tail (blank-separated from the body), appended as the doc's
      last child. Front+end coexist as two sibling `metadata` nodes.
-   - TODO (Stage 2): hoist front+end blocks into ONE parsed doc-level `fig`
-     record (needs the merge/collision policy + per-key provenance decisions,
-     and is where a per-format safe `</script` re-encode would live).
+   - OUT OF SCOPE for Twig: parsing a `metadata` block's `text` into a
+     structured value, merging front+end into one record, and editing keys is a
+     **fig-integration layer** (a separate `twig-fig` library / optional
+     module), NOT Twig core — Twig deliberately treats the bytes as opaque and
+     never links a config parser. The merge/collision policy and per-key
+     provenance are fig's (config) decisions; the round-trip composes fig's
+     per-key spans with Twig's existing `replaceAtSpan` splice. Seam hook for
+     when it's built: give `metadata` a `content_span` (verbatim interior) so
+     fig's spans map to absolute offsets by `base + offset` even on `\r\n`.
+     See `document-metadata.md` → "Library boundary". Twig's own metadata work
+     is complete.
 1. **Markdown Phase 4 — CommonMark-faithful HTML rendering.** The ~150 residual
    conformance failures are all rendering conventions, needing a "CommonMark
    mode" on the shared printer (which djot depends on, so this needs a design

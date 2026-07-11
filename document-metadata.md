@@ -1,6 +1,10 @@
 # Document Metadata: the `---<lang>` proposal
 
-> Status: proposal / design note. Nothing here is implemented yet.
+> Status: **implemented** in Twig at the block level (the `metadata` node,
+> front + end matter, HTML `<script>` projection with the `</script` refusal
+> guard). Parsing that block's text into a structured, queryable, editable
+> value is **out of scope for Twig** — it belongs to a fig-integration layer
+> (see "Library boundary" below).
 > Scope of this doc: **document-level** metadata only. Region-scoped
 > metadata is a separate concern (see "Two scopes" and "Future work").
 
@@ -10,7 +14,10 @@ Document metadata is a **`fig` value attached to a scope**. A `---<lang>`
 block, and where it sits in the file, are just an *encoding* of that value —
 not the thing itself.
 
-Everything below follows from taking that sentence literally.
+Everything below follows from taking that sentence literally. Note the division
+of labor it implies: Twig owns the *block* (an inert, typed, span-carrying
+region of the document); **fig** owns turning that block's bytes into the
+*value*. Twig never parses config.
 
 ## What metadata *is*
 
@@ -63,7 +70,7 @@ setext underline, so only a tagged opener is unambiguous) and *must* be
 separated from the body by a blank line (which also lets the body scan close
 cleanly at it). A front and an end block on the same document coexist as two
 distinct sibling `metadata` nodes today; collapsing them into one logical
-record is the Stage-2 hoist (see below).
+record is a fig-integration concern, not Twig's (see "Library boundary").
 
 ### The book analogy
 
@@ -131,14 +138,45 @@ Rejected alternatives:
   own key=value mini-language; they can't carry an embedded TOML/fig document.
   (They *are* the right tool for region scope — see Future work.)
 
-## Model: one record per scope, hoisted out of the block stream
+## Library boundary: where Twig stops and fig begins
 
-- Document metadata is **exactly one logical record** per document, stored in a
-  **side-table on the doc node** (like `attrs`) — not left as a positioned
-  block in the content stream. Block children stay pure content; metadata is
-  queryable separately.
-- The record's value is a **`fig` value**. `---yaml` / `---toml` / `---fig` /
-  `---json` are all parsed *into* that one structured model.
+The seam is the `metadata` node itself. Twig produces an inert, typed block
+with its raw `text`, its `lang`, and its absolute span, and treats the bytes as
+opaque. Turning those bytes into a structured value — and merging, querying, and
+editing it — is **fig's** job, reached through a thin integration layer. Twig
+never links a config parser.
+
+| Concern | Owner |
+|---|---|
+| Where metadata lives, that it's inert, its raw `text`, its `lang`, its span, refusing unsafe HTML | **Twig** (done) |
+| Parse `(lang, text)` → a structured value; merge two config trees; per-key spans; edit a key and re-serialize | **fig** |
+| "These front + end blocks are one doc scope; hand their text to fig; splice fig's edits back" | **thin glue** (a `twig-fig` integration / optional module) |
+
+Why this cut:
+
+- **No duplicated grammars.** yaml/toml/figl/json parsing is fig's competency;
+  baking it into Twig would fork four evolving config grammars. The `lang`+`text`
+  node was the escape from exactly that.
+- **The core dependency stays clean and optional.** Twig stays format-agnostic
+  and config-parser-free; "parse my metadata into values" is opt-in glue.
+- **The round-trip composes.** fig edits the text slice and returns new bytes;
+  Twig splices the node with its existing `replaceAtSpan` editor. Neither
+  reimplements the other — editing a metadata key is the same splice machinery
+  as any other edit.
+- **The hard decisions belong to fig, not Twig.** Merge/collision policy and
+  per-key provenance are *config* semantics; they were only ever "open" because
+  they were mis-filed under Twig. See "Handed to the fig layer" below.
+
+What stays in Twig: the *convention* that document metadata lives at the edges
+and that front + end are one logical scope. Twig's parser encodes that. fig
+merges the values; Twig decides which blocks feed the merge.
+
+**Seam hook for the round-trip.** For fig's per-key spans to map to absolute
+document offsets by a clean `base + offset`, the node's interior bytes must be a
+*verbatim* slice of the source. Today `text` is a newline-normalized copy, so
+the mapping is exact only for `\n` files (it diverges on `\r\n`). Giving the
+node a `content_span` (the verbatim interior, like Twig's other containers) is
+the natural hook to add when the integration is built — not needed before then.
 
 ### AST node
 
@@ -166,8 +204,8 @@ The one accepted consequence: `fig` and `figl` are **distinct** identities
 losslessness; unify at query time via a selector alias if ever needed, never in
 storage.
 
-Sketch (not final): `metadata: struct { lang: []const u8, text: []const u8 }`,
-plus a parsed `fig` value on the doc node once fig-parsing is wired in.
+Shipped: `metadata: struct { lang: []const u8, text: []const u8 }`. Any parsed
+`fig` value lives in the integration layer, not on the Twig node.
 
 ## Round-trip across formats
 
@@ -200,32 +238,37 @@ escape, the HTML printer **refuses** (`error.UnsafeMetadata`, C ABI
 document. The guard is deliberately conservative (any `</script`,
 case-insensitive) — legitimate frontmatter never contains it. The obscurer
 `<!--`+`<script` double-escape can only *swallow* trailing markup (a
-non-injection corruption) and is left to the Stage-2 pass. Contrast `<code>`
+non-injection corruption) and is left as a documented edge (a per-format safe
+re-encode would live in the fig-integration layer, which knows the value's
+structure). Contrast `<code>`
 (the old code-block projection), which is PCDATA and entity-encodes `<`/`&`/`>`
 on disk — safe, but the raw slice is no longer verbatim config.
 
 ## Input liberal, output opinionated
 
-- **Liberal on input:** accept `---`/`---<lang>` at top, bottom, or both; any
-  supported language; merge them all into the scope's one record.
-- **Opinionated on model:** one logical record per scope, hoisted to a
-  side-table.
-- **Opinionated on output:** when Twig *writes*, emit one canonical block
-  (default position/encoding, or preserve what it read), so round-tripping
-  doesn't multiply blocks.
+- **Liberal on input:** Twig accepts `---`/`---<lang>` at top, bottom, or both,
+  in any language, and preserves each as its own `metadata` node.
+- **Opinionated on output:** Twig re-emits each block losslessly in its own
+  language, at its own edge.
+- **The one-logical-record view** (merging front + end into a single queryable
+  record) is the fig-integration layer's model, not Twig's — see below.
 
-## Two decisions still open
+## Handed to the fig layer (not Twig's to decide)
+
+These were the "open decisions" while this was mis-scoped as Twig work. They are
+*config* semantics, so they belong to fig / the integration layer:
 
 1. **Merge / collision policy.** When the front block says `title = A` and the
    back block says `title = B`, what wins? Candidate: deep-merge maps,
-   last-in-document-order wins for scalar collisions, with a diagnostic.
-   Alternative: hard error on conflict (defensible for a precision tool).
-2. **Provenance for editing.** This is the hard part and the thing that makes
-   Twig *Twig*: if a key came from the back block and someone edits it, the
-   round-trip must rewrite the **back** block, not the front. That means
-   tracking a source span **per key**, not just per block. The span machinery
-   can do it; most tools can't, which is why they don't offer editable
-   metadata.
+   last-in-document-order wins for scalar collisions, with a diagnostic;
+   hard-error-on-conflict is the stricter alternative. Either way it's a
+   config-tree merge — fig's operation, not Twig's.
+2. **Provenance for editing.** If a key came from the back block and someone
+   edits it, the round-trip must rewrite the **back** block. fig produces
+   per-key spans *within* a block's text; Twig already owns the block's absolute
+   span and the splice (`replaceAtSpan`); the glue composes the two offsets (via
+   the `content_span` seam hook above). Most tools can't do this because they
+   have neither half; Twig + fig have both.
 
 ## Why hasn't anyone done this?
 
@@ -258,6 +301,13 @@ template glue and becomes a database keyed on your corpus.
 
 ## Future work (explicitly out of scope for now)
 
+- **The fig-integration layer** — parse a `metadata` node's `text` as its
+  `lang` into a fig value; merge front + end into one record; edit keys and
+  splice back through Twig's editor. A separate library / optional module, per
+  "Library boundary" above. Needs, on the fig side, string-level span-preserving
+  edits and graceful handling of a `lang` fig doesn't support (Twig accepts any
+  `---<anything>`; the glue returns raw-text-only for unknown languages rather
+  than failing).
 - **Region-scope metadata with a language declaration.** Djot already solves
   scoped attributes (`{...}`) — but only in Djot's own key=value mini-language,
   with no way to say "this scoped block is fig / toml / json". A future markup
