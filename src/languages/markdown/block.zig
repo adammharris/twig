@@ -3269,6 +3269,39 @@ test "frontmatter: an arbitrary config language flows through the application/<l
     try testing.expect(std.mem.startsWith(u8, html, "<script type=\"application/edn\">\n"));
 }
 
+test "frontmatter: HTML printer refuses a metadata body containing `</script` (injection guard)" {
+    var r = try parse(testing.allocator, "---figl\nx = \"</script><img src=x onerror=alert(1)>\"\n---\n# Body\n", .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    try testing.expectError(error.UnsafeMetadata, Html.serializeAlloc(testing.allocator, &r.ast, null));
+
+    // The other surfaces stay lossless — only the raw-text HTML island is unsafe.
+    const md = try @import("serializer.zig").serializeAstAlloc(testing.allocator, &r.ast);
+    defer testing.allocator.free(md);
+    try testing.expect(std.mem.indexOf(u8, md, "</script>") != null);
+}
+
+test "frontmatter: the `</script` guard is case-insensitive" {
+    var r = try parse(testing.allocator, "---figl\nx = \"a </SCRIPT b\"\n---\n", .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    try testing.expectError(error.UnsafeMetadata, Html.serializeAlloc(testing.allocator, &r.ast, null));
+}
+
+test "frontmatter: a lone `<script` (no close) is inert raw text and still renders" {
+    // Without a `</script`, the content can't break out of the island, so the
+    // guard must NOT over-refuse it.
+    var r = try parse(testing.allocator, "---figl\nx = \"see <script src=x>\"\n---\n", .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const html = try Html.serializeAlloc(testing.allocator, &r.ast, null);
+    defer testing.allocator.free(html);
+    try testing.expect(std.mem.startsWith(u8, html, "<script type=\"application/figl\">\n"));
+}
+
 test "frontmatter: `----` (four dashes) is a thematic break, not a metadata fence" {
     var r = try parse(testing.allocator, "----\nfoo\n", .{ .frontmatter = true });
     defer r.ast.deinit();

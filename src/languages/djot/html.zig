@@ -66,10 +66,12 @@ pub fn renderAlloc(allocator: Allocator, doc: *const Document, options: RenderOp
     var out: Writer.Allocating = .init(allocator);
     defer out.deinit();
     // `Writer.Allocating` only ever fails (`error.WriteFailed`) when its own
-    // backing allocation fails, so both halves of `RenderError` collapse to
-    // `error.OutOfMemory` here.
+    // backing allocation fails, so it collapses to `error.OutOfMemory`. The
+    // djot parser never produces `metadata` nodes, so the shared printer's
+    // `error.UnsafeMetadata` refusal is unreachable from a djot AST.
     render(allocator, doc, &out.writer, options) catch |err| switch (err) {
         error.WriteFailed, error.OutOfMemory => return error.OutOfMemory,
+        error.UnsafeMetadata => unreachable,
     };
     return out.toOwnedSlice();
 }

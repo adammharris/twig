@@ -141,7 +141,19 @@ pub const KV = struct { key: []const u8, value: []const u8 };
 /// Most render functions can both write and allocate (footnote index/id
 /// tracking, `alt`-text extraction), so they share this combined error set —
 /// same reasoning as `djot/html.zig`'s `RenderError`.
-pub const RenderError = Writer.Error || Allocator.Error;
+///
+/// `error.UnsafeMetadata`: a `metadata` node's body contains `</script`, which
+/// cannot be represented in a raw-text `<script>` data island — it would
+/// terminate the element early, corrupting the document and opening a
+/// script-injection vector. Raw text has no escape mechanism, so the printer
+/// refuses rather than emit unsafe HTML (see the `.metadata` arm).
+pub const RenderError = Writer.Error || Allocator.Error || error{UnsafeMetadata};
+
+/// Error set of the `…Alloc` wrappers: an in-memory `Writer.Allocating` only
+/// fails on allocation, so `error.WriteFailed` collapses into
+/// `error.OutOfMemory` — but `error.UnsafeMetadata` is a genuine content
+/// refusal that must reach the caller (see `RenderError`).
+pub const RenderAllocError = Allocator.Error || error{UnsafeMetadata};
 
 /// HTML5 void elements (https://html.spec.whatwg.org/#void-elements):
 /// looked up by tag NAME alone, taking precedence over `content_span` for
@@ -662,6 +674,17 @@ pub const Renderer = struct {
                 if (std.mem.eql(u8, v.format, "html")) try self.writer.writeAll(v.text);
             },
             .metadata => |v| {
+                // Raw-text refusal guard. `<script>` content is verbatim with
+                // NO escape mechanism, so a `</script` in the body would end
+                // the element early — corrupting the doc and opening a script-
+                // injection vector. There's no fidelity-preserving escape for
+                // raw text, so refuse rather than emit unsafe HTML. Deliberately
+                // conservative (any `</script`, case-insensitive); legitimate
+                // frontmatter never contains it. (The obscurer `<!--`+`<script`
+                // double-escape can only *swallow* trailing markup, not inject —
+                // a lesser, non-injection corruption left to the Stage-2 pass.)
+                if (std.ascii.indexOfIgnoreCase(v.text, "</script") != null)
+                    return error.UnsafeMetadata;
                 // Inert, self-describing data island: a `<script>` whose type
                 // isn't a JS MIME is neither executed nor displayed by the
                 // browser, so document metadata stays in the file without
@@ -963,19 +986,20 @@ pub fn serializeOpts(allocator: Allocator, ast: *const AST, writer: *Writer, ctx
 }
 
 /// Convenience wrapper: serialize to an owned string.
-pub fn serializeAlloc(allocator: Allocator, ast: *const AST, ctx: ?*const Context) Allocator.Error![]u8 {
+pub fn serializeAlloc(allocator: Allocator, ast: *const AST, ctx: ?*const Context) RenderAllocError![]u8 {
     return serializeAllocOpts(allocator, ast, ctx, .{});
 }
 
 /// Like `serializeAlloc`, but with explicit render-convention `options`.
-pub fn serializeAllocOpts(allocator: Allocator, ast: *const AST, ctx: ?*const Context, options: RenderOptions) Allocator.Error![]u8 {
+pub fn serializeAllocOpts(allocator: Allocator, ast: *const AST, ctx: ?*const Context, options: RenderOptions) RenderAllocError![]u8 {
     var out: Writer.Allocating = .init(allocator);
     defer out.deinit();
     // `Writer.Allocating` only ever fails (`error.WriteFailed`) when its own
-    // backing allocation fails, so both halves of `RenderError` collapse to
-    // `error.OutOfMemory` here (mirrors `djot/html.zig`'s `renderAlloc`).
+    // backing allocation fails, so it collapses to `error.OutOfMemory`;
+    // `error.UnsafeMetadata` propagates as a real content refusal.
     serializeOpts(allocator, ast, &out.writer, ctx, options) catch |err| switch (err) {
         error.WriteFailed, error.OutOfMemory => return error.OutOfMemory,
+        error.UnsafeMetadata => return error.UnsafeMetadata,
     };
     return out.toOwnedSlice();
 }

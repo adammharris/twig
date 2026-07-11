@@ -20,6 +20,7 @@ pub const RenderOptions = serializer_mod.RenderOptions;
 pub const Context = serializer_mod.Context;
 pub const KV = serializer_mod.KV;
 pub const RenderError = serializer_mod.RenderError;
+pub const RenderAllocError = serializer_mod.RenderAllocError;
 pub const Renderer = serializer_mod.Renderer;
 pub const Parser = parser_mod.Parser;
 pub const ParseError = parser_mod.ParseError;

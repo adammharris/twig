@@ -24,6 +24,11 @@ pub const TwigStatus = enum(c_int) {
     /// The edit produced a document that no longer parses; it was rolled back
     /// and nothing changed. Editor-only.
     edit_conflict = 8,
+    /// A `metadata` node's body contains `</script`, which can't be emitted
+    /// into a raw-text `<script>` HTML data island without breaking out of the
+    /// element (an injection vector). The HTML printer refused. Render/
+    /// serialize-to-HTML only.
+    unsafe_metadata = 9,
     internal_error = 255,
 };
 
@@ -200,7 +205,7 @@ fn astOf(parsed: *const ParsedDocument) *const twig.AST {
     };
 }
 
-fn renderHtml(allocator: Allocator, parsed: *const ParsedDocument) Allocator.Error![]u8 {
+fn renderHtml(allocator: Allocator, parsed: *const ParsedDocument) twig.Html.RenderAllocError![]u8 {
     return switch (parsed.*) {
         .djot => |*doc| twig.Djot.html.renderAlloc(allocator, doc, .{}),
         .markdown => |*doc| twig.Markdown.html.renderAlloc(allocator, doc, .{}),
@@ -223,6 +228,7 @@ pub export fn twig_document_render_html(
 
     const rendered = renderHtml(allocator, &handle.parsed) catch |err| switch (err) {
         error.OutOfMemory => return .out_of_memory,
+        error.UnsafeMetadata => return .unsafe_metadata,
     };
 
     if (handle.rendered.len != 0) allocator.free(handle.rendered);
@@ -249,7 +255,7 @@ fn serializeDocument(
     allocator: Allocator,
     parsed: *const ParsedDocument,
     target: TwigFormat,
-) Allocator.Error!?[]u8 {
+) twig.Html.RenderAllocError!?[]u8 {
     if (std.meta.activeTag(parsed.*) == target) {
         return switch (parsed.*) {
             .djot => |*doc| try twig.Djot.serializer.serializeAlloc(allocator, doc),
@@ -296,6 +302,7 @@ pub export fn twig_document_serialize(
 
     const serialized = (serializeDocument(allocator, &handle.parsed, target) catch |err| switch (err) {
         error.OutOfMemory => return .out_of_memory,
+        error.UnsafeMetadata => return .unsafe_metadata,
     }) orelse return .unsupported_format;
 
     if (handle.serialized.len != 0) allocator.free(handle.serialized);

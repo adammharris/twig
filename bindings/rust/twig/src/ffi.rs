@@ -15,6 +15,7 @@ impl TwigStatus {
     pub const AMBIGUOUS: c_int = 6;
     pub const NOT_EDITABLE: c_int = 7;
     pub const EDIT_CONFLICT: c_int = 8;
+    pub const UNSAFE_METADATA: c_int = 9;
     pub const INTERNAL_ERROR: c_int = 255;
 }
 

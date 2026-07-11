@@ -17,6 +17,10 @@ pub enum Error {
     /// The edit produced a document that no longer parses; it was rolled back
     /// (editor).
     EditConflict,
+    /// A metadata block's body contains `</script`, so it can't be emitted into
+    /// a raw-text `<script>` HTML data island without an injection risk; the
+    /// HTML printer refused (render/serialize-to-HTML).
+    UnsafeMetadata,
     Internal,
 }
 
@@ -32,6 +36,7 @@ impl Error {
             ffi::TwigStatus::AMBIGUOUS => Err(Self::Ambiguous),
             ffi::TwigStatus::NOT_EDITABLE => Err(Self::NotEditable),
             ffi::TwigStatus::EDIT_CONFLICT => Err(Self::EditConflict),
+            ffi::TwigStatus::UNSAFE_METADATA => Err(Self::UnsafeMetadata),
             _ => Err(Self::Internal),
         }
     }
@@ -48,6 +53,7 @@ impl fmt::Display for Error {
             Error::Ambiguous => f.write_str("selector matched more than one node"),
             Error::NotEditable => f.write_str("node has no editable span"),
             Error::EditConflict => f.write_str("edit produced an unparseable document"),
+            Error::UnsafeMetadata => f.write_str("metadata contains </script; unsafe to embed in HTML"),
             Error::Internal => f.write_str("internal error"),
         }
     }

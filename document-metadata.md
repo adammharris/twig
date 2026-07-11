@@ -180,6 +180,21 @@ schema.org), which is the web's own "document metadata" mechanism. On the HTML
 parse side, a `<script>` with a non-JS `type` becomes a `metadata` node instead
 of the usual `element{name:"script"}`.
 
+**Raw-text safety guard (implemented).** A `<script>` is a *raw text* element:
+its body is verbatim with no escape mechanism, terminated only by the literal
+`</script`. That's what makes it round-trip losslessly (the raw slice between
+the fences *is* the config source, no entity-decoding) — but it also means a
+`</script` inside the body would end the element early, corrupting the document
+and opening a script-injection vector. Since raw text has no fidelity-preserving
+escape, the HTML printer **refuses** (`error.UnsafeMetadata`, C ABI
+`unsafe_metadata`) rather than emit unsafe output; it never writes a partial
+document. The guard is deliberately conservative (any `</script`,
+case-insensitive) — legitimate frontmatter never contains it. The obscurer
+`<!--`+`<script` double-escape can only *swallow* trailing markup (a
+non-injection corruption) and is left to the Stage-2 pass. Contrast `<code>`
+(the old code-block projection), which is PCDATA and entity-encodes `<`/`&`/`>`
+on disk — safe, but the raw slice is no longer verbatim config.
+
 ## Input liberal, output opinionated
 
 - **Liberal on input:** accept `---`/`---<lang>` at top, bottom, or both; any

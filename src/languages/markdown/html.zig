@@ -61,14 +61,16 @@ pub fn render(allocator: Allocator, doc: *const Document, writer: *Writer, optio
 }
 
 /// Convenience wrapper: render to an owned string.
-pub fn renderAlloc(allocator: Allocator, doc: *const Document, options: RenderOptions) Allocator.Error![]u8 {
+pub fn renderAlloc(allocator: Allocator, doc: *const Document, options: RenderOptions) Html.RenderAllocError![]u8 {
     var out: Writer.Allocating = .init(allocator);
     defer out.deinit();
     // `Writer.Allocating` only ever fails (`error.WriteFailed`) when its own
-    // backing allocation fails, so both halves of `RenderError` collapse to
-    // `error.OutOfMemory` here.
+    // backing allocation fails, so it collapses to `error.OutOfMemory`;
+    // `error.UnsafeMetadata` propagates as a real content refusal (a `metadata`
+    // node whose body contains `</script`).
     render(allocator, doc, &out.writer, options) catch |err| switch (err) {
         error.WriteFailed, error.OutOfMemory => return error.OutOfMemory,
+        error.UnsafeMetadata => return error.UnsafeMetadata,
     };
     return out.toOwnedSlice();
 }
