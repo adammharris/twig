@@ -49,6 +49,7 @@ pub fn main(init: std.process.Init) !void {
             cli_args.ArgError.MissingEditArgument,
             cli_args.ArgError.MissingEditOperation,
             cli_args.ArgError.MissingSelector,
+            cli_args.ArgError.MissingFilterSelector,
             => cli_actions.runHelp(stderr_writer, "twig") catch {},
             else => {},
         }
@@ -69,6 +70,9 @@ pub fn main(init: std.process.Init) !void {
             error.ActionFailed => std.process.exit(1),
         },
         .query => cli_actions.runQuery(arena, io, stdout_writer, stderr_writer, config.options.query) catch |err| switch (err) {
+            error.ActionFailed => std.process.exit(1),
+        },
+        .filter => cli_actions.runFilter(arena, io, stdout_writer, stderr_writer, config.options.filter) catch |err| switch (err) {
             error.ActionFailed => std.process.exit(1),
         },
     }

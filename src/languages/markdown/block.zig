@@ -135,6 +135,21 @@ fn isBlankLine(s: []const u8) bool {
     return true;
 }
 
+/// A frontmatter language tag (`figl`, `toml`, `ld+json`): starts with a
+/// letter, then letters/digits/`-_.+`. Two jobs: (1) gate a `---<tag>` fence
+/// apart from a `----` thematic break (whose remainder, `-`, isn't a valid
+/// tag), and (2) guarantee the tag is a legal MIME subtype, since the HTML
+/// projection derives the type mechanically as `application/<tag>` — this
+/// admitted set is a strict subset of RFC 6838's subtype grammar, so no
+/// escaping is ever needed.
+fn isLangTag(s: []const u8) bool {
+    if (s.len == 0 or !std.ascii.isAlphabetic(s[0])) return false;
+    for (s) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.' and c != '+') return false;
+    }
+    return true;
+}
+
 /// Columns of leading whitespace from `cur`'s logical position (`col+spent`)
 /// to the first non-whitespace byte, tabs advancing to the next multiple-of-4
 /// column (per CommonMark's tab-handling rule).
@@ -2055,17 +2070,31 @@ pub const Parser = struct {
     fn tryConsumeFrontmatter(self: *Parser) Allocator.Error!void {
         if (self.lines.len == 0) return;
         const first = std.mem.trimEnd(u8, self.lines[0], " \t");
-        const format: []const u8 = if (std.mem.eql(u8, first, "---"))
-            "yaml"
-        else if (std.mem.eql(u8, first, "+++"))
-            "toml"
+        const delim: []const u8 = if (std.mem.startsWith(u8, first, "---"))
+            "---"
+        else if (std.mem.startsWith(u8, first, "+++"))
+            "+++"
+        else
+            return;
+
+        // Optional language tag after the delimiter, fenced-code-block style
+        // (`---fig`). A bare fence defaults by delimiter (`---` = yaml, `+++`
+        // = toml). A non-empty remainder that ISN'T a valid language token
+        // means this isn't frontmatter at all — `----` stays a thematic break.
+        const rest = std.mem.trim(u8, first[3..], " \t");
+        const lang: []const u8 = if (rest.len == 0)
+            (if (delim[0] == '-') "yaml" else "toml")
+        else if (isLangTag(rest))
+            rest // stored exactly as written; MIME is derived as application/<lang>
         else
             return;
 
         var i: usize = 1;
         while (i < self.lines.len) : (i += 1) {
+            // The closer is the bare delimiter run, tag-free (like a closing
+            // code fence), so `---fig` … `---`.
             const line = std.mem.trimEnd(u8, self.lines[i], " \t");
-            if (!std.mem.eql(u8, line, first)) continue;
+            if (!std.mem.eql(u8, line, delim)) continue;
 
             var text = std.ArrayList(u8).empty;
             defer text.deinit(self.allocator);
@@ -2073,7 +2102,7 @@ pub const Parser = struct {
                 try text.appendSlice(self.allocator, content_line);
                 try text.append(self.allocator, '\n');
             }
-            const id = try self.builder.addLeaf(.{ .raw_block = .{ .format = format, .text = text.items } });
+            const id = try self.builder.addLeaf(.{ .metadata = .{ .lang = lang, .text = text.items } });
             self.builder.setSpan(id, Span.init(self.lineStart(0), self.lineEnd(i)));
             try self.appendToTop(id);
             self.skip_until_line = i + 1;
@@ -3174,34 +3203,79 @@ test "footnotes OFF: '[^a]:' is an ordinary link reference definition, not colle
 
 // ── Phase 3: frontmatter ──────────────────────────────────────────────────
 
-test "frontmatter: a leading YAML block becomes a raw_block, not rendered to HTML" {
+test "frontmatter: a leading YAML block becomes a metadata node, not rendered to HTML body" {
     var r = try parse(testing.allocator, "---\ntitle: Hi\n---\n# Heading\n", .{ .frontmatter = true });
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
     defer r.footnotes.deinit(testing.allocator);
 
     const fm = r.ast.nodes[r.ast.root].first_child.?;
-    try testing.expect(r.ast.nodes[fm].kind == .raw_block);
-    try testing.expectEqualStrings("yaml", r.ast.nodes[fm].kind.raw_block.format);
-    try testing.expectEqualStrings("title: Hi\n", r.ast.nodes[fm].kind.raw_block.text);
+    try testing.expect(r.ast.nodes[fm].kind == .metadata);
+    try testing.expectEqualStrings("yaml", r.ast.nodes[fm].kind.metadata.lang);
+    try testing.expectEqualStrings("title: Hi\n", r.ast.nodes[fm].kind.metadata.text);
 
     const heading = r.ast.nodes[fm].next_sibling.?;
     try testing.expect(r.ast.nodes[heading].kind == .heading);
 
+    // Metadata projects to an inert `<script type>` data island — no body text.
     const html = try Html.serializeAlloc(testing.allocator, &r.ast, null);
     defer testing.allocator.free(html);
-    try testing.expectEqualStrings("<h1>Heading</h1>\n", html);
+    try testing.expectEqualStrings("<script type=\"application/yaml\">\ntitle: Hi\n</script>\n<h1>Heading</h1>\n", html);
 }
 
-test "frontmatter: a leading TOML (+++) block is tagged format=\"toml\"" {
+test "frontmatter: a leading TOML (+++) block is tagged lang=\"toml\"" {
     var r = try parse(testing.allocator, "+++\ntitle = \"Hi\"\n+++\nbody\n", .{ .frontmatter = true });
     defer r.ast.deinit();
     defer r.link_references.deinit(testing.allocator);
     defer r.footnotes.deinit(testing.allocator);
     const fm = r.ast.nodes[r.ast.root].first_child.?;
-    try testing.expect(r.ast.nodes[fm].kind == .raw_block);
-    try testing.expectEqualStrings("toml", r.ast.nodes[fm].kind.raw_block.format);
-    try testing.expectEqualStrings("title = \"Hi\"\n", r.ast.nodes[fm].kind.raw_block.text);
+    try testing.expect(r.ast.nodes[fm].kind == .metadata);
+    try testing.expectEqualStrings("toml", r.ast.nodes[fm].kind.metadata.lang);
+    try testing.expectEqualStrings("title = \"Hi\"\n", r.ast.nodes[fm].kind.metadata.text);
+}
+
+test "frontmatter: the language tag is stored as-written; MIME is application/<lang>" {
+    var r = try parse(testing.allocator, "---fig\ntitle = Twig\n---\n# Twig\n", .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const fm = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[fm].kind == .metadata);
+    // No normalization: `fig` stays `fig` (and `figl` would stay `figl`).
+    try testing.expectEqualStrings("fig", r.ast.nodes[fm].kind.metadata.lang);
+    try testing.expectEqualStrings("title = Twig\n", r.ast.nodes[fm].kind.metadata.text);
+
+    // Round-trips losslessly: `---fig` in, `---fig` out.
+    const md = try @import("serializer.zig").serializeAstAlloc(testing.allocator, &r.ast);
+    defer testing.allocator.free(md);
+    try testing.expect(std.mem.startsWith(u8, md, "---fig\ntitle = Twig\n---\n"));
+
+    // MIME is derived mechanically: `application/fig`.
+    const html = try Html.serializeAlloc(testing.allocator, &r.ast, null);
+    defer testing.allocator.free(html);
+    try testing.expect(std.mem.startsWith(u8, html, "<script type=\"application/fig\">\n"));
+}
+
+test "frontmatter: an arbitrary config language flows through the application/<lang> rule" {
+    var r = try parse(testing.allocator, "---edn\n{:title \"Hi\"}\n---\nbody\n", .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const fm = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[fm].kind == .metadata);
+    try testing.expectEqualStrings("edn", r.ast.nodes[fm].kind.metadata.lang);
+    const html = try Html.serializeAlloc(testing.allocator, &r.ast, null);
+    defer testing.allocator.free(html);
+    try testing.expect(std.mem.startsWith(u8, html, "<script type=\"application/edn\">\n"));
+}
+
+test "frontmatter: `----` (four dashes) is a thematic break, not a metadata fence" {
+    var r = try parse(testing.allocator, "----\nfoo\n", .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const first = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[first].kind == .thematic_break);
 }
 
 test "frontmatter: an unterminated leading '---' block falls back to ordinary parsing" {

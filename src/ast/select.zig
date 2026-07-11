@@ -419,6 +419,7 @@ fn kindNameMatches(name: []const u8, tag: std.meta.Tag(Node.Kind)) bool {
     if (eqAny(name, &.{"list"})) return tag == .bullet_list or tag == .ordered_list or tag == .task_list or tag == .definition_list;
     if (eqAny(name, &.{"item"})) return tag == .list_item or tag == .task_list_item or tag == .definition_list_item;
     if (eqAny(name, &.{"code"})) return tag == .code_block;
+    if (eqAny(name, &.{ "metadata", "meta", "frontmatter" })) return tag == .metadata;
     if (eqAny(name, &.{ "emph", "em", "emphasis", "italic" })) return tag == .emph;
     if (eqAny(name, &.{ "strong", "bold", "b" })) return tag == .strong;
     if (eqAny(name, &.{ "quote", "blockquote" })) return tag == .block_quote;
@@ -470,6 +471,7 @@ fn attrMatches(ast: *const AST, id: Node.Id, pred: AttrPred) bool {
     if (std.mem.eql(u8, pred.key, "lang")) {
         const l: ?[]const u8 = switch (node.kind) {
             .code_block => |c| c.lang,
+            .metadata => |m| m.lang,
             else => null,
         };
         return if (l) |ll| opMatch(pred.op, ll, pred.value) else false;

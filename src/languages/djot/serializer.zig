@@ -257,6 +257,18 @@ const Renderer = struct {
             },
             .code_block => |cb| try self.writeCodeFence(ctx, cb.lang, cb.text),
             .raw_block => |rb| try self.writeCodeFence(ctx, rb.format, rb.text),
+            .metadata => |m| {
+                // Front/end matter: `---<lang>` … `---` (bare `---` for yaml).
+                try self.writePrefix(ctx);
+                if (std.mem.eql(u8, m.lang, "yaml"))
+                    try self.writer.writeAll("---\n")
+                else
+                    try self.writer.print("---{s}\n", .{m.lang});
+                if (m.text.len > 0) try self.writer.writeAll(m.text);
+                if (m.text.len == 0 or m.text[m.text.len - 1] != '\n') try self.writer.writeByte('\n');
+                try self.writePrefix(ctx);
+                try self.writer.writeAll("---\n");
+            },
             .bullet_list => |bl| {
                 const marker: []const u8 = switch (bl.style) {
                     .dash => "- ",

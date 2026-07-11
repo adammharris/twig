@@ -152,6 +152,12 @@ fn writeKindPayload(w: *Stringify, kind: Node.Kind) Writer.Error!void {
             try w.objectField("text");
             try w.write(r.text);
         },
+        .metadata => |m| {
+            try w.objectField("lang");
+            try w.write(m.lang);
+            try w.objectField("text");
+            try w.write(m.text);
+        },
         .bullet_list => |b| {
             try w.objectField("style");
             try w.write(b.style);

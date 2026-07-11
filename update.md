@@ -55,20 +55,26 @@ project to `fig` (which does the same for config formats).
   - Markdown parsing is now FEATURE-COMPLETE. Remaining markdown work is
     render-side only (Phase 4, below).
 - **CLI** (`src/main.zig` + `src/cli/`) — `twig convert [-i F] [-o html|ast|
-  canonical] <file|->`, `twig identify`, and `twig edit`. Extension inference +
+  canonical] <file|->`, `twig identify`, `twig edit`, `twig query`, and `twig
+  filter`. Extension inference +
   `-i` override (including `.html`/`.htm`); extensible format registry (one entry per language — `parse`,
   `parseToAst`, `renderHtml`, optional `serializeCanonical`). `-o ast` = pretty
   JSON dump; `-o canonical` = round-trip serializer (XML, Djot, Markdown).
   Markdown extension flags (`--directives`/`--math`/`--commonmark`/`--gfm`) on
-  `convert`/`query`/`edit`, threaded as a `format.ParseConfig` through the parse
+  `convert`/`query`/`edit`/`filter`, threaded as a `format.ParseConfig` through the parse
   adapters (and through the editor's reparse, so an edited directive document
   stays parseable). The registry's `parseToAst` now matches `Editor.ParseFn`
   (leading opaque parse-config context — see below).
+  `twig filter <file> --drop <sel> [--keep <sel>] [--unwrap]` prunes a document
+  (the `Filter` library helper below): removes every `--drop` match except those
+  also matching `--keep`, then optionally unwraps the survivors — the Diaryx
+  audience-filter path (`--drop 'directive[name=vis]' --keep
+  'directive[class~=public]' --unwrap` = "public view").
 - **Editor** (`src/ast/editor.zig`, reader path-nav, `twig edit`) — the
   span-splice layer: lossless in-place edits via index paths. Primitive
   `replaceAtSpan` (splice → reparse → byte-for-byte rollback on failure); ops
   `replaceNode`/`replaceContent`/`insertBefore`/`insertAfter`/`insertChild`/
-  `deleteNode`/`deleteNodeSmart`. Runtime-dispatched over a `parseToAst`
+  `deleteNode`/`deleteNodeSmart`/`unwrapNode`. Runtime-dispatched over a `parseToAst`
   callback whose signature carries an opaque parse-config `ctx`
   (`Editor.ParseFn`), so an edited Markdown document reparses with the same
   extension flags (`--directives`, …) on every keystroke; djot/markdown
@@ -77,10 +83,15 @@ project to `fig` (which does the same for config formats).
   cleanup: for a whole-line node it also swallows the block's terminating
   newline and one blank-line separator (`A⏎⏎B⏎⏎C` → `A⏎⏎C`, trimming a dangling
   separator at a document edge), and for a mid-line inline node it degrades to
-  the exact-span `deleteNode` (`tidyDeletionSpan`). Remaining limits: no
-  per-field spans (payload edits = whole-node replace), empty-djot-container
-  inserts need a `content_span` the parser leaves null. Ops come in path and
-  `…ById` (node-id) forms; both converge on `replaceAtSpan`.
+  the exact-span `deleteNode` (`tidyDeletionSpan`). `unwrapNode` (CLI
+  `--unwrap`) replaces a node with the verbatim source of its `content_span` —
+  peel a `:::vis{…}` container down to just its blocks — degrading to a smart
+  delete for an empty/childless one; exact for unprefixed containers
+  (directives/divs), but a marker-prefixed container (block quote `>`, list
+  indent) keeps its markers (serializer-assisted stripping is future work).
+  Remaining limits: no per-field spans (payload edits = whole-node replace),
+  empty-djot-container inserts need a `content_span` the parser leaves null.
+  Ops come in path and `…ById` (node-id) forms; both converge on `replaceAtSpan`.
 - **Selectors** (`src/ast/select.zig`, `twig query`) — content-based node
   addressing, the friendly alternative to raw index paths. CSS-lite:
   `heading[level=2]`, `heading("Status")`, `item[2]`, `link[dest^="http"]`,
@@ -98,6 +109,21 @@ project to `fig` (which does the same for config formats).
   (`a b`) and child (`a > b`) combinators work, with per-step `:nth` scoping
   (`list:nth(2) > item("dishes")` = that bullet in the 2nd list only). NOT yet:
   `section("Title")` — layers on this same engine (needs a small CLI span-wire).
+- **Filter** (`src/ast/filter.zig`, `twig.Filter`, `twig filter`) — declarative
+  document pruning over Select + Editor, one layer up from the single-node edit
+  ops. `Filter.apply(gpa, *Editor, .{ .drop, .keep, .unwrap_kept })`: remove
+  every `drop`-selector match except those also matched by `keep`, then
+  optionally unwrap the survivors. Loops + re-resolves both selectors against
+  the CURRENT tree each step (the editor reparses per edit, invalidating ids),
+  acting on one node at a time; bounded by the initial node count with a
+  `FilterDidNotConverge` backstop. The Diaryx audience filter is exactly this:
+  drop `directive[name=vis]`, keep `directive[class~=public]`, unwrap → a
+  public-only rendering of the document. Exposed across all three surfaces: the
+  `twig filter` CLI verb, the C ABI (`twig_editor_filter`, plus
+  `twig_editor_unwrap`/`twig_editor_delete_smart` and a
+  `twig_editor_create_ext` that takes a `TWIG_MD_*` extension bitmask so the
+  editor parses directives), and the Rust bindings (`Editor::filter`/
+  `unwrap_node`/`delete_smart`/`new_ext` with `MarkdownExtensions`).
 
 ## Test status
 
@@ -134,6 +160,11 @@ divergences from issues #1/#3 below — i.e. remaining markdown work is render-s
 
 ## Next steps
 
+0. **Document metadata (`---<lang>`)** — proposal in
+   [`document-metadata.md`](./document-metadata.md): replace the frontmatter
+   `raw_block` hack with a first-class `metadata{lang,text}` node, front-and/or-
+   endmatter at the document edges, parsed into a `fig` value and projected to
+   HTML as a `<script type>` data island.
 1. **Markdown Phase 4 — CommonMark-faithful HTML rendering.** The ~150 residual
    conformance failures are all rendering conventions, needing a "CommonMark
    mode" on the shared printer (which djot depends on, so this needs a design

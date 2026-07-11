@@ -12,6 +12,11 @@ extern "C" {
 #define TWIG_FORMAT_XML 3
 #define TWIG_FORMAT_HTML 4
 
+// Markdown extension flags for twig_editor_create_ext's `md_flags` bitmask
+// (ignored for non-Markdown formats).
+#define TWIG_MD_DIRECTIVES (1u << 0)  // generic directives: :name, ::name, :::name
+#define TWIG_MD_MATH       (1u << 1)  // $...$ / $$...$$ math
+
 typedef enum TwigStatus {
     TWIG_STATUS_OK = 0,
     TWIG_STATUS_INVALID_ARGUMENT = 1,
@@ -140,11 +145,24 @@ TwigStatus twig_document_query(
 // twig_editor_ast_json to inspect the current tree between edits.
 
 // Create an editor over a private copy of `input`, parsed as `format` (a
-// TWIG_FORMAT_* code).
+// TWIG_FORMAT_* code) with default options.
 TwigStatus twig_editor_create(
     const uint8_t *input,
     size_t input_len,
     int format,
+    TwigEditor **out_editor
+);
+
+// Like twig_editor_create, plus `md_flags` — a bitmask of TWIG_MD_* Markdown
+// extensions to enable (ignored for other formats). The editor reparses with
+// these flags after every edit, so a directive-bearing document stays
+// parseable — required before twig_editor_filter can match `directive[...]`
+// selectors.
+TwigStatus twig_editor_create_ext(
+    const uint8_t *input,
+    size_t input_len,
+    int format,
+    uint32_t md_flags,
     TwigEditor **out_editor
 );
 
@@ -203,6 +221,37 @@ TwigStatus twig_editor_delete(
     TwigEditor *editor,
     const uint8_t *locator,
     size_t locator_len
+);
+
+// Delete the located node, tidying surrounding blank lines for a whole-line
+// (block) node; an inline node degrades to the exact-span delete.
+TwigStatus twig_editor_delete_smart(
+    TwigEditor *editor,
+    const uint8_t *locator,
+    size_t locator_len
+);
+
+// Unwrap the located node: replace it with its interior (drop the wrapper, keep
+// the children) — e.g. peel a `:::vis{...}` container. A node with no interior
+// (a leaf, or an empty container) is removed.
+TwigStatus twig_editor_unwrap(
+    TwigEditor *editor,
+    const uint8_t *locator,
+    size_t locator_len
+);
+
+// Prune the document in place: remove every node matching the `drop` selector
+// except those also matching `keep` (pass keep == NULL to spare nothing), then
+// — if `unwrap_kept` is non-zero — unwrap the survivors. Read the result via
+// twig_editor_source. A malformed selector returns TWIG_STATUS_INVALID_ARGUMENT;
+// a reparse-breaking edit (rolled back) TWIG_STATUS_EDIT_CONFLICT.
+TwigStatus twig_editor_filter(
+    TwigEditor *editor,
+    const uint8_t *drop,
+    size_t drop_len,
+    const uint8_t *keep,
+    size_t keep_len,
+    int unwrap_kept
 );
 
 // The editor's current (edited) source bytes. Borrowed from `editor` and valid

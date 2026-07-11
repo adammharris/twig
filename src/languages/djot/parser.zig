@@ -344,6 +344,7 @@ pub const TreeBuilder = struct {
         return switch (kind) {
             .code_block => |v| .{ .code_block = .{ .lang = if (v.lang) |l| try self.own(l) else null, .text = try self.own(v.text) } },
             .raw_block => |v| .{ .raw_block = .{ .format = try self.own(v.format), .text = try self.own(v.text) } },
+            .metadata => |v| .{ .metadata = .{ .lang = try self.own(v.lang), .text = try self.own(v.text) } },
             .footnote => |v| .{ .footnote = .{ .label = try self.own(v.label) } },
             .reference => |v| .{ .reference = .{ .label = try self.own(v.label), .destination = try self.own(v.destination) } },
             .str => |v| .{ .str = try self.own(v) },

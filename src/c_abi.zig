@@ -418,6 +418,10 @@ pub const TwigEditor = opaque {};
 
 const EditorHandle = struct {
     editor: twig.Editor,
+    /// The parse configuration the editor's reparse callback borrows (via
+    /// `twig.Editor.ParseFn`'s `ctx`). Stored ON the handle so its address is
+    /// stable for the handle's whole lifetime — the editor holds `&this`.
+    parse_config: EditorParseConfig = .{},
     /// Caller-borrowed output buffers, same contract as `DocumentHandle`'s.
     ast_json: []u8 = &.{},
     query_matches: []TwigQueryMatch = &.{},
@@ -429,7 +433,7 @@ fn asEditor(ed: *TwigEditor) *EditorHandle {
 
 /// The one edit each `twig_editor_*` op performs, dispatched by `applyEdit`
 /// onto the matching `twig.Editor` method.
-const EditOp = enum { replace, replace_content, insert_before, insert_after, insert_child, delete };
+const EditOp = enum { replace, replace_content, insert_before, insert_after, insert_child, delete, delete_smart, unwrap };
 
 // Per-format `source -> bare AST` reparse callbacks the editor drives. Djot and
 // Markdown's `Document` side tables are irrelevant to editing (it only touches
@@ -437,12 +441,23 @@ const EditOp = enum { replace, replace_content, insert_before, insert_after, ins
 // XML/HTML already parse to a bare `AST`. Mirrors `cli/format.zig`'s
 // `parseToAst*` adapters.
 
-// The editor reparse callback (`twig.Editor.ParseFn`) takes a leading opaque
-// `ctx` for parse configuration; the C ABI exposes no parse options, so these
-// adapters ignore it and use each language's default options, and
-// `twig_editor_create` hands the editor `&c_abi_parse_ctx` (a stable, unread
-// pointer).
-const c_abi_parse_ctx: u8 = 0;
+/// Markdown extension bitmask accepted by `twig_editor_create_ext`
+/// (`TWIG_MD_*` in `twig.h`); other formats ignore it.
+const TWIG_MD_DIRECTIVES: u32 = 1 << 0;
+const TWIG_MD_MATH: u32 = 1 << 1;
+
+/// The editor reparse callback's opaque `ctx` (`twig.Editor.ParseFn`), carried
+/// on each `EditorHandle` and forwarded to every reparse so an edited Markdown
+/// document keeps the extension flags it was created with. Only the Markdown
+/// adapter reads it; djot/xml/html ignore it.
+const EditorParseConfig = struct { markdown: twig.Markdown.ParseOptions = .{} };
+
+fn markdownOptionsFromFlags(flags: u32) twig.Markdown.ParseOptions {
+    var opts: twig.Markdown.ParseOptions = .{};
+    opts.directives = (flags & TWIG_MD_DIRECTIVES) != 0;
+    opts.math = (flags & TWIG_MD_MATH) != 0;
+    return opts;
+}
 
 fn parseToAstDjot(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!twig.AST {
     _ = ctx;
@@ -454,8 +469,8 @@ fn parseToAstDjot(ctx: *const anyopaque, allocator: Allocator, source: []const u
 }
 
 fn parseToAstMarkdown(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!twig.AST {
-    _ = ctx;
-    var doc = try twig.Markdown.parse(allocator, source, .{});
+    const cfg: *const EditorParseConfig = @ptrCast(@alignCast(ctx));
+    var doc = try twig.Markdown.parse(allocator, source, cfg.markdown);
     doc.link_references.deinit(allocator);
     doc.footnotes.deinit(allocator);
     return doc.ast;
@@ -480,12 +495,29 @@ fn parseFnFor(format: TwigFormat) twig.Editor.ParseFn {
     };
 }
 
-/// Create an editor over a private copy of `input`, parsed as `format`. On the
-/// initial parse failing, returns `parse_error` (or `out_of_memory`).
+/// Create an editor over a private copy of `input`, parsed as `format` with
+/// default options. On the initial parse failing, returns `parse_error` (or
+/// `out_of_memory`).
 pub export fn twig_editor_create(
     input_ptr: ?[*]const u8,
     input_len: usize,
     format: c_int,
+    out_editor: ?*?*TwigEditor,
+) TwigStatus {
+    return twig_editor_create_ext(input_ptr, input_len, format, 0, out_editor);
+}
+
+/// Like `twig_editor_create`, plus `md_flags` — a bitmask of `TWIG_MD_*`
+/// Markdown extensions (`TWIG_MD_DIRECTIVES`, `TWIG_MD_MATH`) to enable for a
+/// Markdown parse (ignored for other formats). The editor reparses with the
+/// same flags after every edit, so a directive-bearing document stays
+/// parseable — required before `twig_editor_filter` can match `directive[…]`
+/// selectors.
+pub export fn twig_editor_create_ext(
+    input_ptr: ?[*]const u8,
+    input_len: usize,
+    format: c_int,
+    md_flags: u32,
     out_editor: ?*?*TwigEditor,
 ) TwigStatus {
     const out = out_editor orelse return .invalid_argument;
@@ -494,16 +526,18 @@ pub export fn twig_editor_create(
     const target = intToFormat(format) orelse return .unsupported_format;
 
     const allocator = activeAllocator();
-    var editor = twig.Editor.init(allocator, source, &c_abi_parse_ctx, parseFnFor(target)) catch |err| switch (err) {
-        error.OutOfMemory => return .out_of_memory,
-        else => return .parse_error,
+    const handle = allocator.create(EditorHandle) catch return .out_of_memory;
+    // Set the config BEFORE `Editor.init` (which reads it via the ctx pointer on
+    // its initial parse); the editor stores `&handle.parse_config`, stable for
+    // the handle's lifetime.
+    handle.* = .{ .editor = undefined, .parse_config = .{ .markdown = markdownOptionsFromFlags(md_flags) } };
+    handle.editor = twig.Editor.init(allocator, source, &handle.parse_config, parseFnFor(target)) catch |err| {
+        allocator.destroy(handle);
+        return switch (err) {
+            error.OutOfMemory => .out_of_memory,
+            else => .parse_error,
+        };
     };
-
-    const handle = allocator.create(EditorHandle) catch {
-        editor.deinit();
-        return .out_of_memory;
-    };
-    handle.* = .{ .editor = editor };
     out.* = @ptrCast(handle);
     return .ok;
 }
@@ -599,6 +633,8 @@ fn applyEdit(
         .insert_after => handle.editor.insertAfterById(id, text),
         .insert_child => handle.editor.insertChildById(id, child_index, text),
         .delete => handle.editor.deleteNodeById(id),
+        .delete_smart => handle.editor.deleteNodeSmartById(id),
+        .unwrap => handle.editor.unwrapNodeById(id),
     };
     result catch |err| switch (err) {
         error.OutOfMemory => return .out_of_memory,
@@ -674,6 +710,64 @@ pub export fn twig_editor_delete(
     locator_len: usize,
 ) TwigStatus {
     return applyEdit(ed, locator_ptr, locator_len, .delete, 0, null, 0);
+}
+
+/// Delete the located node, tidying surrounding blank lines for a whole-line
+/// (block) node; an inline node degrades to the exact-span delete.
+pub export fn twig_editor_delete_smart(
+    ed: ?*TwigEditor,
+    locator_ptr: ?[*]const u8,
+    locator_len: usize,
+) TwigStatus {
+    return applyEdit(ed, locator_ptr, locator_len, .delete_smart, 0, null, 0);
+}
+
+/// Unwrap the located node: replace it with its interior (drop the wrapper,
+/// keep the children) — e.g. peel a `:::vis{…}` container. A node with no
+/// interior (a leaf, or an empty container) is removed.
+pub export fn twig_editor_unwrap(
+    ed: ?*TwigEditor,
+    locator_ptr: ?[*]const u8,
+    locator_len: usize,
+) TwigStatus {
+    return applyEdit(ed, locator_ptr, locator_len, .unwrap, 0, null, 0);
+}
+
+/// Prune the document in place (`twig.Filter`): remove every node matching the
+/// `drop` selector except those also matching `keep` (pass `keep_ptr == NULL`
+/// to spare nothing), then — if `unwrap_kept` is non-zero — unwrap the
+/// survivors. The edited bytes are then available via `twig_editor_source`.
+/// A malformed selector returns `invalid_argument`; a reparse-breaking edit
+/// (rolled back) `edit_conflict`.
+pub export fn twig_editor_filter(
+    ed: ?*TwigEditor,
+    drop_ptr: ?[*]const u8,
+    drop_len: usize,
+    keep_ptr: ?[*]const u8,
+    keep_len: usize,
+    unwrap_kept: c_int,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const handle = asEditor(raw);
+    const drop = sliceOf(drop_ptr, drop_len) orelse return .invalid_argument;
+    // `keep` is optional: a NULL pointer means "no keep" (a zero-length keep
+    // with a non-NULL pointer is a caller error, surfacing as invalid_argument
+    // when the empty selector fails to parse).
+    const keep: ?[]const u8 = if (keep_ptr) |p| p[0..keep_len] else null;
+
+    const allocator = activeAllocator();
+    twig.Filter.apply(allocator, &handle.editor, .{
+        .drop = drop,
+        .keep = keep,
+        .unwrap_kept = unwrap_kept != 0,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return .out_of_memory,
+        error.InvalidSelector => return .invalid_argument,
+        error.FilterDidNotConverge => return .internal_error,
+        error.NoNodeSpan, error.NoContentSpan => return .not_editable,
+        else => return .edit_conflict,
+    };
+    return .ok;
 }
 
 /// The editor's current (edited) source bytes.

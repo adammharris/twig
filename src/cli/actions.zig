@@ -78,7 +78,16 @@ pub fn runHelp(w: *Writer, binary_name: []const u8) !void {
         \\        --insert-before <path> <text>    insert text before a node
         \\        --insert-after <path> <text>     insert text after a node
         \\        --insert-child <path> <i> <text> insert as a container's i-th child
-        \\        --delete <path>                  remove a node
+        \\        --delete <path>                  remove a node (tidies blank lines)
+        \\        --unwrap <path>                  drop a wrapper, keep its contents
+        \\      Writes back in place; pass --dry-run to print the result instead.
+        \\
+        \\  filter [-i <format>] <file|-> --drop <sel> [--keep <sel>] [--unwrap]
+        \\      Prune a document: remove every node matching --drop, except those
+        \\      also matching --keep; with --unwrap, peel the kept wrappers down
+        \\      to their contents. E.g. keep only the public audience:
+        \\        filter archive.md --directives \
+        \\          --drop 'directive[name=vis]' --keep 'directive[class~=public]' --unwrap
         \\      Writes back in place; pass --dry-run to print the result instead.
         \\
         \\  help              show this message
@@ -336,6 +345,60 @@ pub fn runEdit(allocator: Allocator, io: Io, stdout: *Writer, stderr: *Writer, o
     };
 }
 
+/// Run `Filter.apply` (drop a selector's family, spare a `keep` subset,
+/// optionally unwrap the survivors) over `opts.file` and either write the
+/// result back in place or — for `--dry-run`/stdin — print it. The prune core
+/// is `filterSource`, split out so it can be exercised against an in-memory
+/// string in tests.
+pub fn runFilter(allocator: Allocator, io: Io, stdout: *Writer, stderr: *Writer, opts: args_mod.FilterOptions) ActionError!void {
+    const source = try readSource(allocator, io, opts.file, stderr);
+    const filtered = try filterSource(allocator, source, opts, stderr);
+
+    if (opts.dry_run or std.mem.eql(u8, opts.file, "-")) {
+        stdout.writeAll(filtered) catch {};
+        stdout.flush() catch |err| {
+            stderr.print("error: failed to write output: {t}\n", .{err}) catch {};
+            stderr.flush() catch {};
+            return error.ActionFailed;
+        };
+        return;
+    }
+
+    writeFileInPlace(io, opts.file, filtered) catch |err| {
+        stderr.print("error: could not write '{s}': {t}\n", .{ opts.file, err }) catch {};
+        stderr.flush() catch {};
+        return error.ActionFailed;
+    };
+}
+
+fn filterSource(allocator: Allocator, source: []const u8, opts: args_mod.FilterOptions, stderr: *Writer) ActionError![]u8 {
+    const entry = format.entryFor(opts.input);
+    // `&opts.parse_config` outlives `editor` (deinited before we return), so the
+    // editor's borrowed parse context stays valid across every reparse.
+    var editor = twig.Editor.init(allocator, source, &opts.parse_config, entry.parseToAst) catch |err| {
+        stderr.print("error: failed to parse input as {s}: {t}\n", .{ @tagName(opts.input), err }) catch {};
+        stderr.flush() catch {};
+        return error.ActionFailed;
+    };
+    defer editor.deinit();
+
+    twig.Filter.apply(allocator, &editor, .{
+        .drop = opts.drop,
+        .keep = opts.keep,
+        .unwrap_kept = opts.unwrap_kept,
+    }) catch |err| {
+        switch (err) {
+            error.InvalidSelector => stderr.print("error: could not parse a --drop/--keep selector\n", .{}) catch {},
+            error.FilterDidNotConverge => stderr.print("error: filter did not converge (an edit kept failing to apply)\n", .{}) catch {},
+            else => stderr.print("error: filter failed: {t}\n", .{err}) catch {},
+        }
+        stderr.flush() catch {};
+        return error.ActionFailed;
+    };
+
+    return allocator.dupe(u8, editor.sourceBytes()) catch return error.ActionFailed;
+}
+
 /// Parse a dot-separated index path (`"0.3.1"` -> `&.{0,3,1}`; empty -> the
 /// root, `&.{}`). A non-numeric segment prints a message and fails.
 fn parsePath(allocator: Allocator, path_str: []const u8, stderr: *Writer) ActionError![]const usize {
@@ -392,6 +455,9 @@ fn applyEditByLocator(
         // surrounding blank lines; for an inline node it degrades to the exact
         // delete. See `Editor.deleteNodeSmart`.
         .delete => editor.deleteNodeSmartById(id),
+        // Drop the wrapper, keep its interior in place (e.g. peel a `:::vis{…}`
+        // container down to its blocks). See `Editor.unwrapNode`.
+        .unwrap => editor.unwrapNodeById(id),
     };
     result catch |err| {
         switch (err) {

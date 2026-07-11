@@ -27,6 +27,10 @@ pub enum TwigFormat {
     Html = 4,
 }
 
+/// Markdown extension flags for `twig_editor_create_ext`'s `md_flags` bitmask.
+pub const TWIG_MD_DIRECTIVES: u32 = 1 << 0;
+pub const TWIG_MD_MATH: u32 = 1 << 1;
+
 pub enum TwigDocument {}
 
 pub enum TwigEditor {}
@@ -93,6 +97,13 @@ unsafe extern "C" {
         format: c_int,
         out_editor: *mut *mut TwigEditor,
     ) -> TwigStatus;
+    pub fn twig_editor_create_ext(
+        input: *const u8,
+        input_len: usize,
+        format: c_int,
+        md_flags: u32,
+        out_editor: *mut *mut TwigEditor,
+    ) -> TwigStatus;
     pub fn twig_editor_destroy(editor: *mut TwigEditor);
     pub fn twig_editor_replace(
         editor: *mut TwigEditor,
@@ -134,6 +145,24 @@ unsafe extern "C" {
         editor: *mut TwigEditor,
         locator: *const u8,
         locator_len: usize,
+    ) -> TwigStatus;
+    pub fn twig_editor_delete_smart(
+        editor: *mut TwigEditor,
+        locator: *const u8,
+        locator_len: usize,
+    ) -> TwigStatus;
+    pub fn twig_editor_unwrap(
+        editor: *mut TwigEditor,
+        locator: *const u8,
+        locator_len: usize,
+    ) -> TwigStatus;
+    pub fn twig_editor_filter(
+        editor: *mut TwigEditor,
+        drop: *const u8,
+        drop_len: usize,
+        keep: *const u8,
+        keep_len: usize,
+        unwrap_kept: c_int,
     ) -> TwigStatus;
     pub fn twig_editor_source(
         editor: *mut TwigEditor,

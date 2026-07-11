@@ -131,6 +131,30 @@ impl Drop for Document {
     }
 }
 
+/// Markdown extensions to enable for an [`Editor`] parse (see
+/// [`Editor::new_ext`]). Ignored for non-Markdown formats. Both default off,
+/// matching the library.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MarkdownExtensions {
+    /// Generic directives: `:name`, `::name`, `:::name`.
+    pub directives: bool,
+    /// `$...$` / `$$...$$` math.
+    pub math: bool,
+}
+
+impl MarkdownExtensions {
+    fn to_flags(self) -> u32 {
+        let mut flags = 0;
+        if self.directives {
+            flags |= ffi::TWIG_MD_DIRECTIVES;
+        }
+        if self.math {
+            flags |= ffi::TWIG_MD_MATH;
+        }
+        flags
+    }
+}
+
 /// A span-splice editor over a document: applies lossless, in-place edits and
 /// reparses after each one, so node addressing stays valid as the document
 /// evolves. Every op is addressed by a `locator` — a dot-separated index path
@@ -142,7 +166,8 @@ pub struct Editor {
 }
 
 impl Editor {
-    /// Create an editor over a private copy of `input`, parsed as `format`.
+    /// Create an editor over a private copy of `input`, parsed as `format` with
+    /// default options.
     pub fn new(input: &[u8], format: Format) -> Result<Self, Error> {
         let mut raw = std::ptr::null_mut();
         let ffi_format: ffi::TwigFormat = format.into();
@@ -155,6 +180,27 @@ impl Editor {
 
     pub fn new_str(input: &str, format: Format) -> Result<Self, Error> {
         Self::new(input.as_bytes(), format)
+    }
+
+    /// Like [`Editor::new`], plus Markdown `extensions` to enable (ignored for
+    /// other formats). The editor reparses with these after every edit, so a
+    /// directive-bearing document stays parseable — needed before
+    /// [`Editor::filter`] can match `directive[...]` selectors.
+    pub fn new_ext(input: &[u8], format: Format, extensions: MarkdownExtensions) -> Result<Self, Error> {
+        let mut raw = std::ptr::null_mut();
+        let ffi_format: ffi::TwigFormat = format.into();
+        let status = unsafe {
+            ffi::twig_editor_create_ext(
+                input.as_ptr(),
+                input.len(),
+                ffi_format as i32,
+                extensions.to_flags(),
+                &mut raw,
+            )
+        };
+        Error::from_status(status)?;
+        let raw = NonNull::new(raw).ok_or(Error::Internal)?;
+        Ok(Self { raw })
     }
 
     /// Replace the whole source of the located node with `text`.
@@ -207,6 +253,47 @@ impl Editor {
     pub fn delete(&mut self, locator: &str) -> Result<(), Error> {
         let status = unsafe {
             ffi::twig_editor_delete(self.raw.as_ptr(), locator.as_ptr(), locator.len())
+        };
+        Error::from_status(status)
+    }
+
+    /// Delete the located node, tidying surrounding blank lines for a
+    /// whole-line (block) node; an inline node degrades to the exact delete.
+    pub fn delete_smart(&mut self, locator: &str) -> Result<(), Error> {
+        let status = unsafe {
+            ffi::twig_editor_delete_smart(self.raw.as_ptr(), locator.as_ptr(), locator.len())
+        };
+        Error::from_status(status)
+    }
+
+    /// Unwrap the located node: replace it with its interior (drop the wrapper,
+    /// keep the children) — e.g. peel a `:::vis{...}` container. A node with no
+    /// interior (a leaf, or an empty container) is removed.
+    pub fn unwrap_node(&mut self, locator: &str) -> Result<(), Error> {
+        let status = unsafe {
+            ffi::twig_editor_unwrap(self.raw.as_ptr(), locator.as_ptr(), locator.len())
+        };
+        Error::from_status(status)
+    }
+
+    /// Prune the document in place: remove every node matching the `drop`
+    /// selector except those also matching `keep` (`None` spares nothing),
+    /// then — if `unwrap_kept` — unwrap the survivors. Read the result with
+    /// [`Editor::source`].
+    pub fn filter(&mut self, drop: &str, keep: Option<&str>, unwrap_kept: bool) -> Result<(), Error> {
+        let (keep_ptr, keep_len) = match keep {
+            Some(k) => (k.as_ptr(), k.len()),
+            None => (std::ptr::null(), 0),
+        };
+        let status = unsafe {
+            ffi::twig_editor_filter(
+                self.raw.as_ptr(),
+                drop.as_ptr(),
+                drop.len(),
+                keep_ptr,
+                keep_len,
+                unwrap_kept as i32,
+            )
         };
         Error::from_status(status)
     }
@@ -447,5 +534,58 @@ mod tests {
         assert_eq!(ed.query("element").expect("query").len(), 3);
         let json = ed.ast_json().expect("ast_json");
         assert!(String::from_utf8_lossy(&json).contains("\"kind\": \"doc\""));
+    }
+
+    #[test]
+    fn editor_unwrap_and_smart_delete() {
+        let mut ed = Editor::new_str("<r><box><b/><c/></box></r>", Format::Xml).expect("editor");
+        ed.unwrap_node("0.0").expect("unwrap"); // <box>
+        assert_eq!(ed.source_str().expect("source"), "<r><b/><c/></r>");
+
+        let mut md = Editor::new_str("A\n\nB\n\nC\n", Format::Markdown).expect("editor");
+        md.delete_smart("1").expect("delete_smart"); // the "B" paragraph
+        assert_eq!(md.source_str().expect("source"), "A\n\nC\n");
+    }
+
+    #[test]
+    fn editor_directives_require_the_extension_flag() {
+        let src = ":::vis{.public}\nhi\n:::\n";
+        // Without the flag, the colon-fence lines are plain paragraph text —
+        // no directive node.
+        let mut plain = Editor::new_str(src, Format::Markdown).expect("editor");
+        assert_eq!(plain.query("directive").expect("query").len(), 0);
+        // With it enabled, the container directive is recognized.
+        let mut ext = Editor::new_ext(
+            src.as_bytes(),
+            Format::Markdown,
+            MarkdownExtensions { directives: true, ..Default::default() },
+        )
+        .expect("editor");
+        assert_eq!(ext.query("directive").expect("query").len(), 1);
+    }
+
+    #[test]
+    fn editor_filter_public_audience_view() {
+        let src = "# Archive\n\n:::vis{.public}\nPublic.\n:::\n\n:::vis{.family}\nPrivate.\n:::\n";
+        let mut ed = Editor::new_ext(
+            src.as_bytes(),
+            Format::Markdown,
+            MarkdownExtensions { directives: true, ..Default::default() },
+        )
+        .expect("editor");
+        // Drop every vis block except the public one, then unwrap it.
+        ed.filter(
+            "directive[name=vis]",
+            Some("directive[class~=public]"),
+            true,
+        )
+        .expect("filter");
+        assert_eq!(ed.source_str().expect("source"), "# Archive\n\nPublic.\n");
+    }
+
+    #[test]
+    fn editor_filter_rejects_a_malformed_selector() {
+        let mut ed = Editor::new_str("hi\n", Format::Markdown).expect("editor");
+        assert_eq!(ed.filter("list >", None, false), Err(Error::InvalidArgument));
     }
 }

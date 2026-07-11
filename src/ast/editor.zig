@@ -241,6 +241,33 @@ pub const Editor = struct {
         const span = try self.nodeSpan(id);
         try self.replaceAtSpan(tidyDeletionSpan(self.source.items, span), "");
     }
+
+    /// Unwrap the node: replace its whole span with the source text of its
+    /// interior (`content_span`), dropping the wrapper but keeping the children
+    /// in place — e.g. peel a `:::vis{…}` container down to just the blocks
+    /// inside it, or a `<div>` down to its contents. Lossless: the interior is
+    /// spliced in verbatim, and the wrapper's own surrounding blank lines are
+    /// left untouched (the interior takes the block's place). A node with no
+    /// interior (`content_span == null`: a leaf, or an EMPTY container — nothing
+    /// to keep) degrades to a smart delete.
+    ///
+    /// Because the interior is spliced VERBATIM, unwrap is exactly right for
+    /// containers whose content lines carry no per-line marker (directives,
+    /// divs, sections). For a marker-prefixed container (a block quote's `>`, a
+    /// list item's indent) the markers live inside `content_span` and would
+    /// survive the unwrap — stripping those needs serializer-assisted
+    /// re-emission, which this span-splice editor deliberately doesn't do.
+    pub fn unwrapNode(self: *Editor, path: []const usize) !void {
+        try self.unwrapNodeById(try self.ast.getIdByPath(path));
+    }
+    pub fn unwrapNodeById(self: *Editor, id: Node.Id) !void {
+        const span = try self.nodeSpan(id);
+        const cs = self.ast.nodes[id].content_span orelse return self.deleteNodeSmartById(id);
+        // `interior` aliases `self.source`; `replaceAtSpan` copies it into the
+        // new buffer before retiring the old source, so this is safe.
+        const interior = self.source.items[cs.start..cs.end];
+        try self.replaceAtSpan(span, interior);
+    }
 };
 
 // ── smart-delete whitespace tidying ────────────────────────────────────────
@@ -366,6 +393,22 @@ test "insertBefore / insertAfter / deleteNode" {
 
     try ed.insertBefore(&.{ 0, 0 }, "<y/>");
     try testing.expectEqualStrings("<r><y/><x/><b/></r>", ed.sourceBytes());
+}
+
+test "unwrapNode keeps a container's children, drops the wrapper" {
+    var ed = try Editor.init(testing.allocator, "<r><box><b/><c/></box></r>", &test_ctx, parseXml);
+    defer ed.deinit();
+    try ed.unwrapNode(&.{ 0, 0 }); // the <box> (doc=.{}, <r>=.{0}, <box>=.{0,0})
+    try testing.expectEqualStrings("<r><b/><c/></r>", ed.sourceBytes());
+}
+
+test "unwrapNode on an empty/childless container degrades to delete" {
+    var ed = try Editor.init(testing.allocator, "<r><box/></r>", &test_ctx, parseXml);
+    defer ed.deinit();
+    // A self-closing element has no interior (null content_span) -> nothing to
+    // keep -> the wrapper is removed.
+    try ed.unwrapNode(&.{ 0, 0 });
+    try testing.expectEqualStrings("<r></r>", ed.sourceBytes());
 }
 
 test "a reparse-breaking edit rolls back and leaves the document untouched" {

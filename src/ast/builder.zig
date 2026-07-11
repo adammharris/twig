@@ -158,6 +158,7 @@ fn dupeKind(self: *Builder, kind: Node.Kind) Allocator.Error!Node.Kind {
             .text = try self.dupe(v.text),
         } },
         .raw_block => |v| .{ .raw_block = .{ .format = try self.dupe(v.format), .text = try self.dupe(v.text) } },
+        .metadata => |v| .{ .metadata = .{ .lang = try self.dupe(v.lang), .text = try self.dupe(v.text) } },
         .footnote => |v| .{ .footnote = .{ .label = try self.dupe(v.label) } },
         .reference => |v| .{ .reference = .{ .label = try self.dupe(v.label), .destination = try self.dupe(v.destination) } },
         .str => |v| .{ .str = try self.dupe(v) },

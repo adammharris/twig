@@ -117,6 +117,21 @@ pub const Node = struct {
         div,
         code_block: struct { lang: ?[]const u8, text: []const u8 },
         raw_block: struct { format: []const u8, text: []const u8 },
+        /// Document-level metadata (front/end matter) as an inert,
+        /// self-describing data island — NOT markup. `lang` is the config
+        /// language it's written in, stored exactly as the fence tag was
+        /// written (`yaml`, `toml`, `fig`, `figl`, `json`, …; a bare `---`
+        /// fence defaults to `yaml`, `+++` to `toml`) — no normalization, so
+        /// it round-trips losslessly. The HTML printer derives the data-island
+        /// MIME mechanically as `application/<lang>`.
+        /// `text` is the block body as written. Distinct from `code_block`
+        /// (a *rendered* code sample) and `raw_block` (verbatim output for a
+        /// target format): metadata is *about* the document and never renders
+        /// into the body — the HTML printer projects it to a
+        /// `<script type=mime>` data island. See `document-metadata.md`.
+        /// Produced by the Markdown parser's frontmatter path; a future pass
+        /// hoists front+end blocks into one parsed doc-level `fig` record.
+        metadata: struct { lang: []const u8, text: []const u8 },
         block_quote,
         bullet_list: struct { style: BulletListStyle, tight: bool },
         ordered_list: struct { style: OrderedListStyle, tight: bool, start: ?u32 },

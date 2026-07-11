@@ -661,6 +661,21 @@ pub const Renderer = struct {
             .raw_block => |v| {
                 if (std.mem.eql(u8, v.format, "html")) try self.writer.writeAll(v.text);
             },
+            .metadata => |v| {
+                // Inert, self-describing data island: a `<script>` whose type
+                // isn't a JS MIME is neither executed nor displayed by the
+                // browser, so document metadata stays in the file without
+                // rendering into the body. The MIME is derived mechanically as
+                // `application/<lang>` — already correct for toml/json/yaml/
+                // ld+json and general to any config language. `lang` is an
+                // `isLangTag`, hence a legal MIME subtype. (Future: hoist into
+                // `<head>`.)
+                try self.writer.writeAll("<script type=\"application/");
+                try self.writeEscapedAttr(v.lang);
+                try self.writer.writeAll("\">\n");
+                try self.writer.writeAll(v.text);
+                try self.writer.writeAll("</script>\n");
+            },
             .str => |text| {
                 if (!self.ast.attrsOf(id).isEmpty()) {
                     try self.renderTag("span", id, &.{});

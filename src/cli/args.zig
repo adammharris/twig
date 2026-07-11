@@ -19,12 +19,12 @@ const format = @import("format.zig");
 const InputFormat = format.InputFormat;
 const OutputMode = format.OutputMode;
 
-pub const Action = enum { help, version, convert, identify, edit, query };
+pub const Action = enum { help, version, convert, identify, edit, query, filter };
 
 /// The span-splice edit `twig edit` performs — one per invocation, selected by
 /// the corresponding `--…` flag. See `actions.zig`'s `applyEdit` for the
 /// mapping onto `twig.Editor`'s methods.
-pub const EditOp = enum { replace, replace_content, insert_before, insert_after, insert_child, delete };
+pub const EditOp = enum { replace, replace_content, insert_before, insert_after, insert_child, delete, unwrap };
 
 pub const ConvertOptions = struct {
     /// The file to convert, or `"-"` for stdin.
@@ -83,6 +83,23 @@ pub const QueryOptions = struct {
     parse_config: format.ParseConfig = .{},
 };
 
+pub const FilterOptions = struct {
+    file: []const u8 = "",
+    input: InputFormat = .djot,
+    /// The candidate family selector (`--drop`, required): every match is a
+    /// removal candidate. See `Filter.Options`.
+    drop: []const u8 = "",
+    /// Exceptions spared despite matching `drop` (`--keep`, optional).
+    keep: ?[]const u8 = null,
+    /// `--unwrap`: after dropping, unwrap each kept family member.
+    unwrap_kept: bool = false,
+    /// Print the result instead of writing back in place.
+    dry_run: bool = false,
+    /// Markdown extension flags — see `ConvertOptions.parse_config`. Needed so a
+    /// selector like `directive[name=vis]` has directive nodes to match.
+    parse_config: format.ParseConfig = .{},
+};
+
 pub const CliActionOptions = union(Action) {
     help: void,
     version: void,
@@ -90,6 +107,7 @@ pub const CliActionOptions = union(Action) {
     identify: IdentifyOptions,
     edit: EditOptions,
     query: QueryOptions,
+    filter: FilterOptions,
 };
 
 pub const CliConfig = struct {
@@ -118,6 +136,9 @@ pub const ArgError = error{
     InvalidEditIndex,
     /// `query` was given a file but no selector string.
     MissingSelector,
+    /// `filter` was given a file but no `--drop` selector, or a `--drop`/
+    /// `--keep` flag was missing its selector value.
+    MissingFilterSelector,
 } || format.ResolveInputFormatError;
 
 /// A `[:0]const u8`-argv-slice-backed iterator satisfying the `.next()`
@@ -197,6 +218,9 @@ pub fn parseConfig(args: anytype, stderr: *Writer) ArgError!CliConfig {
     }
     if (std.mem.eql(u8, action_str, "query")) {
         return parseQuery(args, stderr, config.binary_name);
+    }
+    if (std.mem.eql(u8, action_str, "filter")) {
+        return parseFilter(args, stderr, config.binary_name);
     }
 
     // Unrecognized verb: fall back to help, same as no args / an explicit
@@ -317,6 +341,60 @@ fn parseQuery(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError!
     };
 }
 
+fn parseFilter(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError!CliConfig {
+    var input_override: ?InputFormat = null;
+    var file: ?[]const u8 = null;
+    var drop: ?[]const u8 = null;
+    var keep: ?[]const u8 = null;
+    var unwrap_kept = false;
+    var dry_run = false;
+    var parse_config = format.ParseConfig{};
+
+    while (args.next()) |arg| {
+        if (applyExtFlag(arg, &parse_config)) {
+            // handled
+        } else if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
+            const name = args.next() orelse return ArgError.MissingFormatValue;
+            input_override = format.parseFormatName(name) orelse {
+                try stderr.print("error: unsupported input format '{s}'\n", .{name});
+                try format.printSupportedInputFormats(stderr);
+                try stderr.flush();
+                return ArgError.UnsupportedFormat;
+            };
+        } else if (std.mem.eql(u8, arg, "--drop")) {
+            drop = args.next() orelse return ArgError.MissingFilterSelector;
+        } else if (std.mem.eql(u8, arg, "--keep")) {
+            keep = args.next() orelse return ArgError.MissingFilterSelector;
+        } else if (std.mem.eql(u8, arg, "--unwrap")) {
+            unwrap_kept = true;
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            dry_run = true;
+        } else if (file == null) {
+            file = arg;
+        } else {
+            return ArgError.TooManyPositionals;
+        }
+    }
+
+    const path = file orelse return ArgError.MissingFile;
+    const drop_sel = drop orelse return ArgError.MissingFilterSelector;
+    const resolved = try format.resolveInputFormat(stderr, path, input_override);
+
+    return .{
+        .action = .filter,
+        .binary_name = binary_name,
+        .options = .{ .filter = .{
+            .file = path,
+            .input = resolved,
+            .drop = drop_sel,
+            .keep = keep,
+            .unwrap_kept = unwrap_kept,
+            .dry_run = dry_run,
+            .parse_config = parse_config,
+        } },
+    };
+}
+
 fn parseEdit(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError!CliConfig {
     var input_override: ?InputFormat = null;
     var file: ?[]const u8 = null;
@@ -368,6 +446,9 @@ fn parseEdit(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError!C
             text = args.next() orelse return ArgError.MissingEditArgument;
         } else if (std.mem.eql(u8, arg, "--delete")) {
             op = .delete;
+            path_str = args.next() orelse return ArgError.MissingEditArgument;
+        } else if (std.mem.eql(u8, arg, "--unwrap")) {
+            op = .unwrap;
             path_str = args.next() orelse return ArgError.MissingEditArgument;
         } else if (file == null) {
             file = arg;
@@ -572,6 +653,35 @@ test "parseConfig: edit carries the parse config too" {
     const c = try parseConfig(&a, &w);
     try testing.expect(c.options.edit.parse_config.markdown.directives);
     try testing.expectEqual(EditOp.delete, c.options.edit.op);
+}
+
+test "parseConfig: filter parses --drop/--keep/--unwrap and needs a --drop" {
+    var buf: [256]u8 = undefined;
+    var w = scratchWriter(&buf);
+    var a = TestArgs{ .items = &.{ "twig", "filter", "-i", "md", "--directives", "archive.md", "--drop", "directive[name=vis]", "--keep", "directive[class~=public]", "--unwrap" } };
+    const c = try parseConfig(&a, &w);
+    try testing.expectEqual(Action.filter, c.action);
+    const f = c.options.filter;
+    try testing.expectEqualStrings("archive.md", f.file);
+    try testing.expectEqual(InputFormat.markdown, f.input);
+    try testing.expectEqualStrings("directive[name=vis]", f.drop);
+    try testing.expectEqualStrings("directive[class~=public]", f.keep.?);
+    try testing.expect(f.unwrap_kept);
+    try testing.expect(f.parse_config.markdown.directives);
+
+    // No --drop is an error.
+    var w2 = scratchWriter(&buf);
+    var a2 = TestArgs{ .items = &.{ "twig", "filter", "archive.md" } };
+    try testing.expectError(error.MissingFilterSelector, parseConfig(&a2, &w2));
+}
+
+test "parseConfig: filter without --keep leaves keep null (drop the whole family)" {
+    var buf: [256]u8 = undefined;
+    var w = scratchWriter(&buf);
+    var a = TestArgs{ .items = &.{ "twig", "filter", "doc.md", "--drop", "directive[name=vis]" } };
+    const c = try parseConfig(&a, &w);
+    try testing.expectEqual(@as(?[]const u8, null), c.options.filter.keep);
+    try testing.expect(!c.options.filter.unwrap_kept);
 }
 
 test "parseConfig: an unrecognized verb falls back to help rather than erroring" {

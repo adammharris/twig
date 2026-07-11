@@ -1,9 +1,9 @@
-```fig
+---fig
 title = Twig
 author = adammharris
 created = 2026-07-08T22:39:41-07:00
 updated = 2026-07-08T22:40:04-07:00
-```
+---
 
 # Twig
 

@@ -178,6 +178,21 @@ const Renderer = struct {
         try self.writer.writeByte('\n');
     }
 
+    /// Front/end matter: `---<lang>` … `---`. A bare `---` fence (no tag) is
+    /// emitted for `yaml`, matching the ecosystem-standard YAML frontmatter
+    /// spelling; every other language carries its self-describing tag.
+    fn writeMetadata(self: *Renderer, ctx: Ctx, lang: []const u8, text: []const u8) Writer.Error!void {
+        try self.writePrefix(ctx);
+        if (std.mem.eql(u8, lang, "yaml"))
+            try self.writer.writeAll("---\n")
+        else
+            try self.writer.print("---{s}\n", .{lang});
+        if (text.len > 0) try self.writer.writeAll(text);
+        if (text.len == 0 or text[text.len - 1] != '\n') try self.writer.writeByte('\n');
+        try self.writePrefix(ctx);
+        try self.writer.writeAll("---\n");
+    }
+
     fn renderListItem(self: *Renderer, item_id: Node.Id, marker: []const u8, ctx: Ctx, tight: bool) Writer.Error!void {
         try self.writePrefix(ctx);
         try self.writer.writeAll(marker);
@@ -391,6 +406,7 @@ const Renderer = struct {
             },
             .code_block => |cb| try self.writeCodeFence(ctx, cb.lang, cb.text),
             .raw_block => |rb| try self.writeCodeFence(ctx, rb.format, rb.text),
+            .metadata => |m| try self.writeMetadata(ctx, m.lang, m.text),
             .div => {
                 try self.writePrefix(ctx);
                 try self.writer.writeAll("::: \n");

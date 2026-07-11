@@ -51,6 +51,12 @@ pub const Editor = @import("ast/editor.zig").Editor;
 /// See `ast/select.zig`'s module doc comment.
 pub const Select = @import("ast/select.zig");
 
+/// Declarative document pruning over `Select` + `Editor`: `Filter.apply` keeps
+/// only the family members (`drop` selector) matching a `keep` predicate,
+/// optionally unwrapping the survivors — the engine behind `twig filter`. See
+/// `ast/filter.zig`'s module doc comment.
+pub const Filter = @import("ast/filter.zig");
+
 /// A stable, inspectable JSON encoding of the shared `AST`
 /// (`ast_json.encode`/`encodeAlloc`) — the engine behind `twig convert -o ast`
 /// and the C ABI's `twig_document_ast_json`. See `ast/json.zig`'s module doc
@@ -65,5 +71,6 @@ test {
     _ = Markdown;
     _ = @import("ast/editor.zig");
     _ = Select;
+    _ = Filter;
     _ = ast_json;
 }
