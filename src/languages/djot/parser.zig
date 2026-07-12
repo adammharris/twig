@@ -652,7 +652,12 @@ pub const TreeBuilder = struct {
                 const dest = try stripNewlines(self.allocator, self.accumulated_text.items);
                 defer self.allocator.free(dest);
                 const kind: Node.Kind = if (c.data.is_image) .{ .image = .{ .destination = dest, .reference = null } } else .{ .link = .{ .destination = dest, .reference = null } };
-                const id = try self.addNode(kind, Span.init(c.start, ev.end + 1));
+                // An image's `!` sits one byte before its `[` (guaranteed by
+                // the `is_image` test in inline.zig), and it's part of the
+                // node's source — include it so `edit --delete` doesn't orphan
+                // a stray `!`. `c.start >= 1` whenever `is_image`.
+                const span_start = if (c.data.is_image) c.start - 1 else c.start;
+                const id = try self.addNode(kind, Span.init(span_start, ev.end + 1));
                 self.nodes.items[id].first_child = c.first_child;
                 self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
                 try self.commitAttrs(id, &c.attrs);
@@ -674,7 +679,9 @@ pub const TreeBuilder = struct {
                 const lab = try normalizeLabel(self.allocator, ref);
                 defer self.allocator.free(lab);
                 const kind: Node.Kind = if (c.data.is_image) .{ .image = .{ .destination = null, .reference = lab } } else .{ .link = .{ .destination = null, .reference = lab } };
-                const id = try self.addNode(kind, Span.init(c.start, ev.end + 1));
+                // Include the leading `!` in an image's span (see destination_close).
+                const span_start = if (c.data.is_image) c.start - 1 else c.start;
+                const id = try self.addNode(kind, Span.init(span_start, ev.end + 1));
                 self.nodes.items[id].first_child = c.first_child;
                 self.nodes.items[id].content_span = self.contentSpanFromChildren(c.first_child);
                 try self.commitAttrs(id, &c.attrs);
@@ -1440,6 +1447,34 @@ test "content_span: a leaf str node stays null" {
     const str_id = ast.nodes[para_id].first_child orelse return error.TestExpectedNonNull;
     try testing.expect(ast.nodes[str_id].kind == .str);
     try testing.expectEqual(@as(?Span, null), ast.nodes[str_id].content_span);
+}
+
+test "span: an inline image includes its leading `!`" {
+    const src = "![alt](img.png)\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const para_id = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    const img_id = ast.nodes[para_id].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[img_id].kind == .image);
+    const sp = ast.nodes[img_id].span;
+    // The span must start at the `!` (offset 0), not the `[` — otherwise an
+    // `edit --delete` of the image orphans a stray `!`.
+    try testing.expectEqualStrings("![alt](img.png)", src[sp.start..sp.end]);
+}
+
+test "span: a reference image includes its leading `!`" {
+    const src = "![alt][id]\n\n[id]: img.png\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const para_id = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    const img_id = ast.nodes[para_id].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[img_id].kind == .image);
+    const sp = ast.nodes[img_id].span;
+    try testing.expectEqualStrings("![alt][id]", src[sp.start..sp.end]);
 }
 
 test "content_span: an empty div (no children) stays null" {

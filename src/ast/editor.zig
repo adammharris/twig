@@ -203,16 +203,45 @@ pub const Editor = struct {
         var cur: ?Node.Id = first;
         var i: usize = 0;
         var last: Node.Id = first;
+        var prev_last: ?Node.Id = null; // the sibling before `last`, for gap sampling
         while (cur) |c| {
             if (i == index) {
                 const at = self.ast.nodes[c].span.start;
                 return self.replaceAtSpan(Span.init(at, at), text);
             }
+            if (i > 0) prev_last = last;
             last = c;
             cur = self.ast.nodes[c].next_sibling;
             i += 1;
         }
+        // Appending past the last child. The between-child branch above anchors
+        // at the next sibling's start; with no next sibling we must synthesize
+        // the point a sibling *would* start — otherwise the new node joins onto
+        // the last one (`- b` + `- new` -> `- b- new`). The separator between
+        // siblings is format-specific (a newline for block lists, nothing for
+        // inline XML children), so infer it from the source rather than assume:
+        //   1. A trailing newline already sits after the last child -> step past
+        //      it (its own line ended; the new node starts on the next line).
+        //   2. No trailing newline, but the existing siblings are newline-
+        //      separated (sampled gap contains '\n') -> the last line just lacks
+        //      its terminator (e.g. EOF); inject one before the new node.
+        //   3. Otherwise siblings are adjacent (inline) -> splice verbatim.
+        const src = self.source.items;
         const at = self.ast.nodes[last].span.end;
+        if (at < src.len and src[at] == '\n') {
+            return self.replaceAtSpan(Span.init(at + 1, at + 1), text);
+        }
+        const siblings_line_separated = if (prev_last) |p| blk: {
+            const gap = src[self.ast.nodes[p].span.end..self.ast.nodes[last].span.start];
+            break :blk std.mem.indexOfScalar(u8, gap, '\n') != null;
+        } else false;
+        if (siblings_line_separated) {
+            const buf = try self.allocator.alloc(u8, text.len + 1);
+            defer self.allocator.free(buf);
+            buf[0] = '\n';
+            @memcpy(buf[1..], text);
+            return self.replaceAtSpan(Span.init(at, at), buf);
+        }
         try self.replaceAtSpan(Span.init(at, at), text);
     }
 
@@ -351,6 +380,19 @@ fn parseXml(ctx: *const anyopaque, a: Allocator, s: []const u8) anyerror!AST {
     return Xml.parse(a, s);
 }
 
+/// Second test vehicle: Markdown, whose block children (list items, paragraphs)
+/// are direct siblings separated by real newlines in the source — the shape XML
+/// can't produce (it interns inter-element whitespace as its own text nodes).
+/// Needed to exercise `insertChild`'s line-separated append path.
+fn parseMarkdown(ctx: *const anyopaque, a: Allocator, s: []const u8) anyerror!AST {
+    _ = ctx;
+    const Markdown = @import("../languages/markdown/markdown.zig");
+    var doc = try Markdown.parse(a, s, .{});
+    doc.link_references.deinit(a);
+    doc.footnotes.deinit(a);
+    return doc.ast;
+}
+
 /// A throwaway context for the tests below, which use `parseXml` (which
 /// ignores its `ctx`). Any stable pointer works; this is the conventional one.
 const test_ctx: u8 = 0;
@@ -379,6 +421,28 @@ test "insertChild appends and inserts by index" {
     // Insert at the front (index 0).
     try ed.insertChild(&.{0}, 0, "<z/>");
     try testing.expectEqualStrings("<r><z/><a/><b/><c/><d/></r>", ed.sourceBytes());
+}
+
+test "insertChild appends a block child onto its own line" {
+    // The bullet list is the doc's first child (path [0]); its items are
+    // newline-separated siblings. Appending past the end must start the new
+    // item on a fresh line rather than join the last one (`- b` + `- c`).
+    var ed = try Editor.init(testing.allocator, "- a\n- b\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+
+    try ed.insertChild(&.{0}, 99, "- c\n");
+    try testing.expectEqualStrings("- a\n- b\n- c\n", ed.sourceBytes());
+}
+
+test "insertChild append injects a separator when the last line lacks a newline" {
+    // No trailing newline after `- b`: the append can't step past one, so it
+    // infers from the newline-separated siblings that a separator is needed and
+    // injects it (rather than producing `- b- c`).
+    var ed = try Editor.init(testing.allocator, "- a\n- b", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+
+    try ed.insertChild(&.{0}, 99, "- c\n");
+    try testing.expectEqualStrings("- a\n- b\n- c\n", ed.sourceBytes());
 }
 
 test "insertBefore / insertAfter / deleteNode" {

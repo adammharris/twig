@@ -1079,6 +1079,26 @@ pub const Parser = struct {
         b.setContentSpan(id, Span.init(b.nodes.items[first].span.start, b.nodes.items[last].span.end));
     }
 
+    /// A container's source span must contain all its children. The `syntactic`
+    /// span (from `start_line`/`end_line`) is right for a fenced container like
+    /// a container directive, whose closing `:::` fence follows the last child
+    /// and is tracked in `end_line`. But the LAZY containers — lists, list
+    /// items, block quotes, footnote definitions — never advance `end_line`
+    /// past their opening line, so their syntactic end collapses onto the first
+    /// line and an `edit`/`delete` of the whole container touches only its
+    /// first child. Extend the end to the last child's when it reaches further;
+    /// children are always finalized before their parent is popped, so their
+    /// spans are already correct (this composes bottom-up through nesting).
+    /// `@max` leaves fenced containers untouched (their fence sits past the
+    /// last child, so `syntactic.end` already wins).
+    fn containerSpanExtended(b: *Builder, id: Node.Id, syntactic: Span) Span {
+        const first = b.nodes.items[id].first_child orelse return syntactic;
+        var last = first;
+        while (b.nodes.items[last].next_sibling) |next| last = next;
+        if (isUnsetSpan(b.nodes.items[last].span)) return syntactic;
+        return Span.init(syntactic.start, @max(syntactic.end, b.nodes.items[last].span.end));
+    }
+
     fn top(self: *Parser) *Container {
         return &self.stack.items[self.stack.items.len - 1];
     }
@@ -1134,7 +1154,8 @@ pub const Parser = struct {
                 .{ .directive = .{ .form = .container, .name = c.directive_name } },
                 c.children.items,
             );
-            self.builder.setSpan(id, Span.init(self.lineStart(c.start_line), self.lineEnd(@min(c.end_line, line_idx))));
+            const syntactic = Span.init(self.lineStart(c.start_line), self.lineEnd(@min(c.end_line, line_idx)));
+            self.builder.setSpan(id, containerSpanExtended(&self.builder, id, syntactic));
             setContentSpanFromChildren(&self.builder, id);
             if (c.directive_attrs) |p| try self.builder.setAttrs(id, .{ .entries = p.entries });
             try self.appendToTop(id);
@@ -1154,7 +1175,8 @@ pub const Parser = struct {
                 .{ .bullet_list = .{ .style = bulletStyle(c.bullet_char), .tight = c.tight } },
         };
         const id = try self.builder.addContainer(kind, c.children.items);
-        self.builder.setSpan(id, Span.init(self.lineStart(c.start_line), self.lineEnd(@min(c.end_line, line_idx))));
+        const syntactic = Span.init(self.lineStart(c.start_line), self.lineEnd(@min(c.end_line, line_idx)));
+        self.builder.setSpan(id, containerSpanExtended(&self.builder, id, syntactic));
         setContentSpanFromChildren(&self.builder, id);
         try self.appendToTop(id);
     }
@@ -1588,6 +1610,13 @@ pub const Parser = struct {
     fn continueFencedCode(self: *Parser, lf: *Leaf, line: []const u8, cur: Cursor, idx: usize) Allocator.Error!void {
         const remainder = line[cur.pos..];
         if (indentCols(remainder, .{}) < 4 and isFenceClose(stripUpTo3Indent(remainder), lf.fence_char, lf.fence_len)) {
+            // The closing fence is part of the block's source span (though not
+            // its `text`), so advance `end_line` to it before closing —
+            // otherwise the node's span stops at the last content line and an
+            // `edit`/`delete` orphans the closing fence. An unterminated fence
+            // (EOF, no close line) never reaches here, so its span correctly
+            // ends at the last content line.
+            lf.end_line = idx;
             try self.closeLeaf(idx);
             return;
         }
@@ -2602,7 +2631,8 @@ pub const Parser = struct {
         const label_owned = try normalizeLabel(self.allocator, c.footnote_label);
         defer self.allocator.free(label_owned);
         const id = try self.builder.addContainer(.{ .footnote = .{ .label = label_owned } }, c.children.items);
-        self.builder.setSpan(id, Span.init(self.lineStart(c.start_line), self.lineEnd(@min(c.end_line, line_idx))));
+        const syntactic = Span.init(self.lineStart(c.start_line), self.lineEnd(@min(c.end_line, line_idx)));
+        self.builder.setSpan(id, containerSpanExtended(&self.builder, id, syntactic));
         setContentSpanFromChildren(&self.builder, id);
         if (!self.footnotes.contains(label_owned)) {
             // Reuse the node's OWN (builder-owned) label string as the map
@@ -3585,4 +3615,76 @@ test "text directive renders inline as its named element" {
     const html = try renderHtml("See :abbr[HTML]{title=\"HyperText\"} here.\n", directives_on);
     defer testing.allocator.free(html);
     try testing.expectEqualStrings("<p>See <abbr title=\"HyperText\">HTML</abbr> here.</p>\n", html);
+}
+
+test "span: a fenced code block covers its closing fence" {
+    const src = "```zig\nconst x = 1;\n```\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+
+    const cb = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[cb].kind == .code_block);
+    const sp = r.ast.nodes[cb].span;
+    // Must include the closing ``` fence, not stop at the last content line —
+    // otherwise `edit --delete`/`--replace` orphans the closing fence.
+    try testing.expectEqualStrings("```zig\nconst x = 1;\n```", src[sp.start..sp.end]);
+}
+
+test "span: an UNterminated fenced code block stops at its last content line" {
+    // No closing fence exists, so the span must not overshoot past EOF; it ends
+    // at the last content line (the complement of the test above).
+    const src = "```zig\nconst x = 1;\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+
+    const cb = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[cb].kind == .code_block);
+    const sp = r.ast.nodes[cb].span;
+    try testing.expectEqualStrings("```zig\nconst x = 1;", src[sp.start..sp.end]);
+}
+
+test "span: a list's span covers ALL its items, not just the first" {
+    // Regression: a container's span must contain every child. Deleting the
+    // whole list depends on this — a first-item-only span would leave `- b\n- c`.
+    const src = "- a\n- b\n- c\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+
+    const list = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[list].kind == .bullet_list);
+    const sp = r.ast.nodes[list].span;
+    try testing.expectEqualStrings("- a\n- b\n- c", src[sp.start..sp.end]);
+}
+
+test "span: a multi-line list item covers its continuation lines" {
+    const src = "- first\n  continued\n- second\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+
+    const list = r.ast.nodes[r.ast.root].first_child.?;
+    const item = r.ast.nodes[list].first_child.?;
+    try testing.expect(r.ast.nodes[item].kind == .list_item);
+    const sp = r.ast.nodes[item].span;
+    try testing.expectEqualStrings("- first\n  continued", src[sp.start..sp.end]);
+}
+
+test "span: a block quote's span covers all its lines" {
+    const src = "> line one\n> line two\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+
+    const bq = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[bq].kind == .block_quote);
+    const sp = r.ast.nodes[bq].span;
+    try testing.expectEqualStrings("> line one\n> line two", src[sp.start..sp.end]);
 }
