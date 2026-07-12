@@ -2,6 +2,7 @@ mod error;
 mod ffi;
 
 use std::ops::Range;
+use std::os::raw::c_int;
 use std::ptr::NonNull;
 
 pub use error::Error;
@@ -407,6 +408,476 @@ fn collect_matches(
         .collect()
 }
 
+/// The id of a node added to a [`Builder`], returned by every `add*` method and
+/// used to wire up the tree via [`Builder::set_children`] and to root a
+/// render/serialize/query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct NodeId(pub u32);
+
+/// The void-payload node kinds, addable via [`Builder::add`]. Kinds with a
+/// payload have their own dedicated `add_*` method instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VoidKind {
+    Doc,
+    Para,
+    ThematicBreak,
+    Section,
+    Div,
+    BlockQuote,
+    DefinitionList,
+    Table,
+    ListItem,
+    DefinitionListItem,
+    Term,
+    Definition,
+    Caption,
+    SoftBreak,
+    HardBreak,
+    NonBreakingSpace,
+    Emph,
+    Strong,
+    Span,
+    Mark,
+    Superscript,
+    Subscript,
+    Insert,
+    Delete,
+    DoubleQuoted,
+    SingleQuoted,
+}
+
+impl VoidKind {
+    fn to_c(self) -> c_int {
+        // Discriminants match `TwigNodeKind` in the C ABI.
+        match self {
+            VoidKind::Doc => 0,
+            VoidKind::Para => 1,
+            VoidKind::ThematicBreak => 3,
+            VoidKind::Section => 4,
+            VoidKind::Div => 5,
+            VoidKind::BlockQuote => 9,
+            VoidKind::DefinitionList => 13,
+            VoidKind::Table => 14,
+            VoidKind::ListItem => 15,
+            VoidKind::DefinitionListItem => 17,
+            VoidKind::Term => 18,
+            VoidKind::Definition => 19,
+            VoidKind::Caption => 22,
+            VoidKind::SoftBreak => 26,
+            VoidKind::HardBreak => 27,
+            VoidKind::NonBreakingSpace => 28,
+            VoidKind::Emph => 38,
+            VoidKind::Strong => 39,
+            VoidKind::Span => 42,
+            VoidKind::Mark => 43,
+            VoidKind::Superscript => 44,
+            VoidKind::Subscript => 45,
+            VoidKind::Insert => 46,
+            VoidKind::Delete => 47,
+            VoidKind::DoubleQuoted => 48,
+            VoidKind::SingleQuoted => 49,
+        }
+    }
+}
+
+/// The single-string-payload node kinds, addable via [`Builder::add_text`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextKind {
+    Str,
+    Symb,
+    Verbatim,
+    InlineMath,
+    DisplayMath,
+    Url,
+    Email,
+    FootnoteReference,
+    Comment,
+    Doctype,
+    Cdata,
+}
+
+impl TextKind {
+    fn to_c(self) -> c_int {
+        match self {
+            TextKind::Str => 25,
+            TextKind::Symb => 29,
+            TextKind::Verbatim => 30,
+            TextKind::InlineMath => 32,
+            TextKind::DisplayMath => 33,
+            TextKind::Url => 34,
+            TextKind::Email => 35,
+            TextKind::FootnoteReference => 36,
+            TextKind::Comment => 52,
+            TextKind::Doctype => 53,
+            TextKind::Cdata => 55,
+        }
+    }
+}
+
+/// Bullet marker style for [`Builder::add_bullet_list`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BulletStyle {
+    Dash,
+    Plus,
+    Star,
+}
+
+impl BulletStyle {
+    fn to_c(self) -> c_int {
+        match self {
+            BulletStyle::Dash => 0,
+            BulletStyle::Plus => 1,
+            BulletStyle::Star => 2,
+        }
+    }
+}
+
+/// Numbering scheme for [`Builder::add_ordered_list`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderedNumbering {
+    Decimal,
+    LowerAlpha,
+    UpperAlpha,
+    LowerRoman,
+    UpperRoman,
+}
+
+impl OrderedNumbering {
+    fn to_c(self) -> c_int {
+        match self {
+            OrderedNumbering::Decimal => 0,
+            OrderedNumbering::LowerAlpha => 1,
+            OrderedNumbering::UpperAlpha => 2,
+            OrderedNumbering::LowerRoman => 3,
+            OrderedNumbering::UpperRoman => 4,
+        }
+    }
+}
+
+/// Delimiter around an ordered-list number (`1.`, `1)`, `(1)`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderedDelim {
+    Period,
+    ParenAfter,
+    ParenBoth,
+}
+
+impl OrderedDelim {
+    fn to_c(self) -> c_int {
+        match self {
+            OrderedDelim::Period => 0,
+            OrderedDelim::ParenAfter => 1,
+            OrderedDelim::ParenBoth => 2,
+        }
+    }
+}
+
+/// Table-cell alignment for [`Builder::add_cell`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Alignment {
+    Default,
+    Left,
+    Right,
+    Center,
+}
+
+impl Alignment {
+    fn to_c(self) -> c_int {
+        match self {
+            Alignment::Default => 0,
+            Alignment::Left => 1,
+            Alignment::Right => 2,
+            Alignment::Center => 3,
+        }
+    }
+}
+
+/// The smart-punctuation kind for [`Builder::add_smart_punctuation`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SmartPunctuation {
+    LeftSingleQuote,
+    RightSingleQuote,
+    LeftDoubleQuote,
+    RightDoubleQuote,
+    Ellipses,
+    EmDash,
+    EnDash,
+}
+
+impl SmartPunctuation {
+    fn to_c(self) -> c_int {
+        match self {
+            SmartPunctuation::LeftSingleQuote => 0,
+            SmartPunctuation::RightSingleQuote => 1,
+            SmartPunctuation::LeftDoubleQuote => 2,
+            SmartPunctuation::RightDoubleQuote => 3,
+            SmartPunctuation::Ellipses => 4,
+            SmartPunctuation::EmDash => 5,
+            SmartPunctuation::EnDash => 6,
+        }
+    }
+}
+
+/// The surface form of a generic directive for [`Builder::add_directive`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectiveForm {
+    Text,
+    Leaf,
+    Container,
+}
+
+impl DirectiveForm {
+    fn to_c(self) -> c_int {
+        match self {
+            DirectiveForm::Text => 0,
+            DirectiveForm::Leaf => 1,
+            DirectiveForm::Container => 2,
+        }
+    }
+}
+
+/// Decompose an optional string into `(ptr, len, has)` for the C ABI's
+/// `(ptr, len, has_*)` optional-string triples. The pointer borrows `s` and is
+/// only used within the same call.
+fn opt_str(s: Option<&str>) -> (*const u8, usize, c_int) {
+    match s {
+        Some(x) => (x.as_ptr(), x.len(), 1),
+        None => (std::ptr::null(), 0, 0),
+    }
+}
+
+/// Programmatic construction of a document — the write-path mirror of
+/// [`Document::parse`]. Build the tree bottom-up (add children, then the
+/// container, wiring them with [`Builder::set_children`]); every `add*` method
+/// returns the new node's [`NodeId`]. Then render, serialize, query, or dump the
+/// subtree rooted at any id, on demand, without consuming the builder. All input
+/// strings are copied, so caller buffers need not outlive a call.
+#[derive(Debug)]
+pub struct Builder {
+    raw: NonNull<ffi::TwigBuilder>,
+}
+
+impl Builder {
+    /// Create an empty builder.
+    pub fn new() -> Result<Self, Error> {
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe { ffi::twig_builder_create(&mut raw) };
+        Error::from_status(status)?;
+        let raw = NonNull::new(raw).ok_or(Error::Internal)?;
+        Ok(Self { raw })
+    }
+
+    /// Add a void-payload node (attach children later with
+    /// [`Builder::set_children`]).
+    pub fn add(&mut self, kind: VoidKind) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe { ffi::twig_builder_add(b, kind.to_c(), out) })
+    }
+
+    /// Add a single-string-payload node (a `str`, code span, url, comment, …).
+    pub fn add_text(&mut self, kind: TextKind, text: &str) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe { ffi::twig_builder_add_text(b, kind.to_c(), text.as_ptr(), text.len(), out) })
+    }
+
+    /// Add a heading of the given level (attach its inline children afterward).
+    pub fn add_heading(&mut self, level: u32) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe { ffi::twig_builder_add_heading(b, level, out) })
+    }
+
+    /// Add a code block, with an optional info-string language.
+    pub fn add_code_block(&mut self, lang: Option<&str>, text: &str) -> Result<NodeId, Error> {
+        let (lp, ll, has) = opt_str(lang);
+        self.emit(|b, out| unsafe { ffi::twig_builder_add_code_block(b, lp, ll, has, text.as_ptr(), text.len(), out) })
+    }
+
+    /// Add a raw block targeting `format` (e.g. `"html"`).
+    pub fn add_raw_block(&mut self, format: &str, text: &str) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe {
+            ffi::twig_builder_add_raw_block(b, format.as_ptr(), format.len(), text.as_ptr(), text.len(), out)
+        })
+    }
+
+    /// Add a document-metadata block written in config language `lang`.
+    pub fn add_metadata(&mut self, lang: &str, text: &str) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe {
+            ffi::twig_builder_add_metadata(b, lang.as_ptr(), lang.len(), text.as_ptr(), text.len(), out)
+        })
+    }
+
+    /// Add a raw inline targeting `format`.
+    pub fn add_raw_inline(&mut self, format: &str, text: &str) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe {
+            ffi::twig_builder_add_raw_inline(b, format.as_ptr(), format.len(), text.as_ptr(), text.len(), out)
+        })
+    }
+
+    /// Add a smart-punctuation node standing for `text` (its source spelling).
+    pub fn add_smart_punctuation(&mut self, kind: SmartPunctuation, text: &str) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe {
+            ffi::twig_builder_add_smart_punctuation(b, kind.to_c(), text.as_ptr(), text.len(), out)
+        })
+    }
+
+    /// Add a link with an optional destination and/or reference label (attach
+    /// the link text as children).
+    pub fn add_link(&mut self, destination: Option<&str>, reference: Option<&str>) -> Result<NodeId, Error> {
+        let (dp, dl, hd) = opt_str(destination);
+        let (rp, rl, hr) = opt_str(reference);
+        self.emit(|b, out| unsafe { ffi::twig_builder_add_link(b, dp, dl, hd, rp, rl, hr, out) })
+    }
+
+    /// Add an image — like [`Builder::add_link`], but children are the alt text.
+    pub fn add_image(&mut self, destination: Option<&str>, reference: Option<&str>) -> Result<NodeId, Error> {
+        let (dp, dl, hd) = opt_str(destination);
+        let (rp, rl, hr) = opt_str(reference);
+        self.emit(|b, out| unsafe { ffi::twig_builder_add_image(b, dp, dl, hd, rp, rl, hr, out) })
+    }
+
+    /// Add a generic directive of the given form and name.
+    pub fn add_directive(&mut self, form: DirectiveForm, name: &str) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe { ffi::twig_builder_add_directive(b, form.to_c(), name.as_ptr(), name.len(), out) })
+    }
+
+    /// Add a generic named element (the escape hatch for HTML/XML tags).
+    pub fn add_element(&mut self, name: &str) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe { ffi::twig_builder_add_element(b, name.as_ptr(), name.len(), out) })
+    }
+
+    /// Add an XML processing instruction (`<?target data?>`).
+    pub fn add_processing_instruction(&mut self, target: &str, data: &str) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe {
+            ffi::twig_builder_add_processing_instruction(b, target.as_ptr(), target.len(), data.as_ptr(), data.len(), out)
+        })
+    }
+
+    /// Add a footnote definition with the given label.
+    pub fn add_footnote(&mut self, label: &str) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe { ffi::twig_builder_add_footnote(b, label.as_ptr(), label.len(), out) })
+    }
+
+    /// Add a link/image reference definition (`label` → `destination`).
+    pub fn add_reference(&mut self, label: &str, destination: &str) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe {
+            ffi::twig_builder_add_reference(b, label.as_ptr(), label.len(), destination.as_ptr(), destination.len(), out)
+        })
+    }
+
+    /// Add a bullet list.
+    pub fn add_bullet_list(&mut self, style: BulletStyle, tight: bool) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe { ffi::twig_builder_add_bullet_list(b, style.to_c(), tight as c_int, out) })
+    }
+
+    /// Add an ordered list, with an optional explicit start number.
+    pub fn add_ordered_list(
+        &mut self,
+        numbering: OrderedNumbering,
+        delim: OrderedDelim,
+        tight: bool,
+        start: Option<u32>,
+    ) -> Result<NodeId, Error> {
+        let (start_val, has_start) = match start {
+            Some(s) => (s, 1),
+            None => (0, 0),
+        };
+        self.emit(|b, out| unsafe {
+            ffi::twig_builder_add_ordered_list(b, numbering.to_c(), delim.to_c(), tight as c_int, start_val, has_start, out)
+        })
+    }
+
+    /// Add a task list.
+    pub fn add_task_list(&mut self, tight: bool) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe { ffi::twig_builder_add_task_list(b, tight as c_int, out) })
+    }
+
+    /// Add a task-list item with the given checkbox state.
+    pub fn add_task_list_item(&mut self, checked: bool) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe { ffi::twig_builder_add_task_list_item(b, checked as c_int, out) })
+    }
+
+    /// Add a table row (`head` marks a header row).
+    pub fn add_row(&mut self, head: bool) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe { ffi::twig_builder_add_row(b, head as c_int, out) })
+    }
+
+    /// Add a table cell (`head` marks a header cell).
+    pub fn add_cell(&mut self, head: bool, alignment: Alignment) -> Result<NodeId, Error> {
+        self.emit(|b, out| unsafe { ffi::twig_builder_add_cell(b, head as c_int, alignment.to_c(), out) })
+    }
+
+    /// Set `parent`'s children to `children` (in order), replacing any it had.
+    /// Each child id should appear in exactly one `set_children` call.
+    pub fn set_children(&mut self, parent: NodeId, children: &[NodeId]) -> Result<(), Error> {
+        let ids: Vec<u32> = children.iter().map(|n| n.0).collect();
+        let status = unsafe { ffi::twig_builder_set_children(self.raw.as_ptr(), parent.0, ids.as_ptr(), ids.len()) };
+        Error::from_status(status)
+    }
+
+    /// Attach `{...}` attributes to `id` (`(key, Some(value))`, or
+    /// `(key, None)` for a bare attribute), replacing any it had. An empty slice
+    /// clears them.
+    pub fn set_attrs(&mut self, id: NodeId, attrs: &[(&str, Option<&str>)]) -> Result<(), Error> {
+        let kvs: Vec<ffi::TwigKeyVal> = attrs
+            .iter()
+            .map(|(k, v)| ffi::TwigKeyVal {
+                key: k.as_ptr(),
+                key_len: k.len(),
+                value: v.map_or(std::ptr::null(), |s| s.as_ptr()),
+                value_len: v.map_or(0, |s| s.len()),
+            })
+            .collect();
+        let status = unsafe { ffi::twig_builder_set_attrs(self.raw.as_ptr(), id.0, kvs.as_ptr(), kvs.len()) };
+        Error::from_status(status)
+    }
+
+    /// Render the subtree rooted at `root` to HTML (generic whole-vocabulary
+    /// printer — a built tree has no djot/Markdown side tables).
+    pub fn render_html(&mut self, root: NodeId) -> Result<Vec<u8>, Error> {
+        let raw = self.raw.as_ptr();
+        collect_bytes(|ptr, len| unsafe { ffi::twig_builder_render_html(raw, root.0, ptr, len) })
+    }
+
+    /// Serialize the subtree rooted at `root` to `format`'s source syntax.
+    /// Returns [`Error::UnsupportedFormat`] when the target can't represent the
+    /// built tree (e.g. semantic kinds into XML).
+    pub fn serialize(&mut self, root: NodeId, format: Format) -> Result<Vec<u8>, Error> {
+        let raw = self.raw.as_ptr();
+        let ffi_format: ffi::TwigFormat = format.into();
+        collect_bytes(|ptr, len| unsafe { ffi::twig_builder_serialize(raw, root.0, ffi_format as i32, ptr, len) })
+    }
+
+    /// Encode the subtree rooted at `root` as pretty-printed JSON.
+    pub fn ast_json(&mut self, root: NodeId) -> Result<Vec<u8>, Error> {
+        let raw = self.raw.as_ptr();
+        collect_bytes(|ptr, len| unsafe { ffi::twig_builder_ast_json(raw, root.0, ptr, len) })
+    }
+
+    /// Resolve a selector against the subtree rooted at `root` (same grammar as
+    /// [`Document::query`]).
+    pub fn query(&mut self, root: NodeId, selector: &str) -> Result<Vec<QueryMatch>, Error> {
+        let raw = self.raw.as_ptr();
+        collect_matches(|ptr, len| unsafe {
+            ffi::twig_builder_query(raw, root.0, selector.as_ptr(), selector.len(), ptr, len)
+        })
+    }
+
+    /// Shared plumbing for the `add*` constructors: run `call` (which writes the
+    /// new node's id) and wrap the result.
+    fn emit(
+        &mut self,
+        call: impl FnOnce(*mut ffi::TwigBuilder, *mut u32) -> ffi::TwigStatus,
+    ) -> Result<NodeId, Error> {
+        let mut id: u32 = 0;
+        let status = call(self.raw.as_ptr(), &mut id);
+        Error::from_status(status)?;
+        Ok(NodeId(id))
+    }
+}
+
+impl Drop for Builder {
+    fn drop(&mut self) {
+        unsafe { ffi::twig_builder_destroy(self.raw.as_ptr()) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,5 +1058,100 @@ mod tests {
     fn editor_filter_rejects_a_malformed_selector() {
         let mut ed = Editor::new_str("hi\n", Format::Markdown).expect("editor");
         assert_eq!(ed.filter("list >", None, false), Err(Error::InvalidArgument));
+    }
+
+    #[test]
+    fn builder_builds_and_renders_a_document() {
+        let mut b = Builder::new().expect("builder");
+
+        // # Title\n\nhello *world*
+        let title = b.add_text(TextKind::Str, "Title").unwrap();
+        let heading = b.add_heading(1).unwrap();
+        b.set_children(heading, &[title]).unwrap();
+
+        let hello = b.add_text(TextKind::Str, "hello ").unwrap();
+        let world = b.add_text(TextKind::Str, "world").unwrap();
+        let emph = b.add(VoidKind::Emph).unwrap();
+        b.set_children(emph, &[world]).unwrap();
+        let para = b.add(VoidKind::Para).unwrap();
+        b.set_children(para, &[hello, emph]).unwrap();
+
+        let doc = b.add(VoidKind::Doc).unwrap();
+        b.set_children(doc, &[heading, para]).unwrap();
+
+        let html = String::from_utf8(b.render_html(doc).unwrap()).unwrap();
+        assert!(html.contains("<h1>Title</h1>"), "{html}");
+        assert!(html.contains("<em>world</em>"), "{html}");
+
+        let md = String::from_utf8(b.serialize(doc, Format::Markdown).unwrap()).unwrap();
+        assert!(md.contains("# Title"), "{md}");
+        assert!(md.contains("*world*"), "{md}");
+
+        let matches = b.query(doc, "heading").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].kind, "heading");
+
+        let json = String::from_utf8(b.ast_json(doc).unwrap()).unwrap();
+        assert!(json.contains("\"kind\": \"doc\""), "{json}");
+    }
+
+    #[test]
+    fn builder_element_with_attributes() {
+        let mut b = Builder::new().expect("builder");
+        let inner = b.add_text(TextKind::Str, "hi").unwrap();
+        let el = b.add_element("section").unwrap();
+        b.set_children(el, &[inner]).unwrap();
+        b.set_attrs(el, &[("class", Some("note")), ("hidden", None)]).unwrap();
+
+        let html = String::from_utf8(b.render_html(el).unwrap()).unwrap();
+        assert!(html.contains("<section"), "{html}");
+        assert!(html.contains("class=\"note\""), "{html}");
+        assert!(html.contains("hidden"), "{html}");
+    }
+
+    #[test]
+    fn builder_lists_round_trip_to_markdown() {
+        let mut b = Builder::new().expect("builder");
+
+        // An ordered list: 1. one / 2. two
+        let one_txt = b.add_text(TextKind::Str, "one").unwrap();
+        let one_para = b.add(VoidKind::Para).unwrap();
+        b.set_children(one_para, &[one_txt]).unwrap();
+        let one = b.add(VoidKind::ListItem).unwrap();
+        b.set_children(one, &[one_para]).unwrap();
+
+        let two_txt = b.add_text(TextKind::Str, "two").unwrap();
+        let two_para = b.add(VoidKind::Para).unwrap();
+        b.set_children(two_para, &[two_txt]).unwrap();
+        let two = b.add(VoidKind::ListItem).unwrap();
+        b.set_children(two, &[two_para]).unwrap();
+
+        let list = b
+            .add_ordered_list(OrderedNumbering::Decimal, OrderedDelim::Period, true, Some(1))
+            .unwrap();
+        b.set_children(list, &[one, two]).unwrap();
+        let doc = b.add(VoidKind::Doc).unwrap();
+        b.set_children(doc, &[list]).unwrap();
+
+        let md = String::from_utf8(b.serialize(doc, Format::Markdown).unwrap()).unwrap();
+        assert!(md.contains("1. one"), "{md}");
+        assert!(md.contains("2. two"), "{md}");
+    }
+
+    #[test]
+    fn builder_rejects_invalid_kind_and_id() {
+        let b = Builder::new().expect("builder");
+        // `heading` (code 2) carries a payload, so the void-kind `add` rejects it
+        // — the safe `VoidKind` enum has no such variant, so we go through the raw
+        // ABI to prove the guard.
+        let mut id = 0u32;
+        let status = unsafe { ffi::twig_builder_add(b.raw.as_ptr(), 2, &mut id) };
+        assert_eq!(Error::from_status(status), Err(Error::InvalidArgument));
+
+        // A root id past the end can't be rendered.
+        let mut ptr = std::ptr::null();
+        let mut len = 0usize;
+        let status = unsafe { ffi::twig_builder_render_html(b.raw.as_ptr(), 4242, &mut ptr, &mut len) };
+        assert_eq!(Error::from_status(status), Err(Error::InvalidArgument));
     }
 }

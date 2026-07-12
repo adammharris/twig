@@ -36,6 +36,19 @@ pub enum TwigDocument {}
 
 pub enum TwigEditor {}
 
+pub enum TwigBuilder {}
+
+/// C ABI mirror of Zig's `TwigKeyVal` — one attribute pair for
+/// `twig_builder_set_attrs`. A NULL `value` is a bare attribute.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TwigKeyVal {
+    pub key: *const u8,
+    pub key_len: usize,
+    pub value: *const u8,
+    pub value_len: usize,
+}
+
 /// C ABI mirror of Zig's `TwigSpan` — a byte range `[start, end)`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,6 +190,171 @@ unsafe extern "C" {
     ) -> TwigStatus;
     pub fn twig_editor_query(
         editor: *mut TwigEditor,
+        selector: *const u8,
+        selector_len: usize,
+        out_ptr: *mut *const TwigQueryMatch,
+        out_len: *mut usize,
+    ) -> TwigStatus;
+
+    pub fn twig_builder_create(out_builder: *mut *mut TwigBuilder) -> TwigStatus;
+    pub fn twig_builder_destroy(builder: *mut TwigBuilder);
+    pub fn twig_builder_add(builder: *mut TwigBuilder, kind: c_int, out_id: *mut u32) -> TwigStatus;
+    pub fn twig_builder_add_text(
+        builder: *mut TwigBuilder,
+        kind: c_int,
+        text: *const u8,
+        text_len: usize,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_heading(builder: *mut TwigBuilder, level: u32, out_id: *mut u32) -> TwigStatus;
+    pub fn twig_builder_add_code_block(
+        builder: *mut TwigBuilder,
+        lang: *const u8,
+        lang_len: usize,
+        has_lang: c_int,
+        text: *const u8,
+        text_len: usize,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_raw_block(
+        builder: *mut TwigBuilder,
+        format: *const u8,
+        format_len: usize,
+        text: *const u8,
+        text_len: usize,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_metadata(
+        builder: *mut TwigBuilder,
+        lang: *const u8,
+        lang_len: usize,
+        text: *const u8,
+        text_len: usize,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_raw_inline(
+        builder: *mut TwigBuilder,
+        format: *const u8,
+        format_len: usize,
+        text: *const u8,
+        text_len: usize,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_smart_punctuation(
+        builder: *mut TwigBuilder,
+        punct_kind: c_int,
+        text: *const u8,
+        text_len: usize,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_link(
+        builder: *mut TwigBuilder,
+        destination: *const u8,
+        destination_len: usize,
+        has_destination: c_int,
+        reference: *const u8,
+        reference_len: usize,
+        has_reference: c_int,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_image(
+        builder: *mut TwigBuilder,
+        destination: *const u8,
+        destination_len: usize,
+        has_destination: c_int,
+        reference: *const u8,
+        reference_len: usize,
+        has_reference: c_int,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_directive(
+        builder: *mut TwigBuilder,
+        form: c_int,
+        name: *const u8,
+        name_len: usize,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_element(
+        builder: *mut TwigBuilder,
+        name: *const u8,
+        name_len: usize,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_processing_instruction(
+        builder: *mut TwigBuilder,
+        target: *const u8,
+        target_len: usize,
+        data: *const u8,
+        data_len: usize,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_footnote(
+        builder: *mut TwigBuilder,
+        label: *const u8,
+        label_len: usize,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_reference(
+        builder: *mut TwigBuilder,
+        label: *const u8,
+        label_len: usize,
+        destination: *const u8,
+        destination_len: usize,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_bullet_list(
+        builder: *mut TwigBuilder,
+        style: c_int,
+        tight: c_int,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_ordered_list(
+        builder: *mut TwigBuilder,
+        numbering: c_int,
+        delim: c_int,
+        tight: c_int,
+        start: u32,
+        has_start: c_int,
+        out_id: *mut u32,
+    ) -> TwigStatus;
+    pub fn twig_builder_add_task_list(builder: *mut TwigBuilder, tight: c_int, out_id: *mut u32) -> TwigStatus;
+    pub fn twig_builder_add_task_list_item(builder: *mut TwigBuilder, checked: c_int, out_id: *mut u32) -> TwigStatus;
+    pub fn twig_builder_add_row(builder: *mut TwigBuilder, head: c_int, out_id: *mut u32) -> TwigStatus;
+    pub fn twig_builder_add_cell(builder: *mut TwigBuilder, head: c_int, alignment: c_int, out_id: *mut u32) -> TwigStatus;
+    pub fn twig_builder_set_children(
+        builder: *mut TwigBuilder,
+        parent: u32,
+        ids: *const u32,
+        ids_len: usize,
+    ) -> TwigStatus;
+    pub fn twig_builder_set_attrs(
+        builder: *mut TwigBuilder,
+        id: u32,
+        kvs: *const TwigKeyVal,
+        kvs_len: usize,
+    ) -> TwigStatus;
+    pub fn twig_builder_render_html(
+        builder: *mut TwigBuilder,
+        root: u32,
+        out_ptr: *mut *const u8,
+        out_len: *mut usize,
+    ) -> TwigStatus;
+    pub fn twig_builder_serialize(
+        builder: *mut TwigBuilder,
+        root: u32,
+        format: c_int,
+        out_ptr: *mut *const u8,
+        out_len: *mut usize,
+    ) -> TwigStatus;
+    pub fn twig_builder_ast_json(
+        builder: *mut TwigBuilder,
+        root: u32,
+        out_ptr: *mut *const u8,
+        out_len: *mut usize,
+    ) -> TwigStatus;
+    pub fn twig_builder_query(
+        builder: *mut TwigBuilder,
+        root: u32,
         selector: *const u8,
         selector_len: usize,
         out_ptr: *mut *const TwigQueryMatch,

@@ -860,6 +860,736 @@ pub export fn twig_editor_query(
     return .ok;
 }
 
+// ── Builder ──────────────────────────────────────────────────────────────────
+// Programmatic construction of a document, the write-path mirror of `twig_parse`
+// (which reads a document from source). Wraps `twig.AST.Builder`: build the tree
+// bottom-up — add children, then the container from their ids — where every
+// `twig_builder_add*` call returns the new node's id through `out_id`. Then
+// render / serialize / query / dump the subtree rooted at any id, on demand,
+// WITHOUT consuming the builder (via `Builder.view`), so a build can be inspected
+// and extended freely. Mirrors fig's `fig_value_*` value-construction surface.
+//
+// Two contracts, inherited from `twig.AST.Builder`:
+//   * Every string handed in is COPIED — the caller's buffers need not outlive
+//     the call, and a built tree borrows no source.
+//   * Each node id must be placed in exactly one parent (`set_children`); reusing
+//     an id in two parents corrupts the sibling chain (asserted in safe builds).
+
+pub const TwigBuilder = opaque {};
+
+/// The full shared `Node.Kind` vocabulary as stable C ABI codes, in
+/// `ast.zig` declaration order. Used by `twig_builder_add` (void-payload kinds)
+/// and `twig_builder_add_text` (single-string-payload kinds) to pick a kind;
+/// the kinds with richer payloads have their own dedicated `twig_builder_add_*`
+/// constructors and are not selectable through those two entry points.
+pub const TwigNodeKind = enum(c_int) {
+    doc = 0,
+    para = 1,
+    heading = 2,
+    thematic_break = 3,
+    section = 4,
+    div = 5,
+    code_block = 6,
+    raw_block = 7,
+    metadata = 8,
+    block_quote = 9,
+    bullet_list = 10,
+    ordered_list = 11,
+    task_list = 12,
+    definition_list = 13,
+    table = 14,
+    list_item = 15,
+    task_list_item = 16,
+    definition_list_item = 17,
+    term = 18,
+    definition = 19,
+    row = 20,
+    cell = 21,
+    caption = 22,
+    footnote = 23,
+    reference = 24,
+    str = 25,
+    soft_break = 26,
+    hard_break = 27,
+    non_breaking_space = 28,
+    symb = 29,
+    verbatim = 30,
+    raw_inline = 31,
+    inline_math = 32,
+    display_math = 33,
+    url = 34,
+    email = 35,
+    footnote_reference = 36,
+    smart_punctuation = 37,
+    emph = 38,
+    strong = 39,
+    link = 40,
+    image = 41,
+    span = 42,
+    mark = 43,
+    superscript = 44,
+    subscript = 45,
+    insert = 46,
+    delete = 47,
+    double_quoted = 48,
+    single_quoted = 49,
+    directive = 50,
+    element = 51,
+    comment = 52,
+    doctype = 53,
+    processing_instruction = 54,
+    cdata = 55,
+};
+
+pub const TwigBulletStyle = enum(c_int) { dash = 0, plus = 1, star = 2 };
+pub const TwigOrderedNumbering = enum(c_int) { decimal = 0, lower_alpha = 1, upper_alpha = 2, lower_roman = 3, upper_roman = 4 };
+pub const TwigOrderedDelim = enum(c_int) { period = 0, paren_after = 1, paren_both = 2 };
+pub const TwigAlignment = enum(c_int) { default = 0, left = 1, right = 2, center = 3 };
+pub const TwigSmartPunctuation = enum(c_int) {
+    left_single_quote = 0,
+    right_single_quote = 1,
+    left_double_quote = 2,
+    right_double_quote = 3,
+    ellipses = 4,
+    em_dash = 5,
+    en_dash = 6,
+};
+pub const TwigDirectiveForm = enum(c_int) { text = 0, leaf = 1, container = 2 };
+
+/// One attribute pair for `twig_builder_set_attrs`. A NULL `value` is a *bare*
+/// attribute (HTML `disabled`), distinct from a present-but-empty value
+/// (`value` non-NULL, `value_len == 0`, i.e. `disabled=""`). The strings are
+/// copied, so they need not outlive the call.
+pub const TwigKeyVal = extern struct {
+    key: ?[*]const u8,
+    key_len: usize,
+    value: ?[*]const u8,
+    value_len: usize,
+};
+
+const BuilderHandle = struct {
+    builder: twig.AST.Builder,
+    /// Caller-borrowed output buffers, same contract as `DocumentHandle`'s:
+    /// owned by the handle, replaced on the next call to the same accessor,
+    /// freed on destroy.
+    rendered: []u8 = &.{},
+    serialized: []u8 = &.{},
+    ast_json: []u8 = &.{},
+    query_matches: []TwigQueryMatch = &.{},
+};
+
+fn asBuilder(b: *TwigBuilder) *BuilderHandle {
+    return @ptrCast(@alignCast(b));
+}
+
+/// Write the id a builder call produced to `out_id`, mapping allocation failure
+/// to a status. Node construction can only fail on OOM.
+fn emitNode(out_id: ?*u32, result: Allocator.Error!twig.AST.Node.Id) TwigStatus {
+    const out = out_id orelse return .invalid_argument;
+    const id = result catch return .out_of_memory;
+    out.* = id;
+    return .ok;
+}
+
+pub export fn twig_builder_create(out_builder: ?*?*TwigBuilder) TwigStatus {
+    const out = out_builder orelse return .invalid_argument;
+    out.* = null;
+    const allocator = activeAllocator();
+    const handle = allocator.create(BuilderHandle) catch return .out_of_memory;
+    handle.* = .{ .builder = twig.AST.Builder.init(allocator) };
+    out.* = @ptrCast(handle);
+    return .ok;
+}
+
+pub export fn twig_builder_destroy(b: ?*TwigBuilder) void {
+    const raw = b orelse return;
+    const allocator = activeAllocator();
+    const handle = asBuilder(raw);
+    if (handle.rendered.len != 0) allocator.free(handle.rendered);
+    if (handle.serialized.len != 0) allocator.free(handle.serialized);
+    if (handle.ast_json.len != 0) allocator.free(handle.ast_json);
+    if (handle.query_matches.len != 0) allocator.free(handle.query_matches);
+    handle.builder.deinit();
+    allocator.destroy(handle);
+}
+
+// ── constructors ─────────────────────────────────────────────────────────────
+// Grouped by payload shape: `add` for the void-payload kinds (children attached
+// later via `set_children`), `add_text` for the single-string-payload kinds, and
+// a dedicated constructor for each kind carrying a richer payload.
+
+/// The void-payload `Node.Kind` for a `TwigNodeKind` code, or `null` if the code
+/// names a kind with a payload (which needs its own `twig_builder_add_*`) or is
+/// unknown. Any of these may still be given children via `twig_builder_set_children`.
+fn voidKind(kind: c_int) ?twig.AST.Node.Kind {
+    return switch (kind) {
+        @intFromEnum(TwigNodeKind.doc) => .doc,
+        @intFromEnum(TwigNodeKind.para) => .para,
+        @intFromEnum(TwigNodeKind.thematic_break) => .thematic_break,
+        @intFromEnum(TwigNodeKind.section) => .section,
+        @intFromEnum(TwigNodeKind.div) => .div,
+        @intFromEnum(TwigNodeKind.block_quote) => .block_quote,
+        @intFromEnum(TwigNodeKind.definition_list) => .definition_list,
+        @intFromEnum(TwigNodeKind.table) => .table,
+        @intFromEnum(TwigNodeKind.list_item) => .list_item,
+        @intFromEnum(TwigNodeKind.definition_list_item) => .definition_list_item,
+        @intFromEnum(TwigNodeKind.term) => .term,
+        @intFromEnum(TwigNodeKind.definition) => .definition,
+        @intFromEnum(TwigNodeKind.caption) => .caption,
+        @intFromEnum(TwigNodeKind.soft_break) => .soft_break,
+        @intFromEnum(TwigNodeKind.hard_break) => .hard_break,
+        @intFromEnum(TwigNodeKind.non_breaking_space) => .non_breaking_space,
+        @intFromEnum(TwigNodeKind.emph) => .emph,
+        @intFromEnum(TwigNodeKind.strong) => .strong,
+        @intFromEnum(TwigNodeKind.span) => .span,
+        @intFromEnum(TwigNodeKind.mark) => .mark,
+        @intFromEnum(TwigNodeKind.superscript) => .superscript,
+        @intFromEnum(TwigNodeKind.subscript) => .subscript,
+        @intFromEnum(TwigNodeKind.insert) => .insert,
+        @intFromEnum(TwigNodeKind.delete) => .delete,
+        @intFromEnum(TwigNodeKind.double_quoted) => .double_quoted,
+        @intFromEnum(TwigNodeKind.single_quoted) => .single_quoted,
+        else => null,
+    };
+}
+
+/// Add a void-payload node (`para`, `emph`, `block_quote`, `table`, …). Attach
+/// its children afterward with `twig_builder_set_children`. A `kind` code that
+/// names a payload-bearing kind (use that kind's own constructor) or is unknown
+/// returns `invalid_argument`.
+pub export fn twig_builder_add(b: ?*TwigBuilder, kind: c_int, out_id: ?*u32) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const node_kind = voidKind(kind) orelse return .invalid_argument;
+    return emitNode(out_id, handle.builder.addNode(node_kind));
+}
+
+/// Add a single-string-payload inline/leaf node. `kind` must be one of the
+/// string kinds (`str`, `symb`, `verbatim`, `inline_math`, `display_math`,
+/// `url`, `email`, `footnote_reference`, `comment`, `doctype`, `cdata`); any
+/// other code returns `invalid_argument`. The text is copied.
+pub export fn twig_builder_add_text(
+    b: ?*TwigBuilder,
+    kind: c_int,
+    text_ptr: ?[*]const u8,
+    text_len: usize,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const text = sliceOf(text_ptr, text_len) orelse return .invalid_argument;
+    const node_kind: twig.AST.Node.Kind = switch (kind) {
+        @intFromEnum(TwigNodeKind.str) => .{ .str = text },
+        @intFromEnum(TwigNodeKind.symb) => .{ .symb = text },
+        @intFromEnum(TwigNodeKind.verbatim) => .{ .verbatim = text },
+        @intFromEnum(TwigNodeKind.inline_math) => .{ .inline_math = text },
+        @intFromEnum(TwigNodeKind.display_math) => .{ .display_math = text },
+        @intFromEnum(TwigNodeKind.url) => .{ .url = text },
+        @intFromEnum(TwigNodeKind.email) => .{ .email = text },
+        @intFromEnum(TwigNodeKind.footnote_reference) => .{ .footnote_reference = text },
+        @intFromEnum(TwigNodeKind.comment) => .{ .comment = text },
+        @intFromEnum(TwigNodeKind.doctype) => .{ .doctype = text },
+        @intFromEnum(TwigNodeKind.cdata) => .{ .cdata = text },
+        else => return .invalid_argument,
+    };
+    return emitNode(out_id, handle.builder.addNode(node_kind));
+}
+
+pub export fn twig_builder_add_heading(b: ?*TwigBuilder, level: u32, out_id: ?*u32) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    return emitNode(out_id, handle.builder.addNode(.{ .heading = .{ .level = level } }));
+}
+
+/// Add a `code_block`. `has_lang == 0` means no info-string language (a NULL
+/// `code_block.lang`); otherwise `lang_ptr[0..lang_len]` is the language. Both
+/// strings are copied.
+pub export fn twig_builder_add_code_block(
+    b: ?*TwigBuilder,
+    lang_ptr: ?[*]const u8,
+    lang_len: usize,
+    has_lang: c_int,
+    text_ptr: ?[*]const u8,
+    text_len: usize,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const text = sliceOf(text_ptr, text_len) orelse return .invalid_argument;
+    const lang: ?[]const u8 = if (has_lang != 0) (sliceOf(lang_ptr, lang_len) orelse return .invalid_argument) else null;
+    return emitNode(out_id, handle.builder.addNode(.{ .code_block = .{ .lang = lang, .text = text } }));
+}
+
+pub export fn twig_builder_add_raw_block(
+    b: ?*TwigBuilder,
+    format_ptr: ?[*]const u8,
+    format_len: usize,
+    text_ptr: ?[*]const u8,
+    text_len: usize,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const format = sliceOf(format_ptr, format_len) orelse return .invalid_argument;
+    const text = sliceOf(text_ptr, text_len) orelse return .invalid_argument;
+    return emitNode(out_id, handle.builder.addNode(.{ .raw_block = .{ .format = format, .text = text } }));
+}
+
+pub export fn twig_builder_add_metadata(
+    b: ?*TwigBuilder,
+    lang_ptr: ?[*]const u8,
+    lang_len: usize,
+    text_ptr: ?[*]const u8,
+    text_len: usize,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const lang = sliceOf(lang_ptr, lang_len) orelse return .invalid_argument;
+    const text = sliceOf(text_ptr, text_len) orelse return .invalid_argument;
+    return emitNode(out_id, handle.builder.addNode(.{ .metadata = .{ .lang = lang, .text = text } }));
+}
+
+pub export fn twig_builder_add_raw_inline(
+    b: ?*TwigBuilder,
+    format_ptr: ?[*]const u8,
+    format_len: usize,
+    text_ptr: ?[*]const u8,
+    text_len: usize,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const format = sliceOf(format_ptr, format_len) orelse return .invalid_argument;
+    const text = sliceOf(text_ptr, text_len) orelse return .invalid_argument;
+    return emitNode(out_id, handle.builder.addNode(.{ .raw_inline = .{ .format = format, .text = text } }));
+}
+
+fn smartPunctOf(kind: c_int) ?twig.AST.SmartPunctuationKind {
+    return switch (kind) {
+        @intFromEnum(TwigSmartPunctuation.left_single_quote) => .left_single_quote,
+        @intFromEnum(TwigSmartPunctuation.right_single_quote) => .right_single_quote,
+        @intFromEnum(TwigSmartPunctuation.left_double_quote) => .left_double_quote,
+        @intFromEnum(TwigSmartPunctuation.right_double_quote) => .right_double_quote,
+        @intFromEnum(TwigSmartPunctuation.ellipses) => .ellipses,
+        @intFromEnum(TwigSmartPunctuation.em_dash) => .em_dash,
+        @intFromEnum(TwigSmartPunctuation.en_dash) => .en_dash,
+        else => null,
+    };
+}
+
+/// Add a `smart_punctuation` node. `punct_kind` is a `TwigSmartPunctuation`
+/// code; `text` is the source spelling it stands for (e.g. `"---"` for an
+/// em dash), copied.
+pub export fn twig_builder_add_smart_punctuation(
+    b: ?*TwigBuilder,
+    punct_kind: c_int,
+    text_ptr: ?[*]const u8,
+    text_len: usize,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const pk = smartPunctOf(punct_kind) orelse return .invalid_argument;
+    const text = sliceOf(text_ptr, text_len) orelse return .invalid_argument;
+    return emitNode(out_id, handle.builder.addNode(.{ .smart_punctuation = .{ .kind = pk, .text = text } }));
+}
+
+/// Add a `link`. `has_destination`/`has_reference` gate the two optional
+/// fields (a NULL field when 0). Inline children (the link text) are attached
+/// with `twig_builder_set_children`. Strings are copied.
+pub export fn twig_builder_add_link(
+    b: ?*TwigBuilder,
+    dest_ptr: ?[*]const u8,
+    dest_len: usize,
+    has_destination: c_int,
+    ref_ptr: ?[*]const u8,
+    ref_len: usize,
+    has_reference: c_int,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const dest: ?[]const u8 = if (has_destination != 0) (sliceOf(dest_ptr, dest_len) orelse return .invalid_argument) else null;
+    const ref: ?[]const u8 = if (has_reference != 0) (sliceOf(ref_ptr, ref_len) orelse return .invalid_argument) else null;
+    return emitNode(out_id, handle.builder.addNode(.{ .link = .{ .destination = dest, .reference = ref } }));
+}
+
+/// Add an `image` — like `twig_builder_add_link`, but the children are the alt
+/// text.
+pub export fn twig_builder_add_image(
+    b: ?*TwigBuilder,
+    dest_ptr: ?[*]const u8,
+    dest_len: usize,
+    has_destination: c_int,
+    ref_ptr: ?[*]const u8,
+    ref_len: usize,
+    has_reference: c_int,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const dest: ?[]const u8 = if (has_destination != 0) (sliceOf(dest_ptr, dest_len) orelse return .invalid_argument) else null;
+    const ref: ?[]const u8 = if (has_reference != 0) (sliceOf(ref_ptr, ref_len) orelse return .invalid_argument) else null;
+    return emitNode(out_id, handle.builder.addNode(.{ .image = .{ .destination = dest, .reference = ref } }));
+}
+
+fn directiveFormOf(form: c_int) ?twig.AST.DirectiveForm {
+    return switch (form) {
+        @intFromEnum(TwigDirectiveForm.text) => .text,
+        @intFromEnum(TwigDirectiveForm.leaf) => .leaf,
+        @intFromEnum(TwigDirectiveForm.container) => .container,
+        else => null,
+    };
+}
+
+pub export fn twig_builder_add_directive(
+    b: ?*TwigBuilder,
+    form: c_int,
+    name_ptr: ?[*]const u8,
+    name_len: usize,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const f = directiveFormOf(form) orelse return .invalid_argument;
+    const name = sliceOf(name_ptr, name_len) orelse return .invalid_argument;
+    return emitNode(out_id, handle.builder.addNode(.{ .directive = .{ .form = f, .name = name } }));
+}
+
+pub export fn twig_builder_add_element(
+    b: ?*TwigBuilder,
+    name_ptr: ?[*]const u8,
+    name_len: usize,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const name = sliceOf(name_ptr, name_len) orelse return .invalid_argument;
+    return emitNode(out_id, handle.builder.addNode(.{ .element = .{ .name = name } }));
+}
+
+pub export fn twig_builder_add_processing_instruction(
+    b: ?*TwigBuilder,
+    target_ptr: ?[*]const u8,
+    target_len: usize,
+    data_ptr: ?[*]const u8,
+    data_len: usize,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const target = sliceOf(target_ptr, target_len) orelse return .invalid_argument;
+    const data = sliceOf(data_ptr, data_len) orelse return .invalid_argument;
+    return emitNode(out_id, handle.builder.addNode(.{ .processing_instruction = .{ .target = target, .data = data } }));
+}
+
+pub export fn twig_builder_add_footnote(
+    b: ?*TwigBuilder,
+    label_ptr: ?[*]const u8,
+    label_len: usize,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const label = sliceOf(label_ptr, label_len) orelse return .invalid_argument;
+    return emitNode(out_id, handle.builder.addNode(.{ .footnote = .{ .label = label } }));
+}
+
+pub export fn twig_builder_add_reference(
+    b: ?*TwigBuilder,
+    label_ptr: ?[*]const u8,
+    label_len: usize,
+    dest_ptr: ?[*]const u8,
+    dest_len: usize,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const label = sliceOf(label_ptr, label_len) orelse return .invalid_argument;
+    const dest = sliceOf(dest_ptr, dest_len) orelse return .invalid_argument;
+    return emitNode(out_id, handle.builder.addNode(.{ .reference = .{ .label = label, .destination = dest } }));
+}
+
+fn bulletStyleOf(style: c_int) ?twig.AST.BulletListStyle {
+    return switch (style) {
+        @intFromEnum(TwigBulletStyle.dash) => .dash,
+        @intFromEnum(TwigBulletStyle.plus) => .plus,
+        @intFromEnum(TwigBulletStyle.star) => .star,
+        else => null,
+    };
+}
+
+pub export fn twig_builder_add_bullet_list(
+    b: ?*TwigBuilder,
+    style: c_int,
+    tight: c_int,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const s = bulletStyleOf(style) orelse return .invalid_argument;
+    return emitNode(out_id, handle.builder.addNode(.{ .bullet_list = .{ .style = s, .tight = tight != 0 } }));
+}
+
+fn numberingOf(numbering: c_int) ?twig.AST.OrderedListStyle.Numbering {
+    return switch (numbering) {
+        @intFromEnum(TwigOrderedNumbering.decimal) => .decimal,
+        @intFromEnum(TwigOrderedNumbering.lower_alpha) => .lower_alpha,
+        @intFromEnum(TwigOrderedNumbering.upper_alpha) => .upper_alpha,
+        @intFromEnum(TwigOrderedNumbering.lower_roman) => .lower_roman,
+        @intFromEnum(TwigOrderedNumbering.upper_roman) => .upper_roman,
+        else => null,
+    };
+}
+
+fn delimOf(delim: c_int) ?twig.AST.OrderedListStyle.Delim {
+    return switch (delim) {
+        @intFromEnum(TwigOrderedDelim.period) => .period,
+        @intFromEnum(TwigOrderedDelim.paren_after) => .paren_after,
+        @intFromEnum(TwigOrderedDelim.paren_both) => .paren_both,
+        else => null,
+    };
+}
+
+/// Add an `ordered_list`. `has_start == 0` leaves the start number implicit (a
+/// NULL `ordered_list.start`); otherwise `start` is the explicit first number.
+pub export fn twig_builder_add_ordered_list(
+    b: ?*TwigBuilder,
+    numbering: c_int,
+    delim: c_int,
+    tight: c_int,
+    start: u32,
+    has_start: c_int,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const num = numberingOf(numbering) orelse return .invalid_argument;
+    const del = delimOf(delim) orelse return .invalid_argument;
+    return emitNode(out_id, handle.builder.addNode(.{ .ordered_list = .{
+        .style = .{ .numbering = num, .delim = del },
+        .tight = tight != 0,
+        .start = if (has_start != 0) start else null,
+    } }));
+}
+
+pub export fn twig_builder_add_task_list(b: ?*TwigBuilder, tight: c_int, out_id: ?*u32) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    return emitNode(out_id, handle.builder.addNode(.{ .task_list = .{ .tight = tight != 0 } }));
+}
+
+pub export fn twig_builder_add_task_list_item(b: ?*TwigBuilder, checked: c_int, out_id: ?*u32) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    return emitNode(out_id, handle.builder.addNode(.{ .task_list_item = .{ .checked = checked != 0 } }));
+}
+
+pub export fn twig_builder_add_row(b: ?*TwigBuilder, head: c_int, out_id: ?*u32) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    return emitNode(out_id, handle.builder.addNode(.{ .row = .{ .head = head != 0 } }));
+}
+
+fn alignmentOf(alignment: c_int) ?twig.AST.Alignment {
+    return switch (alignment) {
+        @intFromEnum(TwigAlignment.default) => .default,
+        @intFromEnum(TwigAlignment.left) => .left,
+        @intFromEnum(TwigAlignment.right) => .right,
+        @intFromEnum(TwigAlignment.center) => .center,
+        else => null,
+    };
+}
+
+pub export fn twig_builder_add_cell(
+    b: ?*TwigBuilder,
+    head: c_int,
+    alignment: c_int,
+    out_id: ?*u32,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const a = alignmentOf(alignment) orelse return .invalid_argument;
+    return emitNode(out_id, handle.builder.addNode(.{ .cell = .{ .head = head != 0, .alignment = a } }));
+}
+
+// ── structure & attributes ───────────────────────────────────────────────────
+
+/// Set `parent`'s children to `ids` (in order), replacing any it had. Every id
+/// — `parent` and each child — must name a node already added to this builder,
+/// else `invalid_argument`. Each child id should appear in exactly one
+/// `set_children` call across the whole build (a node has a single sibling
+/// link); reusing one corrupts the tree.
+pub export fn twig_builder_set_children(
+    b: ?*TwigBuilder,
+    parent: u32,
+    ids_ptr: ?[*]const u32,
+    ids_len: usize,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const count = handle.builder.nodes.items.len;
+    if (parent >= count) return .invalid_argument;
+    // u32 and Node.Id are the same type, so the C array is already the slice the
+    // builder wants — no copy. Every id must name an existing node.
+    const ids: []const u32 = if (ids_len == 0) &.{} else (ids_ptr orelse return .invalid_argument)[0..ids_len];
+    for (ids) |id| if (id >= count) return .invalid_argument;
+    handle.builder.setChildren(parent, ids);
+    return .ok;
+}
+
+/// Attach `{...}` attributes to `id` (see `TwigKeyVal`), replacing any it had;
+/// `kvs_len == 0` clears them. `id` must name an existing node. The keys/values
+/// are copied.
+pub export fn twig_builder_set_attrs(
+    b: ?*TwigBuilder,
+    id: u32,
+    kvs_ptr: ?[*]const TwigKeyVal,
+    kvs_len: usize,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    if (id >= handle.builder.nodes.items.len) return .invalid_argument;
+    if (kvs_len == 0) {
+        handle.builder.setAttrs(id, .{}) catch return .out_of_memory;
+        return .ok;
+    }
+    const c_kvs = (kvs_ptr orelse return .invalid_argument)[0..kvs_len];
+    const allocator = activeAllocator();
+    // `setAttrs` copies each key/value into owned storage, so this decode array
+    // (borrowing the caller's bytes) is only needed for the duration of the call.
+    const entries = allocator.alloc(twig.AST.KeyVal, kvs_len) catch return .out_of_memory;
+    defer allocator.free(entries);
+    for (c_kvs, entries) |c, *e| {
+        const key = sliceOf(c.key, c.key_len) orelse return .invalid_argument;
+        const value: ?[]const u8 = if (c.value) |vp| vp[0..c.value_len] else null;
+        e.* = .{ .key = key, .value = value };
+    }
+    handle.builder.setAttrs(id, .{ .entries = entries }) catch return .out_of_memory;
+    return .ok;
+}
+
+// ── render / serialize / inspect the built tree ───────────────────────────────
+// Each takes an explicit `root` id and operates on the subtree under it via a
+// non-consuming `Builder.view`, so a build can be rendered/queried and then
+// extended. Output buffers follow the borrowed-until-next-same-call contract.
+
+/// Serialize a built `AST` (subtree rooted at the view's root) to `target`'s own
+/// source syntax. Mirrors `serializeDocument`'s cross-format arm, but always
+/// from a bare AST — a built tree has no djot/Markdown side tables. Any error is
+/// mapped by the caller (OOM / unsafe-metadata / otherwise unsupported).
+fn serializeBuiltAst(allocator: Allocator, ast: *const twig.AST, target: TwigFormat) anyerror![]u8 {
+    return switch (target) {
+        .djot => twig.Djot.serializer.serializeAstAlloc(allocator, ast),
+        .markdown => twig.Markdown.serializer.serializeAstAlloc(allocator, ast),
+        .html => twig.Html.serializeAlloc(allocator, ast, null),
+        .xml => twig.Xml.serializeAlloc(allocator, ast),
+    };
+}
+
+/// Render the subtree rooted at `root` to HTML via the generic whole-vocabulary
+/// printer (no djot/Markdown side tables — a built tree has none). Borrowed
+/// output, valid until the next `twig_builder_render_html` on this handle or its
+/// destruction.
+pub export fn twig_builder_render_html(
+    b: ?*TwigBuilder,
+    root: u32,
+    out_ptr: ?*?[*]const u8,
+    out_len: ?*usize,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const ptr_out = out_ptr orelse return .invalid_argument;
+    const len_out = out_len orelse return .invalid_argument;
+    if (root >= handle.builder.nodes.items.len) return .invalid_argument;
+
+    const allocator = activeAllocator();
+    const ast = handle.builder.view(root);
+    const rendered = twig.Html.serializeAlloc(allocator, &ast, null) catch |err| switch (err) {
+        error.OutOfMemory => return .out_of_memory,
+        error.UnsafeMetadata => return .unsafe_metadata,
+    };
+
+    if (handle.rendered.len != 0) allocator.free(handle.rendered);
+    handle.rendered = rendered;
+
+    ptr_out.* = if (rendered.len == 0) null else rendered.ptr;
+    len_out.* = rendered.len;
+    return .ok;
+}
+
+/// Serialize the subtree rooted at `root` to `format`'s source syntax.
+/// `unsupported_format` when the target has no serializer for the built tree
+/// (e.g. serializing semantic kinds into XML). Borrowed output, valid until the
+/// next `twig_builder_serialize` on this handle or its destruction.
+pub export fn twig_builder_serialize(
+    b: ?*TwigBuilder,
+    root: u32,
+    format: c_int,
+    out_ptr: ?*?[*]const u8,
+    out_len: ?*usize,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const ptr_out = out_ptr orelse return .invalid_argument;
+    const len_out = out_len orelse return .invalid_argument;
+    const target = intToFormat(format) orelse return .unsupported_format;
+    if (root >= handle.builder.nodes.items.len) return .invalid_argument;
+
+    const allocator = activeAllocator();
+    const ast = handle.builder.view(root);
+    const serialized = serializeBuiltAst(allocator, &ast, target) catch |err| switch (err) {
+        error.OutOfMemory => return .out_of_memory,
+        error.UnsafeMetadata => return .unsafe_metadata,
+        // Any other serializer error means the built tree can't be represented
+        // in the target format (e.g. XML's shape requirements).
+        else => return .unsupported_format,
+    };
+
+    if (handle.serialized.len != 0) allocator.free(handle.serialized);
+    handle.serialized = serialized;
+
+    ptr_out.* = if (serialized.len == 0) null else serialized.ptr;
+    len_out.* = serialized.len;
+    return .ok;
+}
+
+/// Encode the subtree rooted at `root` as pretty-printed JSON (the same stable
+/// encoding as `twig_document_ast_json`). Borrowed output, valid until the next
+/// `twig_builder_ast_json` on this handle or its destruction.
+pub export fn twig_builder_ast_json(
+    b: ?*TwigBuilder,
+    root: u32,
+    out_ptr: ?*?[*]const u8,
+    out_len: ?*usize,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const ptr_out = out_ptr orelse return .invalid_argument;
+    const len_out = out_len orelse return .invalid_argument;
+    if (root >= handle.builder.nodes.items.len) return .invalid_argument;
+
+    const allocator = activeAllocator();
+    const ast = handle.builder.view(root);
+    const json = twig.ast_json.encodeAlloc(allocator, &ast) catch |err| switch (err) {
+        error.OutOfMemory => return .out_of_memory,
+    };
+
+    if (handle.ast_json.len != 0) allocator.free(handle.ast_json);
+    handle.ast_json = json;
+
+    ptr_out.* = if (json.len == 0) null else json.ptr;
+    len_out.* = json.len;
+    return .ok;
+}
+
+/// Resolve a selector against the subtree rooted at `root`. Same grammar and
+/// borrowed-output contract as `twig_document_query`; a malformed selector
+/// returns `invalid_argument`.
+pub export fn twig_builder_query(
+    b: ?*TwigBuilder,
+    root: u32,
+    selector_ptr: ?[*]const u8,
+    selector_len: usize,
+    out_ptr: ?*?[*]const TwigQueryMatch,
+    out_len: ?*usize,
+) TwigStatus {
+    const handle = asBuilder(b orelse return .invalid_argument);
+    const ptr_out = out_ptr orelse return .invalid_argument;
+    const len_out = out_len orelse return .invalid_argument;
+    const selector_src = sliceOf(selector_ptr, selector_len) orelse return .invalid_argument;
+    if (root >= handle.builder.nodes.items.len) return .invalid_argument;
+
+    const allocator = activeAllocator();
+    const ast = handle.builder.view(root);
+    const out = buildQueryMatches(allocator, &ast, selector_src) catch |err| switch (err) {
+        error.OutOfMemory => return .out_of_memory,
+        error.InvalidSelector => return .invalid_argument,
+    };
+
+    if (handle.query_matches.len != 0) allocator.free(handle.query_matches);
+    handle.query_matches = out;
+
+    ptr_out.* = if (out.len == 0) null else out.ptr;
+    len_out.* = out.len;
+    return .ok;
+}
+
 test "twig_parse + twig_document_render_html renders markdown" {
     const source = "# hi\n";
     var doc: ?*TwigDocument = null;
@@ -1188,4 +1918,143 @@ test "twig_editor: ast_json and query reflect the current tree" {
     var jlen: usize = 0;
     try std.testing.expectEqual(TwigStatus.ok, twig_editor_ast_json(fx.ed, &jptr, &jlen));
     try std.testing.expect(std.mem.indexOf(u8, jptr.?[0..jlen], "\"kind\": \"doc\"") != null);
+}
+
+// ── builder tests ─────────────────────────────────────────────────────────────
+
+/// Add a node, asserting success, and return its id.
+fn bAdd(b: *TwigBuilder, kind: TwigNodeKind) !u32 {
+    var id: u32 = undefined;
+    try std.testing.expectEqual(TwigStatus.ok, twig_builder_add(b, @intFromEnum(kind), &id));
+    return id;
+}
+
+fn bAddText(b: *TwigBuilder, kind: TwigNodeKind, text: []const u8) !u32 {
+    var id: u32 = undefined;
+    try std.testing.expectEqual(TwigStatus.ok, twig_builder_add_text(b, @intFromEnum(kind), text.ptr, text.len, &id));
+    return id;
+}
+
+fn bSetChildren(b: *TwigBuilder, parent: u32, ids: []const u32) !void {
+    try std.testing.expectEqual(TwigStatus.ok, twig_builder_set_children(b, parent, ids.ptr, ids.len));
+}
+
+test "twig_builder: build a small doc and render/serialize/query/dump it" {
+    var b: ?*TwigBuilder = null;
+    try std.testing.expectEqual(TwigStatus.ok, twig_builder_create(&b));
+    defer twig_builder_destroy(b);
+    const bld = b.?;
+
+    // # Title\n\nhello *world*
+    const title_text = try bAddText(bld, .str, "Title");
+    var heading: u32 = undefined;
+    try std.testing.expectEqual(TwigStatus.ok, twig_builder_add_heading(bld, 1, &heading));
+    try bSetChildren(bld, heading, &.{title_text});
+
+    const hello = try bAddText(bld, .str, "hello ");
+    const world = try bAddText(bld, .str, "world");
+    const emph = try bAdd(bld, .emph);
+    try bSetChildren(bld, emph, &.{world});
+    const para = try bAdd(bld, .para);
+    try bSetChildren(bld, para, &.{ hello, emph });
+
+    const doc = try bAdd(bld, .doc);
+    try bSetChildren(bld, doc, &.{ heading, para });
+
+    // Render to HTML via the generic printer.
+    var ptr: ?[*]const u8 = null;
+    var len: usize = 0;
+    try std.testing.expectEqual(TwigStatus.ok, twig_builder_render_html(bld, doc, &ptr, &len));
+    const html = ptr.?[0..len];
+    try std.testing.expect(std.mem.indexOf(u8, html, "<h1>Title</h1>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<em>world</em>") != null);
+
+    // Serialize to Markdown.
+    try std.testing.expectEqual(
+        TwigStatus.ok,
+        twig_builder_serialize(bld, doc, @intFromEnum(TwigFormat.markdown), &ptr, &len),
+    );
+    const md = ptr.?[0..len];
+    try std.testing.expect(std.mem.indexOf(u8, md, "# Title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, md, "*world*") != null);
+
+    // Query the built subtree.
+    var qptr: ?[*]const TwigQueryMatch = null;
+    var qlen: usize = 0;
+    const sel = "heading";
+    try std.testing.expectEqual(
+        TwigStatus.ok,
+        twig_builder_query(bld, doc, sel.ptr, sel.len, &qptr, &qlen),
+    );
+    try std.testing.expect(qlen == 1);
+    try std.testing.expectEqualStrings("heading", std.mem.span(qptr.?[0].kind));
+
+    // AST JSON dump.
+    try std.testing.expectEqual(TwigStatus.ok, twig_builder_ast_json(bld, doc, &ptr, &len));
+    try std.testing.expect(std.mem.indexOf(u8, ptr.?[0..len], "\"kind\": \"doc\"") != null);
+}
+
+test "twig_builder: element with attributes renders as an HTML tag" {
+    var b: ?*TwigBuilder = null;
+    try std.testing.expectEqual(TwigStatus.ok, twig_builder_create(&b));
+    defer twig_builder_destroy(b);
+    const bld = b.?;
+
+    const inner = try bAddText(bld, .str, "hi");
+    var div: u32 = undefined;
+    const name = "section";
+    try std.testing.expectEqual(TwigStatus.ok, twig_builder_add_element(bld, name.ptr, name.len, &div));
+    try bSetChildren(bld, div, &.{inner});
+
+    // class="note" plus a bare (valueless) attribute `hidden`.
+    const kvs = [_]TwigKeyVal{
+        .{ .key = "class", .key_len = 5, .value = "note", .value_len = 4 },
+        .{ .key = "hidden", .key_len = 6, .value = null, .value_len = 0 },
+    };
+    try std.testing.expectEqual(TwigStatus.ok, twig_builder_set_attrs(bld, div, &kvs, kvs.len));
+
+    var ptr: ?[*]const u8 = null;
+    var len: usize = 0;
+    try std.testing.expectEqual(TwigStatus.ok, twig_builder_render_html(bld, div, &ptr, &len));
+    const html = ptr.?[0..len];
+    try std.testing.expect(std.mem.indexOf(u8, html, "<section") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "class=\"note\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "hidden") != null);
+}
+
+test "twig_builder: invalid kind codes and out-of-range ids are rejected" {
+    var b: ?*TwigBuilder = null;
+    try std.testing.expectEqual(TwigStatus.ok, twig_builder_create(&b));
+    defer twig_builder_destroy(b);
+    const bld = b.?;
+
+    var id: u32 = undefined;
+    // `heading` carries a payload — not selectable via the void-kind `add`.
+    try std.testing.expectEqual(
+        TwigStatus.invalid_argument,
+        twig_builder_add(bld, @intFromEnum(TwigNodeKind.heading), &id),
+    );
+    // `para` is void, not a string kind — not selectable via `add_text`.
+    const t = "x";
+    try std.testing.expectEqual(
+        TwigStatus.invalid_argument,
+        twig_builder_add_text(bld, @intFromEnum(TwigNodeKind.para), t.ptr, t.len, &id),
+    );
+    // A completely unknown code.
+    try std.testing.expectEqual(TwigStatus.invalid_argument, twig_builder_add(bld, 9999, &id));
+
+    // set_children with a child id that doesn't exist yet.
+    const p = try bAdd(bld, .para);
+    const bogus = [_]u32{4242};
+    try std.testing.expectEqual(
+        TwigStatus.invalid_argument,
+        twig_builder_set_children(bld, p, &bogus, bogus.len),
+    );
+    // A root id past the end can't be rendered.
+    var ptr: ?[*]const u8 = null;
+    var len: usize = 0;
+    try std.testing.expectEqual(
+        TwigStatus.invalid_argument,
+        twig_builder_render_html(bld, 4242, &ptr, &len),
+    );
 }

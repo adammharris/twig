@@ -281,6 +281,356 @@ TwigStatus twig_editor_query(
     size_t *out_len
 );
 
+// ── Builder ───────────────────────────────────────────────────────────────────
+// Programmatic construction of a document — the write-path mirror of twig_parse.
+// Build the tree bottom-up: add children, then the container, wiring them with
+// twig_builder_set_children; every twig_builder_add* call returns the new node's
+// id through out_id. Then render / serialize / query / dump the subtree rooted at
+// any id, on demand, without consuming the builder. All input strings are copied,
+// so caller buffers need not outlive a call. Each node id must be placed in
+// exactly one parent (a node has a single sibling link).
+
+typedef struct TwigBuilder TwigBuilder;
+
+// The shared node-kind vocabulary as stable codes (declaration order). Used by
+// twig_builder_add (the void-payload kinds) and twig_builder_add_text (the
+// single-string-payload kinds); kinds with richer payloads have their own
+// twig_builder_add_* constructor and are not selectable through those two.
+typedef enum TwigNodeKind {
+    TWIG_KIND_DOC = 0,
+    TWIG_KIND_PARA = 1,
+    TWIG_KIND_HEADING = 2,
+    TWIG_KIND_THEMATIC_BREAK = 3,
+    TWIG_KIND_SECTION = 4,
+    TWIG_KIND_DIV = 5,
+    TWIG_KIND_CODE_BLOCK = 6,
+    TWIG_KIND_RAW_BLOCK = 7,
+    TWIG_KIND_METADATA = 8,
+    TWIG_KIND_BLOCK_QUOTE = 9,
+    TWIG_KIND_BULLET_LIST = 10,
+    TWIG_KIND_ORDERED_LIST = 11,
+    TWIG_KIND_TASK_LIST = 12,
+    TWIG_KIND_DEFINITION_LIST = 13,
+    TWIG_KIND_TABLE = 14,
+    TWIG_KIND_LIST_ITEM = 15,
+    TWIG_KIND_TASK_LIST_ITEM = 16,
+    TWIG_KIND_DEFINITION_LIST_ITEM = 17,
+    TWIG_KIND_TERM = 18,
+    TWIG_KIND_DEFINITION = 19,
+    TWIG_KIND_ROW = 20,
+    TWIG_KIND_CELL = 21,
+    TWIG_KIND_CAPTION = 22,
+    TWIG_KIND_FOOTNOTE = 23,
+    TWIG_KIND_REFERENCE = 24,
+    TWIG_KIND_STR = 25,
+    TWIG_KIND_SOFT_BREAK = 26,
+    TWIG_KIND_HARD_BREAK = 27,
+    TWIG_KIND_NON_BREAKING_SPACE = 28,
+    TWIG_KIND_SYMB = 29,
+    TWIG_KIND_VERBATIM = 30,
+    TWIG_KIND_RAW_INLINE = 31,
+    TWIG_KIND_INLINE_MATH = 32,
+    TWIG_KIND_DISPLAY_MATH = 33,
+    TWIG_KIND_URL = 34,
+    TWIG_KIND_EMAIL = 35,
+    TWIG_KIND_FOOTNOTE_REFERENCE = 36,
+    TWIG_KIND_SMART_PUNCTUATION = 37,
+    TWIG_KIND_EMPH = 38,
+    TWIG_KIND_STRONG = 39,
+    TWIG_KIND_LINK = 40,
+    TWIG_KIND_IMAGE = 41,
+    TWIG_KIND_SPAN = 42,
+    TWIG_KIND_MARK = 43,
+    TWIG_KIND_SUPERSCRIPT = 44,
+    TWIG_KIND_SUBSCRIPT = 45,
+    TWIG_KIND_INSERT = 46,
+    TWIG_KIND_DELETE = 47,
+    TWIG_KIND_DOUBLE_QUOTED = 48,
+    TWIG_KIND_SINGLE_QUOTED = 49,
+    TWIG_KIND_DIRECTIVE = 50,
+    TWIG_KIND_ELEMENT = 51,
+    TWIG_KIND_COMMENT = 52,
+    TWIG_KIND_DOCTYPE = 53,
+    TWIG_KIND_PROCESSING_INSTRUCTION = 54,
+    TWIG_KIND_CDATA = 55,
+} TwigNodeKind;
+
+typedef enum TwigBulletStyle {
+    TWIG_BULLET_DASH = 0,
+    TWIG_BULLET_PLUS = 1,
+    TWIG_BULLET_STAR = 2,
+} TwigBulletStyle;
+
+typedef enum TwigOrderedNumbering {
+    TWIG_ORDERED_DECIMAL = 0,
+    TWIG_ORDERED_LOWER_ALPHA = 1,
+    TWIG_ORDERED_UPPER_ALPHA = 2,
+    TWIG_ORDERED_LOWER_ROMAN = 3,
+    TWIG_ORDERED_UPPER_ROMAN = 4,
+} TwigOrderedNumbering;
+
+typedef enum TwigOrderedDelim {
+    TWIG_ORDERED_DELIM_PERIOD = 0,
+    TWIG_ORDERED_DELIM_PAREN_AFTER = 1,
+    TWIG_ORDERED_DELIM_PAREN_BOTH = 2,
+} TwigOrderedDelim;
+
+typedef enum TwigAlignment {
+    TWIG_ALIGN_DEFAULT = 0,
+    TWIG_ALIGN_LEFT = 1,
+    TWIG_ALIGN_RIGHT = 2,
+    TWIG_ALIGN_CENTER = 3,
+} TwigAlignment;
+
+typedef enum TwigSmartPunctuation {
+    TWIG_SMART_LEFT_SINGLE_QUOTE = 0,
+    TWIG_SMART_RIGHT_SINGLE_QUOTE = 1,
+    TWIG_SMART_LEFT_DOUBLE_QUOTE = 2,
+    TWIG_SMART_RIGHT_DOUBLE_QUOTE = 3,
+    TWIG_SMART_ELLIPSES = 4,
+    TWIG_SMART_EM_DASH = 5,
+    TWIG_SMART_EN_DASH = 6,
+} TwigSmartPunctuation;
+
+typedef enum TwigDirectiveForm {
+    TWIG_DIRECTIVE_TEXT = 0,
+    TWIG_DIRECTIVE_LEAF = 1,
+    TWIG_DIRECTIVE_CONTAINER = 2,
+} TwigDirectiveForm;
+
+// One attribute pair for twig_builder_set_attrs. A NULL `value` is a *bare*
+// attribute (HTML `disabled`), distinct from a present-but-empty value (`value`
+// non-NULL, `value_len == 0`). Keys/values are copied.
+typedef struct TwigKeyVal {
+    const uint8_t *key;
+    size_t key_len;
+    const uint8_t *value;
+    size_t value_len;
+} TwigKeyVal;
+
+// Create/destroy a builder handle.
+TwigStatus twig_builder_create(TwigBuilder **out_builder);
+void twig_builder_destroy(TwigBuilder *builder);
+
+// Add a void-payload node (para, emph, block_quote, table, …); attach children
+// afterward with twig_builder_set_children. A payload-bearing or unknown `kind`
+// returns TWIG_STATUS_INVALID_ARGUMENT.
+TwigStatus twig_builder_add(TwigBuilder *builder, int kind, uint32_t *out_id);
+
+// Add a single-string-payload node (`kind` one of STR, SYMB, VERBATIM,
+// INLINE_MATH, DISPLAY_MATH, URL, EMAIL, FOOTNOTE_REFERENCE, COMMENT, DOCTYPE,
+// CDATA). Any other `kind` returns TWIG_STATUS_INVALID_ARGUMENT.
+TwigStatus twig_builder_add_text(
+    TwigBuilder *builder,
+    int kind,
+    const uint8_t *text,
+    size_t text_len,
+    uint32_t *out_id
+);
+
+TwigStatus twig_builder_add_heading(TwigBuilder *builder, uint32_t level, uint32_t *out_id);
+
+// Add a code_block. has_lang == 0 leaves the info-string language absent (a NULL
+// code_block lang); otherwise lang[0..lang_len] is the language.
+TwigStatus twig_builder_add_code_block(
+    TwigBuilder *builder,
+    const uint8_t *lang,
+    size_t lang_len,
+    int has_lang,
+    const uint8_t *text,
+    size_t text_len,
+    uint32_t *out_id
+);
+
+TwigStatus twig_builder_add_raw_block(
+    TwigBuilder *builder,
+    const uint8_t *format,
+    size_t format_len,
+    const uint8_t *text,
+    size_t text_len,
+    uint32_t *out_id
+);
+
+TwigStatus twig_builder_add_metadata(
+    TwigBuilder *builder,
+    const uint8_t *lang,
+    size_t lang_len,
+    const uint8_t *text,
+    size_t text_len,
+    uint32_t *out_id
+);
+
+TwigStatus twig_builder_add_raw_inline(
+    TwigBuilder *builder,
+    const uint8_t *format,
+    size_t format_len,
+    const uint8_t *text,
+    size_t text_len,
+    uint32_t *out_id
+);
+
+// Add a smart_punctuation node; `punct_kind` is a TwigSmartPunctuation code and
+// `text` is the source spelling it stands for (e.g. "---" for an em dash).
+TwigStatus twig_builder_add_smart_punctuation(
+    TwigBuilder *builder,
+    int punct_kind,
+    const uint8_t *text,
+    size_t text_len,
+    uint32_t *out_id
+);
+
+// Add a link. has_destination/has_reference gate the two optional fields (NULL
+// when 0). Attach the link text as children.
+TwigStatus twig_builder_add_link(
+    TwigBuilder *builder,
+    const uint8_t *destination,
+    size_t destination_len,
+    int has_destination,
+    const uint8_t *reference,
+    size_t reference_len,
+    int has_reference,
+    uint32_t *out_id
+);
+
+// Add an image — like twig_builder_add_link, but children are the alt text.
+TwigStatus twig_builder_add_image(
+    TwigBuilder *builder,
+    const uint8_t *destination,
+    size_t destination_len,
+    int has_destination,
+    const uint8_t *reference,
+    size_t reference_len,
+    int has_reference,
+    uint32_t *out_id
+);
+
+// Add a generic directive; `form` is a TwigDirectiveForm code.
+TwigStatus twig_builder_add_directive(
+    TwigBuilder *builder,
+    int form,
+    const uint8_t *name,
+    size_t name_len,
+    uint32_t *out_id
+);
+
+TwigStatus twig_builder_add_element(
+    TwigBuilder *builder,
+    const uint8_t *name,
+    size_t name_len,
+    uint32_t *out_id
+);
+
+TwigStatus twig_builder_add_processing_instruction(
+    TwigBuilder *builder,
+    const uint8_t *target,
+    size_t target_len,
+    const uint8_t *data,
+    size_t data_len,
+    uint32_t *out_id
+);
+
+TwigStatus twig_builder_add_footnote(
+    TwigBuilder *builder,
+    const uint8_t *label,
+    size_t label_len,
+    uint32_t *out_id
+);
+
+TwigStatus twig_builder_add_reference(
+    TwigBuilder *builder,
+    const uint8_t *label,
+    size_t label_len,
+    const uint8_t *destination,
+    size_t destination_len,
+    uint32_t *out_id
+);
+
+// Add a bullet_list; `style` is a TwigBulletStyle code, `tight` a 0/1 flag.
+TwigStatus twig_builder_add_bullet_list(
+    TwigBuilder *builder,
+    int style,
+    int tight,
+    uint32_t *out_id
+);
+
+// Add an ordered_list; `numbering`/`delim` are TwigOrderedNumbering/
+// TwigOrderedDelim codes. has_start == 0 leaves the first number implicit.
+TwigStatus twig_builder_add_ordered_list(
+    TwigBuilder *builder,
+    int numbering,
+    int delim,
+    int tight,
+    uint32_t start,
+    int has_start,
+    uint32_t *out_id
+);
+
+TwigStatus twig_builder_add_task_list(TwigBuilder *builder, int tight, uint32_t *out_id);
+TwigStatus twig_builder_add_task_list_item(TwigBuilder *builder, int checked, uint32_t *out_id);
+TwigStatus twig_builder_add_row(TwigBuilder *builder, int head, uint32_t *out_id);
+
+// Add a table cell; `alignment` is a TwigAlignment code.
+TwigStatus twig_builder_add_cell(TwigBuilder *builder, int head, int alignment, uint32_t *out_id);
+
+// Set `parent`'s children to `ids` (in order), replacing any it had. Every id
+// (parent and each child) must name a node already added; a child id should
+// appear in exactly one set_children call across the build.
+TwigStatus twig_builder_set_children(
+    TwigBuilder *builder,
+    uint32_t parent,
+    const uint32_t *ids,
+    size_t ids_len
+);
+
+// Attach `{...}` attributes to `id`, replacing any it had; kvs_len == 0 clears
+// them.
+TwigStatus twig_builder_set_attrs(
+    TwigBuilder *builder,
+    uint32_t id,
+    const TwigKeyVal *kvs,
+    size_t kvs_len
+);
+
+// Render the subtree rooted at `root` to HTML via the generic whole-vocabulary
+// printer. Borrowed output, valid until the next twig_builder_render_html on
+// this handle or its destruction.
+TwigStatus twig_builder_render_html(
+    TwigBuilder *builder,
+    uint32_t root,
+    const uint8_t **out_ptr,
+    size_t *out_len
+);
+
+// Serialize the subtree rooted at `root` to `format`'s source syntax.
+// TWIG_STATUS_UNSUPPORTED_FORMAT when the target can't represent the built tree
+// (e.g. semantic kinds into XML). Borrowed output, same contract as above.
+TwigStatus twig_builder_serialize(
+    TwigBuilder *builder,
+    uint32_t root,
+    int format,
+    const uint8_t **out_ptr,
+    size_t *out_len
+);
+
+// Encode the subtree rooted at `root` as pretty-printed JSON. Borrowed output.
+TwigStatus twig_builder_ast_json(
+    TwigBuilder *builder,
+    uint32_t root,
+    const uint8_t **out_ptr,
+    size_t *out_len
+);
+
+// Resolve a selector against the subtree rooted at `root`. Same grammar and
+// borrowed-output contract as twig_document_query.
+TwigStatus twig_builder_query(
+    TwigBuilder *builder,
+    uint32_t root,
+    const uint8_t *selector,
+    size_t selector_len,
+    const TwigQueryMatch **out_ptr,
+    size_t *out_len
+);
+
 #ifdef __cplusplus
 }
 #endif

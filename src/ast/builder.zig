@@ -133,6 +133,25 @@ pub fn finish(self: *Builder, root: Node.Id) Allocator.Error!AST {
     };
 }
 
+/// A non-owning `AST` over the builder's current nodes, rooted at `root`. The
+/// returned AST *borrows* the builder's storage (`nodes`, `owned_strings`,
+/// `attrs`): it is valid only while the builder lives and stays unmodified, and
+/// must NOT be `deinit`ed — the builder owns the memory. Use it to serialize,
+/// render, or query an in-progress build without consuming it; use `finish`
+/// when you want an owned `AST` instead. Mirrors fig's `Builder.view`.
+///
+/// `root` must be a valid id (`< nodes.items.len`); callers that accept an id
+/// from outside should bounds-check first (the C ABI does).
+pub fn view(self: *const Builder, root: Node.Id) AST {
+    return .{
+        .allocator = self.allocator,
+        .owned_strings = self.owned_strings.items,
+        .root = root,
+        .nodes = self.nodes.items,
+        .attrs = self.attrs.items,
+    };
+}
+
 // ── internals ────────────────────────────────────────────────────────────
 
 /// Take ownership of an already-allocated string. Freed, not leaked, if
@@ -284,6 +303,31 @@ test "dupeKind copies generic-markup string payloads into owned storage" {
     try testing.expectEqualStrings("a < b", ast.nodes[cd].kind.cdata);
     // Not aliasing the (now-mutated) inputs also means distinct pointers.
     try testing.expect(ast.nodes[el].kind.element.name.ptr != &name_buf);
+}
+
+test "view borrows the in-progress build without consuming it" {
+    const testing = std.testing;
+    var b = Builder.init(testing.allocator);
+    defer b.deinit(); // `view` does not consume, so the builder must still free.
+
+    const hello = try b.addLeaf(.{ .str = "hi" });
+    const para = try b.addContainer(.para, &.{hello});
+
+    // A borrowed view sees the current tree; it must NOT be deinit'd.
+    const v = b.view(para);
+    try testing.expectEqual(para, v.root);
+    try testing.expect(v.nodes[para].kind == .para);
+    try testing.expectEqualStrings("hi", v.nodes[hello].kind.str);
+
+    // The builder is still live: we can keep adding, and a fresh view reflects it.
+    const world = try b.addLeaf(.{ .str = " world" });
+    const doc = try b.addContainer(.doc, &.{ para, world });
+    const v2 = b.view(doc);
+    try testing.expectEqual(doc, v2.root);
+    var it = v2.children(doc);
+    try testing.expectEqual(para, it.next().?.id);
+    try testing.expectEqual(world, it.next().?.id);
+    try testing.expectEqual(@as(?*const Node, null), it.next());
 }
 
 test "content_span defaults to null and is set via setContentSpan" {
