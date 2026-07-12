@@ -43,6 +43,14 @@ const Node = AST.Node;
 const Span = @import("../span.zig");
 
 pub const Editor = struct {
+    /// What the most recent successful edit did to the source, in byte terms.
+    /// `old` is the range of the *pre-edit* source that was replaced; `new` is
+    /// the range the replacement now occupies in the *post-edit* source (they
+    /// share a start). An insertion has an empty `old`; a deletion an empty
+    /// `new`. The net length delta is `new.len() - old.len()`. Everything a
+    /// caret/selection needs to re-anchor across an edit without re-diffing.
+    pub const Change = struct { old: Span, new: Span };
+
     /// Source -> a freshly-allocated `AST` the editor takes ownership of.
     /// Runtime (not comptime-generic) so the CLI can pick the language at run
     /// time; the error set is open (`anyerror`) because each language's parse
@@ -68,6 +76,11 @@ pub const Editor = struct {
     /// Opaque configuration handed to `parse_fn` on every reparse (see
     /// `ParseFn`). Borrowed; must outlive the editor.
     parse_ctx: *const anyopaque,
+    /// The byte-level effect of the last successful `replaceAtSpan` (and hence
+    /// of the last successful op, since every op funnels through it), or `null`
+    /// before the first edit. A failed edit leaves it untouched. Note: a
+    /// multi-splice op (e.g. `Filter`) leaves only its *final* splice here.
+    last_change: ?Change = null,
 
     /// Parse `source_bytes` and build an editor over a private copy of them.
     /// `parse_ctx` is forwarded verbatim to `parse_fn` on the initial parse
@@ -128,6 +141,10 @@ pub const Editor = struct {
         self.ast = new_ast;
         self.source.deinit(self.allocator);
         self.source = new_src;
+        self.last_change = .{
+            .old = span,
+            .new = Span.init(span.start, span.start + replacement.len),
+        };
     }
 
     // ── ops ─────────────────────────────────────────────────────────────
@@ -486,6 +503,26 @@ test "a reparse-breaking edit rolls back and leaves the document untouched" {
     // Byte-for-byte unchanged, and still a valid, navigable tree.
     try testing.expectEqualStrings("<a>ok</a>", ed.sourceBytes());
     _ = try ed.astView().getIdByPath(&.{0});
+}
+
+test "last_change records the byte effect of the last successful edit" {
+    var ed = try Editor.init(testing.allocator, "<a>hi</a>", &test_ctx, parseXml);
+    defer ed.deinit();
+
+    try testing.expectEqual(@as(?Editor.Change, null), ed.last_change);
+
+    // Replace "hi" [3,5) with "bye" -> new interior occupies [3,6).
+    try ed.replaceContent(&.{0}, "bye");
+    const c = ed.last_change.?;
+    try testing.expectEqual(@as(usize, 3), c.old.start);
+    try testing.expectEqual(@as(usize, 5), c.old.end);
+    try testing.expectEqual(@as(usize, 3), c.new.start);
+    try testing.expectEqual(@as(usize, 6), c.new.end);
+
+    // A failed edit leaves last_change untouched.
+    try testing.expectError(error.MismatchedCloseTag, ed.replaceContent(&.{0}, "<b>"));
+    const c2 = ed.last_change.?;
+    try testing.expectEqual(@as(usize, 6), c2.new.end);
 }
 
 test "replaceContent on a leaf yields NoContentSpan" {

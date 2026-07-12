@@ -44,6 +44,11 @@ pub const Markdown = @import("languages/markdown/markdown.zig");
 /// comment for the reparse/rollback model and its current limits.
 pub const Editor = @import("ast/editor.zig").Editor;
 
+/// A byte range `[start, end)` into the source — the currency of the span-
+/// splice editor and the offset-addressed `twig_editor_edit_range`/`node_at`
+/// C-ABI surface. See `span.zig`.
+pub const Span = @import("span.zig");
+
 /// Content-based node addressing: `Select.parse` a CSS-lite selector (e.g.
 /// `heading[level=2]`, `link[dest^="http"]`, `item("eggs")`) then
 /// `Select.resolveAll`/`resolveOne` it against an `AST` — the friendly

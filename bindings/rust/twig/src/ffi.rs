@@ -71,6 +71,42 @@ pub struct TwigQueryMatch {
     pub kind: *const c_char,
 }
 
+/// The sentinel `node_id` for "no such node" in a [`TwigFlatNode`] link field.
+pub const TWIG_NO_NODE: u32 = u32::MAX;
+
+/// C ABI mirror of Zig's `TwigChange` — the byte effect of an edit. `old_span`
+/// is the replaced range in the pre-edit source; `new_span` is the range the
+/// replacement occupies in the post-edit source (same start).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TwigChange {
+    pub old_span: TwigSpan,
+    pub new_span: TwigSpan,
+}
+
+/// C ABI mirror of Zig's `TwigFlatNode` — one node of the editor's flat tree
+/// snapshot. Link fields (`parent`/`first_child`/`next_sibling`) are ids or
+/// [`TWIG_NO_NODE`]. `content_span` is meaningful only when `has_content_span`.
+/// `kind` is static, library-owned storage; `text`/`destination` pointers
+/// borrow the current parse's payloads (NULL when the kind carries none).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TwigFlatNode {
+    pub id: u32,
+    pub parent: u32,
+    pub first_child: u32,
+    pub next_sibling: u32,
+    pub span: TwigSpan,
+    pub content_span: TwigSpan,
+    pub has_content_span: c_int,
+    pub level: u32,
+    pub kind: *const c_char,
+    pub text_ptr: *const u8,
+    pub text_len: usize,
+    pub destination_ptr: *const u8,
+    pub destination_len: usize,
+}
+
 unsafe extern "C" {
     pub fn twig_version() -> u32;
     pub fn twig_version_string() -> *const c_char;
@@ -192,6 +228,34 @@ unsafe extern "C" {
         editor: *mut TwigEditor,
         selector: *const u8,
         selector_len: usize,
+        out_ptr: *mut *const TwigQueryMatch,
+        out_len: *mut usize,
+    ) -> TwigStatus;
+    pub fn twig_editor_edit_range(
+        editor: *mut TwigEditor,
+        start: usize,
+        end: usize,
+        text: *const u8,
+        text_len: usize,
+        out_change: *mut TwigChange,
+    ) -> TwigStatus;
+    pub fn twig_editor_last_change(
+        editor: *mut TwigEditor,
+        out_change: *mut TwigChange,
+    ) -> TwigStatus;
+    pub fn twig_editor_nodes(
+        editor: *mut TwigEditor,
+        out_ptr: *mut *const TwigFlatNode,
+        out_len: *mut usize,
+    ) -> TwigStatus;
+    pub fn twig_editor_node_at(
+        editor: *mut TwigEditor,
+        offset: usize,
+        out_match: *mut TwigQueryMatch,
+    ) -> TwigStatus;
+    pub fn twig_editor_nodes_at(
+        editor: *mut TwigEditor,
+        offset: usize,
         out_ptr: *mut *const TwigQueryMatch,
         out_len: *mut usize,
     ) -> TwigStatus;

@@ -2,7 +2,7 @@ mod error;
 mod ffi;
 
 use std::ops::Range;
-use std::os::raw::c_int;
+use std::os::raw::{c_char, c_int};
 use std::ptr::NonNull;
 
 pub use error::Error;
@@ -39,6 +39,53 @@ pub struct QueryMatch {
     pub content_span: Option<Range<usize>>,
     /// The node-kind name (e.g. `"heading"`, `"code_block"`).
     pub kind: String,
+}
+
+/// The byte-level effect of an [`Editor`] edit: `old` is the range of the
+/// pre-edit source that was replaced, `new` the range the replacement now
+/// occupies in the post-edit source (they share a start). An insertion has an
+/// empty `old`; a deletion an empty `new`. Everything a caret/selection needs
+/// to re-anchor across an edit without re-diffing: shift any offset `>= old.end`
+/// by `new.len() - old.len()`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Change {
+    pub old: Range<usize>,
+    pub new: Range<usize>,
+}
+
+impl Change {
+    /// The net change in source length (`new.len() - old.len()`).
+    pub fn delta(&self) -> isize {
+        self.new.len() as isize - self.old.len() as isize
+    }
+
+    fn from_ffi(c: ffi::TwigChange) -> Self {
+        Change {
+            old: c.old_span.start..c.old_span.end,
+            new: c.new_span.start..c.new_span.end,
+        }
+    }
+}
+
+/// One node of an [`Editor::nodes`] snapshot — the flat AST arena as owned Rust
+/// data (the JSON-free read path). `id` indexes the snapshot; `parent`,
+/// `first_child`, and `next_sibling` link the tree (`None` where absent).
+/// `text` is the node's primary payload (a `str`'s bytes, a `code_block`'s
+/// body, …) and `destination` a link/image target, each `None` when the kind
+/// carries no such payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlatNode {
+    pub id: NodeId,
+    pub parent: Option<NodeId>,
+    pub first_child: Option<NodeId>,
+    pub next_sibling: Option<NodeId>,
+    pub span: Range<usize>,
+    pub content_span: Option<Range<usize>>,
+    /// A heading's level; `None` for every other kind.
+    pub level: Option<u32>,
+    pub kind: String,
+    pub text: Option<String>,
+    pub destination: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,6 +373,110 @@ impl Editor {
         })
     }
 
+    // ── offset-addressed editing & read-back ────────────────────────────────
+
+    /// Splice `[start, end)` of the current source with `text`, reparse, and
+    /// return the [`Change`] the edit produced — the offset-addressed primitive
+    /// a caret editor is built on: a keystroke is `edit_range(c, c, "x")`,
+    /// backspace `edit_range(c - 1, c, "")`, a selection replace
+    /// `edit_range(a, b, s)`. `start <= end <= ` source length, else
+    /// [`Error::InvalidArgument`]. A reparse-breaking edit is rolled back and
+    /// returns [`Error::EditConflict`], leaving the document untouched.
+    pub fn edit_range(&mut self, start: usize, end: usize, text: &str) -> Result<Change, Error> {
+        let mut change = ffi::TwigChange {
+            old_span: ffi::TwigSpan { start: 0, end: 0 },
+            new_span: ffi::TwigSpan { start: 0, end: 0 },
+        };
+        let status = unsafe {
+            ffi::twig_editor_edit_range(
+                self.raw.as_ptr(),
+                start,
+                end,
+                text.as_ptr(),
+                text.len(),
+                &mut change,
+            )
+        };
+        Error::from_status(status)?;
+        Ok(Change::from_ffi(change))
+    }
+
+    /// The byte effect of the last successful edit — including the locator ops
+    /// ([`Editor::replace`], [`Editor::delete_smart`], …), so any edit can
+    /// re-anchor a caret without re-diffing. `None` before the first successful
+    /// edit. (A multi-splice op such as [`Editor::filter`] reports only its
+    /// final splice.)
+    pub fn last_change(&mut self) -> Option<Change> {
+        let mut change = ffi::TwigChange {
+            old_span: ffi::TwigSpan { start: 0, end: 0 },
+            new_span: ffi::TwigSpan { start: 0, end: 0 },
+        };
+        let status = unsafe { ffi::twig_editor_last_change(self.raw.as_ptr(), &mut change) };
+        match status.0 {
+            ffi::TwigStatus::OK => Some(Change::from_ffi(change)),
+            _ => None,
+        }
+    }
+
+    /// Snapshot the current tree as a flat [`FlatNode`] array (the JSON-free
+    /// read path for a renderer), indexed so `nodes[i].id == NodeId(i)`. Walk it
+    /// via the `parent`/`first_child`/`next_sibling` links; the root is the node
+    /// whose `parent` is `None`.
+    pub fn nodes(&mut self) -> Result<Vec<FlatNode>, Error> {
+        let mut ptr: *const ffi::TwigFlatNode = std::ptr::null();
+        let mut len = 0usize;
+        let status = unsafe { ffi::twig_editor_nodes(self.raw.as_ptr(), &mut ptr, &mut len) };
+        Error::from_status(status)?;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        if ptr.is_null() {
+            return Err(Error::Internal);
+        }
+        let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
+        raw.iter().map(flat_node_from_ffi).collect()
+    }
+
+    /// The deepest node whose span contains byte `offset` (with `offset` equal
+    /// to the source length treated as inside the root) — mouse hit-testing and
+    /// cursor context. `Ok(None)` if no node covers the offset;
+    /// [`Error::InvalidArgument`] if `offset` exceeds the source length.
+    pub fn node_at(&mut self, offset: usize) -> Result<Option<QueryMatch>, Error> {
+        let mut m = ffi::TwigQueryMatch {
+            node_id: 0,
+            span: ffi::TwigSpan { start: 0, end: 0 },
+            content_span: ffi::TwigSpan { start: 0, end: 0 },
+            has_content_span: 0,
+            kind: std::ptr::null(),
+        };
+        let status = unsafe { ffi::twig_editor_node_at(self.raw.as_ptr(), offset, &mut m) };
+        match status.0 {
+            ffi::TwigStatus::OK => Ok(Some(query_match_from_ffi(&m)?)),
+            ffi::TwigStatus::NOT_FOUND => Ok(None),
+            _ => Err(Error::from_status(status).unwrap_err()),
+        }
+    }
+
+    /// The chain of nodes containing byte `offset`, root-first down to the
+    /// deepest (the node [`Editor::node_at`] returns) — the ancestor path for a
+    /// breadcrumb or context-scoped edit. Empty if no node covers the offset.
+    pub fn ancestors_at(&mut self, offset: usize) -> Result<Vec<QueryMatch>, Error> {
+        let mut ptr: *const ffi::TwigQueryMatch = std::ptr::null();
+        let mut len = 0usize;
+        let status =
+            unsafe { ffi::twig_editor_nodes_at(self.raw.as_ptr(), offset, &mut ptr, &mut len) };
+        match status.0 {
+            ffi::TwigStatus::OK => {}
+            ffi::TwigStatus::NOT_FOUND => return Ok(Vec::new()),
+            _ => return Err(Error::from_status(status).unwrap_err()),
+        }
+        if len == 0 || ptr.is_null() {
+            return Ok(Vec::new());
+        }
+        let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
+        raw.iter().map(query_match_from_ffi).collect()
+    }
+
     /// Shared plumbing for the `(locator, text)` edit ops.
     fn apply(
         &mut self,
@@ -387,25 +538,65 @@ fn collect_matches(
         return Err(Error::Internal);
     }
     let matches = unsafe { std::slice::from_raw_parts(ptr, len) };
-    matches
-        .iter()
-        .map(|m| {
-            let kind = unsafe { std::ffi::CStr::from_ptr(m.kind) }
-                .to_str()
-                .map_err(|_| Error::Internal)?
-                .to_owned();
-            Ok(QueryMatch {
-                node_id: m.node_id,
-                span: m.span.start..m.span.end,
-                content_span: if m.has_content_span != 0 {
-                    Some(m.content_span.start..m.content_span.end)
-                } else {
-                    None
-                },
-                kind,
-            })
-        })
-        .collect()
+    matches.iter().map(query_match_from_ffi).collect()
+}
+
+/// Copy a borrowed C ABI [`ffi::TwigQueryMatch`] into an owned [`QueryMatch`].
+/// Shared by `collect_matches`, [`Editor::node_at`], and [`Editor::ancestors_at`].
+fn query_match_from_ffi(m: &ffi::TwigQueryMatch) -> Result<QueryMatch, Error> {
+    Ok(QueryMatch {
+        node_id: m.node_id,
+        span: m.span.start..m.span.end,
+        content_span: if m.has_content_span != 0 {
+            Some(m.content_span.start..m.content_span.end)
+        } else {
+            None
+        },
+        kind: borrowed_cstr(m.kind)?,
+    })
+}
+
+/// Copy a borrowed C ABI [`ffi::TwigFlatNode`] into an owned [`FlatNode`].
+fn flat_node_from_ffi(n: &ffi::TwigFlatNode) -> Result<FlatNode, Error> {
+    let node_id = |v: u32| if v == ffi::TWIG_NO_NODE { None } else { Some(NodeId(v)) };
+    Ok(FlatNode {
+        id: NodeId(n.id),
+        parent: node_id(n.parent),
+        first_child: node_id(n.first_child),
+        next_sibling: node_id(n.next_sibling),
+        span: n.span.start..n.span.end,
+        content_span: if n.has_content_span != 0 {
+            Some(n.content_span.start..n.content_span.end)
+        } else {
+            None
+        },
+        level: if n.level != 0 { Some(n.level) } else { None },
+        kind: borrowed_cstr(n.kind)?,
+        text: borrowed_bytes(n.text_ptr, n.text_len),
+        destination: borrowed_bytes(n.destination_ptr, n.destination_len),
+    })
+}
+
+/// Copy a NUL-terminated, library-owned C string into an owned `String`.
+fn borrowed_cstr(ptr: *const c_char) -> Result<String, Error> {
+    if ptr.is_null() {
+        return Err(Error::Internal);
+    }
+    Ok(unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_str()
+        .map_err(|_| Error::Internal)?
+        .to_owned())
+}
+
+/// Copy a borrowed `(ptr, len)` payload slice into an owned `String`, or `None`
+/// for a NULL pointer (the kind carries no such payload). The bytes are a slice
+/// of a UTF-8 document, so a lossy decode never actually substitutes.
+fn borrowed_bytes(ptr: *const u8, len: usize) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// The id of a node added to a [`Builder`], returned by every `add*` method and
@@ -1005,6 +1196,103 @@ mod tests {
         assert_eq!(ed.query("element").expect("query").len(), 3);
         let json = ed.ast_json().expect("ast_json");
         assert!(String::from_utf8_lossy(&json).contains("\"kind\": \"doc\""));
+    }
+
+    // ── offset-addressed editing & read-back (P0–P3) ────────────────────────
+
+    #[test]
+    fn editor_edit_range_types_backspaces_and_reports_change() {
+        let mut ed = Editor::new_str("ab\n", Format::Markdown).expect("editor");
+
+        // Type "X" at offset 1 (a zero-width splice = an insertion).
+        let c = ed.edit_range(1, 1, "X").expect("edit_range insert");
+        assert_eq!(ed.source_str().unwrap(), "aXb\n");
+        assert_eq!(c.old, 1..1);
+        assert_eq!(c.new, 1..2);
+        assert_eq!(c.delta(), 1);
+
+        // Backspace it (delete the "X").
+        let c2 = ed.edit_range(1, 2, "").expect("edit_range delete");
+        assert_eq!(ed.source_str().unwrap(), "ab\n");
+        assert_eq!(c2.old, 1..2);
+        assert_eq!(c2.new, 1..1);
+        assert_eq!(c2.delta(), -1);
+    }
+
+    #[test]
+    fn editor_edit_range_rejects_bad_ranges() {
+        let mut ed = Editor::new_str("hi\n", Format::Markdown).expect("editor");
+        assert_eq!(ed.edit_range(0, 99, "x"), Err(Error::InvalidArgument)); // end past len
+        assert_eq!(ed.edit_range(2, 1, "x"), Err(Error::InvalidArgument)); // start > end
+        assert_eq!(ed.source_str().unwrap(), "hi\n"); // untouched
+    }
+
+    #[test]
+    fn editor_last_change_reports_locator_ops_too() {
+        let mut ed = Editor::new_str("# One\n\n## Two\n", Format::Markdown).expect("editor");
+        assert_eq!(ed.last_change(), None); // nothing edited yet
+
+        ed.replace("heading(\"Two\")", "## Renamed").expect("replace");
+        assert_eq!(ed.source_str().unwrap(), "# One\n\n## Renamed\n");
+        let c = ed.last_change().expect("a change was recorded");
+        // "## Two" occupied [7,13); "## Renamed" (10 bytes) now occupies [7,17).
+        assert_eq!(c.old, 7..13);
+        assert_eq!(c.new, 7..17);
+    }
+
+    #[test]
+    fn editor_nodes_is_a_walkable_flat_tree() {
+        let mut ed = Editor::new_str("# Hi\n\ntext\n", Format::Markdown).expect("editor");
+        let nodes = ed.nodes().expect("nodes");
+        assert!(!nodes.is_empty());
+
+        // Dense, index-aligned ids.
+        for (i, n) in nodes.iter().enumerate() {
+            assert_eq!(n.id, NodeId(i as u32));
+        }
+        // Exactly one root (no parent), and it's the doc.
+        let roots: Vec<_> = nodes.iter().filter(|n| n.parent.is_none()).collect();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].kind, "doc");
+
+        // The heading carries its level; the "Hi" text is reachable as a payload.
+        let heading = nodes.iter().find(|n| n.kind == "heading").expect("a heading");
+        assert_eq!(heading.level, Some(1));
+        assert!(nodes.iter().any(|n| n.text.as_deref() == Some("Hi")));
+
+        // Every non-root node's parent links back to a node that lists it as a
+        // child (via first_child/next_sibling).
+        for n in nodes.iter().filter(|n| n.parent.is_some()) {
+            let p = &nodes[n.parent.unwrap().0 as usize];
+            let mut kid = p.first_child;
+            let mut seen = false;
+            while let Some(NodeId(k)) = kid {
+                if k == n.id.0 {
+                    seen = true;
+                    break;
+                }
+                kid = nodes[k as usize].next_sibling;
+            }
+            assert!(seen, "node {:?} not found among its parent's children", n.id);
+        }
+    }
+
+    #[test]
+    fn editor_node_at_and_ancestors_hit_test_offsets() {
+        let mut ed = Editor::new_str("# Hi\n\ntext\n", Format::Markdown).expect("editor");
+
+        // Offset 2 is the "H" of the heading "# Hi" [0,4).
+        let m = ed.node_at(2).expect("node_at").expect("a node covers offset 2");
+        assert!(m.span.contains(&2));
+
+        // The ancestor chain is root-first and ends at the deepest (== node_at).
+        let chain = ed.ancestors_at(2).expect("ancestors_at");
+        assert!(!chain.is_empty());
+        assert_eq!(chain[0].kind, "doc");
+        assert_eq!(chain.last().unwrap().node_id, m.node_id);
+
+        // An out-of-range offset is an error; a gap covers nothing deeper than doc.
+        assert_eq!(ed.node_at(999), Err(Error::InvalidArgument));
     }
 
     #[test]

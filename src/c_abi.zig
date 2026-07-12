@@ -62,6 +62,46 @@ pub const TwigQueryMatch = extern struct {
     kind: [*:0]const u8,
 };
 
+/// The sentinel `node_id` for "no such node" in a `TwigFlatNode` link field
+/// (`parent`/`first_child`/`next_sibling`) — the root has no parent, a leaf no
+/// child, a last sibling no next. A real id is a `[]Node` index, always `<`
+/// this value.
+pub const TWIG_NO_NODE: u32 = std.math.maxInt(u32);
+
+/// The byte-level effect of an edit, C-ABI shape of `twig.Editor.Change`.
+/// `old` is the range of the pre-edit source that was replaced; `new` is the
+/// range the replacement occupies in the post-edit source (same start). See
+/// `twig_editor_edit_range` / `twig_editor_last_change`.
+pub const TwigChange = extern struct {
+    old: TwigSpan,
+    new: TwigSpan,
+};
+
+/// One node in the editor's current tree, C-ABI shape for the flat-arena
+/// snapshot `twig_editor_nodes` returns — the JSON-free read path. `id` is the
+/// node's index in the arena; `parent`/`first_child`/`next_sibling` are ids or
+/// `TWIG_NO_NODE`. `content_span` is meaningful only when `has_content_span`.
+/// `level` is a heading's level (0 otherwise). `kind` is static, library-owned
+/// storage (never freed). `text`/`destination` borrow the *node's* payload in
+/// the current parse (the AST owns its own copies, not the source) and stay
+/// valid until the next successful edit or `twig_editor_destroy`; each is NULL
+/// when the kind carries no such payload.
+pub const TwigFlatNode = extern struct {
+    id: u32,
+    parent: u32,
+    first_child: u32,
+    next_sibling: u32,
+    span: TwigSpan,
+    content_span: TwigSpan,
+    has_content_span: c_int,
+    level: u32,
+    kind: [*:0]const u8,
+    text_ptr: ?[*]const u8,
+    text_len: usize,
+    destination_ptr: ?[*]const u8,
+    destination_len: usize,
+};
+
 pub const TwigDocument = opaque {};
 
 const ParsedDocument = union(TwigFormat) {
@@ -432,6 +472,11 @@ const EditorHandle = struct {
     /// Caller-borrowed output buffers, same contract as `DocumentHandle`'s.
     ast_json: []u8 = &.{},
     query_matches: []TwigQueryMatch = &.{},
+    /// The last `twig_editor_nodes` snapshot (P2).
+    flat_nodes: []TwigFlatNode = &.{},
+    /// The last `twig_editor_nodes_at` ancestor chain (P3). Independent of
+    /// `query_matches` so a hit-test doesn't invalidate a prior query.
+    ancestor_matches: []TwigQueryMatch = &.{},
 };
 
 fn asEditor(ed: *TwigEditor) *EditorHandle {
@@ -555,6 +600,8 @@ pub export fn twig_editor_destroy(ed: ?*TwigEditor) void {
     const handle = asEditor(raw);
     if (handle.ast_json.len != 0) allocator.free(handle.ast_json);
     if (handle.query_matches.len != 0) allocator.free(handle.query_matches);
+    if (handle.flat_nodes.len != 0) allocator.free(handle.flat_nodes);
+    if (handle.ancestor_matches.len != 0) allocator.free(handle.ancestor_matches);
     handle.editor.deinit();
     allocator.destroy(handle);
 }
@@ -858,6 +905,284 @@ pub export fn twig_editor_query(
     ptr_out.* = if (out.len == 0) null else out.ptr;
     len_out.* = out.len;
     return .ok;
+}
+
+// ── Offset-addressed editing & read-back (P0–P3) ─────────────────────────────
+// The rich-text-editor surface: a caret speaks byte offsets, not locator
+// strings. `edit_range` is the raw splice (`Editor.replaceAtSpan`) a keystroke
+// maps onto; `node_at`/`nodes_at` hit-test an offset back to nodes; `nodes`
+// hands out the whole tree as a flat array so a renderer needn't parse JSON.
+
+fn spanC(s: twig.Span) TwigSpan {
+    return .{ .start = s.start, .end = s.end };
+}
+
+fn changeC(c: twig.Editor.Change) TwigChange {
+    return .{ .old = spanC(c.old), .new = spanC(c.new) };
+}
+
+/// The node's static kind-tag name, matching `TwigQueryMatch.kind`.
+fn kindName(node: *const twig.AST.Node) [*:0]const u8 {
+    return @tagName(std.meta.activeTag(node.kind)).ptr;
+}
+
+/// A heading's level, or 0 for any other kind.
+fn kindLevel(node: *const twig.AST.Node) u32 {
+    return switch (node.kind) {
+        .heading => |h| h.level,
+        else => 0,
+    };
+}
+
+/// The node's primary text payload (a `str`'s bytes, a `code_block`'s body, …),
+/// or `null` for kinds that carry none. Borrows the AST-owned payload.
+fn kindText(node: *const twig.AST.Node) ?[]const u8 {
+    return switch (node.kind) {
+        .str, .symb, .verbatim, .inline_math, .display_math, .url, .email, .footnote_reference => |s| s,
+        .comment, .doctype, .cdata => |s| s,
+        // Each payload is a distinct anonymous struct type, so Zig can't merge
+        // these captures into one prong — but each exposes a `.text` field.
+        .code_block => |p| p.text,
+        .raw_block => |p| p.text,
+        .raw_inline => |p| p.text,
+        .metadata => |p| p.text,
+        .smart_punctuation => |p| p.text,
+        else => null,
+    };
+}
+
+/// A link/image destination, or `null`.
+fn kindDestination(node: *const twig.AST.Node) ?[]const u8 {
+    return switch (node.kind) {
+        .link => |l| l.destination,
+        .image => |l| l.destination,
+        else => null,
+    };
+}
+
+/// Splice `[start, end)` of the current source with `text` and reparse — the
+/// offset-addressed primitive (`Editor.replaceAtSpan`) behind a caret editor:
+/// a keystroke is `edit_range(caret, caret, "x")`, backspace
+/// `edit_range(caret-1, caret, "")`, a selection replace `edit_range(a, b, s)`.
+/// `start`/`end` are byte offsets into the *current* source with
+/// `start <= end <= len`; a bad range is `invalid_argument`. On a reparse-
+/// breaking edit the splice is rolled back and `edit_conflict` returned. On
+/// success, if `out_change` is non-NULL it receives the byte effect (also
+/// retrievable via `twig_editor_last_change`).
+pub export fn twig_editor_edit_range(
+    ed: ?*TwigEditor,
+    start: usize,
+    end: usize,
+    text_ptr: ?[*]const u8,
+    text_len: usize,
+    out_change: ?*TwigChange,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const text = sliceOf(text_ptr, text_len) orelse return .invalid_argument;
+    const handle = asEditor(raw);
+
+    if (start > end or end > handle.editor.sourceBytes().len) return .invalid_argument;
+
+    handle.editor.replaceAtSpan(twig.Span.init(start, end), text) catch |err| switch (err) {
+        error.OutOfMemory => return .out_of_memory,
+        // Any parse error means the edited document didn't reparse; it was
+        // rolled back.
+        else => return .edit_conflict,
+    };
+    if (out_change) |slot| slot.* = changeC(handle.editor.last_change.?);
+    return .ok;
+}
+
+/// Write the byte effect of the last successful edit into `out_change`. Lets
+/// the locator ops (`twig_editor_replace`, `_delete`, …) report their change
+/// too, so a caret/selection can re-anchor without re-diffing. Returns
+/// `not_found` if no edit has succeeded yet (nothing to report).
+pub export fn twig_editor_last_change(
+    ed: ?*TwigEditor,
+    out_change: ?*TwigChange,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const slot = out_change orelse return .invalid_argument;
+    const change = asEditor(raw).editor.last_change orelse return .not_found;
+    slot.* = changeC(change);
+    return .ok;
+}
+
+/// Snapshot the editor's current tree as a flat array of `TwigFlatNode`, one
+/// per arena node, indexed so `array[i].id == i`. The JSON-free read path for
+/// a renderer: one call, one buffer, walked via the `parent`/`first_child`/
+/// `next_sibling` id links (`TWIG_NO_NODE` where absent). The root is the node
+/// whose `parent == TWIG_NO_NODE`.
+///
+/// The returned array is borrowed from `ed` and stays valid until the next
+/// `twig_editor_nodes` call on this handle or `twig_editor_destroy`. The
+/// `text`/`destination` pointers within it additionally require no *successful
+/// edit* to have happened since (a reparse frees the payloads they borrow).
+pub export fn twig_editor_nodes(
+    ed: ?*TwigEditor,
+    out_ptr: ?*?[*]const TwigFlatNode,
+    out_len: ?*usize,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const ptr_out = out_ptr orelse return .invalid_argument;
+    const len_out = out_len orelse return .invalid_argument;
+
+    const allocator = activeAllocator();
+    const handle = asEditor(raw);
+    const ast = handle.editor.astView();
+    const nodes = ast.nodes;
+
+    const buf = allocator.alloc(TwigFlatNode, nodes.len) catch return .out_of_memory;
+    for (nodes, 0..) |node, i| {
+        const text = kindText(&node);
+        const dest = kindDestination(&node);
+        buf[i] = .{
+            .id = @intCast(i),
+            .parent = TWIG_NO_NODE, // filled in the parent pass below
+            .first_child = node.first_child orelse TWIG_NO_NODE,
+            .next_sibling = node.next_sibling orelse TWIG_NO_NODE,
+            .span = spanC(node.span),
+            .content_span = if (node.content_span) |cs| spanC(cs) else .{ .start = 0, .end = 0 },
+            .has_content_span = if (node.content_span != null) 1 else 0,
+            .level = kindLevel(&node),
+            .kind = kindName(&node),
+            .text_ptr = if (text) |t| t.ptr else null,
+            .text_len = if (text) |t| t.len else 0,
+            .destination_ptr = if (dest) |d| d.ptr else null,
+            .destination_len = if (dest) |d| d.len else 0,
+        };
+    }
+    // Parent pass: a `Node` stores children, not its parent, so derive it by
+    // stamping each node's children with its own id (one linear walk).
+    for (nodes, 0..) |node, i| {
+        var child = node.first_child;
+        while (child) |cid| {
+            buf[cid].parent = @intCast(i);
+            child = nodes[cid].next_sibling;
+        }
+    }
+
+    if (handle.flat_nodes.len != 0) allocator.free(handle.flat_nodes);
+    handle.flat_nodes = buf;
+
+    ptr_out.* = if (buf.len == 0) null else buf.ptr;
+    len_out.* = buf.len;
+    return .ok;
+}
+
+/// The deepest node whose span contains byte `offset` (half-open `[start, end)`,
+/// with `offset == source.len` treated as inside the root) — mouse hit-testing
+/// and "what's my cursor context". Descends from the root into the last child
+/// that still contains the offset. Nodes with an unset `(0,0)` span (some
+/// parsers leave inline spans unpopulated) can't be descended into and are
+/// skipped. Fills `out_match` and returns `ok`, or `not_found` if no node
+/// covers the offset (`invalid_argument` if `offset > source.len`).
+pub export fn twig_editor_node_at(
+    ed: ?*TwigEditor,
+    offset: usize,
+    out_match: ?*TwigQueryMatch,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const slot = out_match orelse return .invalid_argument;
+    const handle = asEditor(raw);
+    const ast = handle.editor.astView();
+    if (offset > handle.editor.sourceBytes().len) return .invalid_argument;
+
+    const found = deepestContaining(ast, offset, handle.editor.sourceBytes().len) orelse return .not_found;
+    slot.* = flatMatch(ast, found);
+    return .ok;
+}
+
+/// The chain of nodes containing byte `offset`, root-first down to the deepest
+/// (the same node `twig_editor_node_at` returns) — the ancestor path for
+/// breadcrumbs or context-scoped edits. Same borrow contract as
+/// `twig_editor_query`, but on an independent buffer. Returns `not_found` (and
+/// a zero-length result) if nothing covers the offset.
+pub export fn twig_editor_nodes_at(
+    ed: ?*TwigEditor,
+    offset: usize,
+    out_ptr: ?*?[*]const TwigQueryMatch,
+    out_len: ?*usize,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const ptr_out = out_ptr orelse return .invalid_argument;
+    const len_out = out_len orelse return .invalid_argument;
+    const allocator = activeAllocator();
+    const handle = asEditor(raw);
+    const ast = handle.editor.astView();
+    if (offset > handle.editor.sourceBytes().len) return .invalid_argument;
+
+    const len = handle.editor.sourceBytes().len;
+    // Rebuild the exact root→deepest descent path, so the chain's last element
+    // is always the node `twig_editor_node_at` returns. The root is included as
+    // the outermost breadcrumb even when its own span is unset.
+    const deepest = deepestContaining(ast, offset, len) orelse {
+        if (handle.ancestor_matches.len != 0) allocator.free(handle.ancestor_matches);
+        handle.ancestor_matches = &.{};
+        ptr_out.* = null;
+        len_out.* = 0;
+        return .not_found;
+    };
+
+    var chain: std.ArrayList(TwigQueryMatch) = .empty;
+    defer chain.deinit(allocator);
+
+    var cur = ast.root;
+    chain.append(allocator, flatMatch(ast, cur)) catch return .out_of_memory;
+    while (cur != deepest) {
+        cur = childContaining(ast, cur, offset, len) orelse break;
+        chain.append(allocator, flatMatch(ast, cur)) catch return .out_of_memory;
+    }
+
+    if (handle.ancestor_matches.len != 0) allocator.free(handle.ancestor_matches);
+    handle.ancestor_matches = chain.toOwnedSlice(allocator) catch return .out_of_memory;
+    ptr_out.* = handle.ancestor_matches.ptr;
+    len_out.* = handle.ancestor_matches.len;
+    return .ok;
+}
+
+/// True if `offset` falls in node span `s` (half-open), treating a whole-source
+/// end position as inside, and an unset `(0,0)` span as containing nothing.
+fn spanContains(s: twig.Span, offset: usize, source_len: usize) bool {
+    if (s.start == 0 and s.end == 0) return false;
+    if (offset == source_len) return offset >= s.start and s.end >= source_len;
+    return offset >= s.start and offset < s.end;
+}
+
+/// The child of `id` whose span contains `offset` — the last such child, so an
+/// offset on a boundary resolves into the later sibling. `null` if none.
+fn childContaining(ast: *const twig.AST, id: twig.AST.Node.Id, offset: usize, source_len: usize) ?twig.AST.Node.Id {
+    var found: ?twig.AST.Node.Id = null;
+    var it = ast.children(id);
+    while (it.next()) |child| {
+        if (spanContains(child.span, offset, source_len)) found = child.id;
+    }
+    return found;
+}
+
+/// The deepest node containing `offset`, descending from the root. The root's
+/// own span may be unset `(0,0)` (some parsers don't span the `doc` node); when
+/// so, entry is the root's child that owns the offset, and descent continues
+/// fully from there. `null` if no node covers the offset at all.
+fn deepestContaining(ast: *const twig.AST, offset: usize, source_len: usize) ?twig.AST.Node.Id {
+    var cur = ast.root;
+    if (!spanContains(ast.nodes[cur].span, offset, source_len)) {
+        cur = childContaining(ast, cur, offset, source_len) orelse return null;
+    }
+    while (childContaining(ast, cur, offset, source_len)) |child| cur = child;
+    return cur;
+}
+
+/// Build a `TwigQueryMatch` for a node id from the flat arena.
+fn flatMatch(ast: *const twig.AST, id: twig.AST.Node.Id) TwigQueryMatch {
+    const node = &ast.nodes[id];
+    return .{
+        .node_id = id,
+        .span = spanC(node.span),
+        .content_span = if (node.content_span) |cs| spanC(cs) else .{ .start = 0, .end = 0 },
+        .has_content_span = if (node.content_span != null) 1 else 0,
+        .kind = kindName(node),
+    };
 }
 
 // ── Builder ──────────────────────────────────────────────────────────────────

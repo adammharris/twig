@@ -62,6 +62,47 @@ typedef struct TwigQueryMatch {
     const char *kind;
 } TwigQueryMatch;
 
+// The sentinel node id meaning "no such node" in a TwigFlatNode link field
+// (parent / first_child / next_sibling): the root has no parent, a leaf no
+// child, a last sibling no next. A real id is a node-arena index, always less
+// than this value.
+#define TWIG_NO_NODE ((uint32_t)0xFFFFFFFFu)
+
+// The byte-level effect of an edit. `old_span` is the range of the pre-edit
+// source that was replaced; `new_span` is the range the replacement occupies in
+// the post-edit source (they share a start). An insertion has an empty
+// `old_span`, a deletion an empty `new_span`. See twig_editor_edit_range /
+// twig_editor_last_change.
+typedef struct TwigChange {
+    TwigSpan old_span;
+    TwigSpan new_span;
+} TwigChange;
+
+// One node in the editor's current tree — the flat-arena snapshot
+// twig_editor_nodes returns, the JSON-free read path. `id` is the node's index
+// in the arena; parent / first_child / next_sibling are ids or TWIG_NO_NODE.
+// content_span is meaningful only when has_content_span is non-zero. `level` is
+// a heading's level (0 otherwise). `kind` is static, library-owned storage
+// (never freed). text_ptr/destination_ptr borrow the node's payload in the
+// current parse and stay valid until the next successful edit or
+// twig_editor_destroy; each pointer is NULL when the kind carries no such
+// payload.
+typedef struct TwigFlatNode {
+    uint32_t id;
+    uint32_t parent;
+    uint32_t first_child;
+    uint32_t next_sibling;
+    TwigSpan span;
+    TwigSpan content_span;
+    int has_content_span;
+    uint32_t level;
+    const char *kind;
+    const uint8_t *text_ptr;
+    size_t text_len;
+    const uint8_t *destination_ptr;
+    size_t destination_len;
+} TwigFlatNode;
+
 // Packed as (major << 16) | (minor << 8) | patch.
 uint32_t twig_version(void);
 // Null-terminated "major.minor.patch" string in static library-owned storage.
@@ -277,6 +318,74 @@ TwigStatus twig_editor_query(
     TwigEditor *editor,
     const uint8_t *selector,
     size_t selector_len,
+    const TwigQueryMatch **out_ptr,
+    size_t *out_len
+);
+
+// ── Offset-addressed editing & read-back ──────────────────────────────────────
+// The rich-text-editor surface: a caret speaks byte offsets, not locator
+// strings. edit_range is the raw splice a keystroke maps onto; node_at /
+// nodes_at hit-test an offset back to nodes; nodes hands out the whole tree as
+// a flat array so a renderer needn't parse the AST JSON.
+
+// Splice [start, end) of the current source with `text` and reparse — the
+// offset-addressed primitive behind a caret editor: a keystroke is
+// edit_range(caret, caret, "x"); backspace edit_range(caret-1, caret, "");
+// a selection replace edit_range(a, b, s). start <= end <= source length, else
+// TWIG_STATUS_INVALID_ARGUMENT. A reparse-breaking edit is rolled back and
+// returns TWIG_STATUS_EDIT_CONFLICT. On success, if out_change is non-NULL it
+// receives the byte effect (also available via twig_editor_last_change).
+TwigStatus twig_editor_edit_range(
+    TwigEditor *editor,
+    size_t start,
+    size_t end,
+    const uint8_t *text,
+    size_t text_len,
+    TwigChange *out_change
+);
+
+// Write the byte effect of the last successful edit into out_change — lets the
+// locator ops (twig_editor_replace, _delete, …) report their change too, so a
+// caret/selection can re-anchor without re-diffing. Returns TWIG_STATUS_NOT_FOUND
+// if no edit has succeeded yet. (A multi-splice op such as filter reports only
+// its final splice.)
+TwigStatus twig_editor_last_change(
+    TwigEditor *editor,
+    TwigChange *out_change
+);
+
+// Snapshot the editor's current tree as a flat array of TwigFlatNode, one per
+// arena node, indexed so array[i].id == i. The JSON-free read path for a
+// renderer: walk it via the parent / first_child / next_sibling id links
+// (TWIG_NO_NODE where absent); the root is the node whose parent == TWIG_NO_NODE.
+// Borrowed from `editor`, valid until the next twig_editor_nodes call or
+// destroy; the text/destination pointers within additionally require no
+// successful edit since (a reparse frees the payloads they borrow).
+TwigStatus twig_editor_nodes(
+    TwigEditor *editor,
+    const TwigFlatNode **out_ptr,
+    size_t *out_len
+);
+
+// The deepest node whose span contains byte `offset` (half-open [start, end),
+// with offset == source length treated as inside the root) — mouse hit-testing
+// and cursor context. Fills out_match and returns TWIG_STATUS_OK, or
+// TWIG_STATUS_NOT_FOUND if no node covers the offset (TWIG_STATUS_INVALID_ARGUMENT
+// if offset > source length). out_match is a value copy (its `kind` is static).
+TwigStatus twig_editor_node_at(
+    TwigEditor *editor,
+    size_t offset,
+    TwigQueryMatch *out_match
+);
+
+// The chain of nodes containing byte `offset`, root-first down to the deepest
+// (the node twig_editor_node_at returns) — the ancestor path for breadcrumbs or
+// context-scoped edits. Same borrow contract as twig_editor_query, on an
+// independent buffer. Returns TWIG_STATUS_NOT_FOUND (and a zero-length result)
+// if nothing covers the offset.
+TwigStatus twig_editor_nodes_at(
+    TwigEditor *editor,
+    size_t offset,
     const TwigQueryMatch **out_ptr,
     size_t *out_len
 );
