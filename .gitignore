@@ -3,6 +3,9 @@ zig-out/
 djot.js/
 target/
 
+# Nix build symlink
+/result
+
 # Zig source vendored into the Rust crate at publish time (see
 # bindings/rust/twig/vendor-zig.sh) — regenerated, never committed.
 bindings/rust/twig/zig/
