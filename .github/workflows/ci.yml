@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  # Build the Zig library + CLI, run the test suite, and build the C ABI
+  # static library and header across Linux and macOS. macOS is included
+  # deliberately: the Rust binding's build.rs repacks the archive for
+  # Apple's `ld`, so the toolchain is exercised on the platform that needs it.
+  zig:
+    name: zig (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test
+
+      - name: Build C ABI library + header
+        run: zig build install-c-lib
+
+  # Build and test the Rust binding. Its build.rs shells out to
+  # `zig build install-c-lib`, so Zig must be on PATH alongside the Rust
+  # toolchain.
+  rust:
+    name: rust binding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/rust
+
+      - name: Build
+        working-directory: bindings/rust
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        working-directory: bindings/rust
+        run: cargo test --workspace
