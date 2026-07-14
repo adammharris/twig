@@ -37,22 +37,12 @@ pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(arena);
     var arg_iter = cli_args.ArgIterator{ .items = argv };
 
-    const config = cli_args.parseConfig(&arg_iter, stderr_writer) catch |err| {
-        // `args.zig` already printed a tailored diagnostic for every
-        // resolvable-format failure; the remaining variants (a flag missing
-        // its value, no file given, an extra positional) have nothing
-        // format-specific to say, so add a short usage reminder for those.
-        switch (err) {
-            cli_args.ArgError.MissingFile,
-            cli_args.ArgError.MissingFormatValue,
-            cli_args.ArgError.TooManyPositionals,
-            cli_args.ArgError.MissingEditArgument,
-            cli_args.ArgError.MissingEditOperation,
-            cli_args.ArgError.MissingSelector,
-            cli_args.ArgError.MissingFilterSelector,
-            => cli_actions.runHelp(stderr_writer, "twig") catch {},
-            else => {},
-        }
+    const config = cli_args.parseConfig(&arg_iter, stderr_writer) catch {
+        // `args.zig` already printed a tailored diagnostic for every failure —
+        // the specific message plus the failing command's one-line usage (via
+        // `argFail`), or the supported-format list for a bad `-i`/`-o`/
+        // extension. The full `runHelp` manual is reserved for an explicit
+        // `twig help`, so here we only set the exit code.
         stderr_writer.flush() catch {};
         std.process.exit(2);
     };

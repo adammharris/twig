@@ -8,9 +8,11 @@
 //! deferred to `main.zig`'s catch site the way fig routes through `std.log` —
 //! Twig's CLI has no `std.log`/terminal-color machinery (see `main.zig`'s
 //! module doc comment), so a plain writer threaded through is the modest
-//! equivalent. `main.zig` only adds a short usage reminder on the handful of
-//! `ArgError` variants that reach it without their own message already
-//! printed (`MissingFile`, `MissingFormatValue`, `TooManyPositionals`).
+//! equivalent. Every failure prints a message scoped to the command that
+//! failed, plus that command's one-line usage synopsis (`commandUsage`, via
+//! the `argFail` helper) — never the whole `runHelp` manual, which is
+//! reserved for an explicit `twig help`. `main.zig`'s catch site therefore
+//! just sets the exit code.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -20,6 +22,23 @@ const InputFormat = format.InputFormat;
 const OutputMode = format.OutputMode;
 
 pub const Action = enum { help, version, convert, identify, edit, query, filter };
+
+/// One-line usage synopsis for each command, matching the per-command
+/// synopsis lines in `actions.zig`'s `runHelp`. When a command's arguments
+/// fail to parse, `argFail` prints just this line (prefixed with the binary
+/// name) instead of the whole help manual, so the diagnostic points at the
+/// shape of the command that actually failed. `help`/`version` never fail to
+/// parse, so they fall back to the top-level synopsis.
+pub fn commandUsage(action: Action) []const u8 {
+    return switch (action) {
+        .convert => "convert [-i <format>] [-o <format>] <file|->",
+        .identify => "identify [-i <format>] <file>",
+        .query => "query [-i <format>] <file> <selector>",
+        .edit => "edit [-i <format>] <file|-> <operation>",
+        .filter => "filter [-i <format>] <file|-> --drop <sel> [--keep <sel>] [--unwrap]",
+        .help, .version => "<command> [options] <file>",
+    };
+}
 
 /// The span-splice edit `twig edit` performs — one per invocation, selected by
 /// the corresponding `--…` flag. See `actions.zig`'s `applyEdit` for the
@@ -116,11 +135,14 @@ pub const CliConfig = struct {
     binary_name: []const u8 = "twig",
 };
 
-/// Errors `parseConfig` can return. The `Missing*`/`TooManyPositionals`
-/// variants carry no message of their own (there is nothing tailored to say
-/// beyond "here's the usage"); every other variant has already printed a
-/// specific diagnostic to `stderr` by the time it's returned — see this
-/// file's module doc comment.
+/// Errors `parseConfig` can return. Every variant has already printed a
+/// specific diagnostic to `stderr` by the time it's returned: the format
+/// variants (`UnsupportedFormat`, the `ResolveInputFormatError`s) print the
+/// supported-format list at their point of failure, and the
+/// `Missing*`/`TooManyPositionals`/edit variants go through `argFail`, which
+/// prints the specific message plus the offending command's one-line usage.
+/// `main.zig` therefore only needs to set the exit code — see this file's and
+/// `main.zig`'s module doc comments.
 pub const ArgError = error{
     UnsupportedFormat,
     MissingFormatValue,
@@ -159,6 +181,26 @@ pub const ArgIterator = struct {
 fn isAny(s: []const u8, options: []const []const u8) bool {
     for (options) |o| if (std.mem.eql(u8, s, o)) return true;
     return false;
+}
+
+/// Print a specific parse-error diagnostic plus the offending command's
+/// one-line usage (`commandUsage`), then return `err` for the caller to
+/// propagate. This is the "message + short usage, not the whole manual"
+/// convention for every bare-argument failure a sub-parser can hit
+/// (`MissingFile`, `TooManyPositionals`, the edit/selector variants, a flag
+/// missing its value). Format-resolution failures don't come through here —
+/// `format.zig` and the inline `-i`/`-o` handlers print their own richer
+/// diagnostics (the supported-format list) at their point of failure.
+fn argFail(
+    stderr: *Writer,
+    binary_name: []const u8,
+    action: Action,
+    message: []const u8,
+    err: ArgError,
+) ArgError {
+    stderr.print("error: {s}\nusage: {s} {s}\n", .{ message, binary_name, commandUsage(action) }) catch {};
+    stderr.flush() catch {};
+    return err;
 }
 
 /// Consume a Markdown extension flag, mutating `cfg`. Returns true if `arg`
@@ -241,7 +283,7 @@ fn parseConvert(args: anytype, stderr: *Writer, binary_name: []const u8) ArgErro
         if (applyExtFlag(arg, &parse_config)) {
             // handled
         } else if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
-            const name = args.next() orelse return ArgError.MissingFormatValue;
+            const name = args.next() orelse return argFail(stderr, binary_name, .convert, "convert: -i/--input needs a format value", ArgError.MissingFormatValue);
             input_override = format.parseFormatName(name) orelse {
                 try stderr.print("error: unsupported input format '{s}'\n", .{name});
                 try format.printSupportedInputFormats(stderr);
@@ -249,7 +291,7 @@ fn parseConvert(args: anytype, stderr: *Writer, binary_name: []const u8) ArgErro
                 return ArgError.UnsupportedFormat;
             };
         } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
-            const name = args.next() orelse return ArgError.MissingFormatValue;
+            const name = args.next() orelse return argFail(stderr, binary_name, .convert, "convert: -o/--output needs a format value", ArgError.MissingFormatValue);
             const target = format.parseOutputTarget(name) orelse {
                 try stderr.print("error: unsupported output format '{s}' (expected html, ast, canonical, or a target language like djot/markdown/xml)\n", .{name});
                 try stderr.flush();
@@ -260,11 +302,11 @@ fn parseConvert(args: anytype, stderr: *Writer, binary_name: []const u8) ArgErro
         } else if (file == null) {
             file = arg;
         } else {
-            return ArgError.TooManyPositionals;
+            return argFail(stderr, binary_name, .convert, "convert: unexpected extra argument (only one input file is accepted)", ArgError.TooManyPositionals);
         }
     }
 
-    const path = file orelse return ArgError.MissingFile;
+    const path = file orelse return argFail(stderr, binary_name, .convert, "convert: missing input file", ArgError.MissingFile);
     const resolved = try format.resolveInputFormat(stderr, path, input_override);
 
     return .{
@@ -280,7 +322,7 @@ fn parseIdentify(args: anytype, stderr: *Writer, binary_name: []const u8) ArgErr
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
-            const name = args.next() orelse return ArgError.MissingFormatValue;
+            const name = args.next() orelse return argFail(stderr, binary_name, .identify, "identify: -i/--input needs a format value", ArgError.MissingFormatValue);
             input_override = format.parseFormatName(name) orelse {
                 try stderr.print("error: unsupported input format '{s}'\n", .{name});
                 try format.printSupportedInputFormats(stderr);
@@ -290,11 +332,11 @@ fn parseIdentify(args: anytype, stderr: *Writer, binary_name: []const u8) ArgErr
         } else if (file == null) {
             file = arg;
         } else {
-            return ArgError.TooManyPositionals;
+            return argFail(stderr, binary_name, .identify, "identify: unexpected extra argument (only one input file is accepted)", ArgError.TooManyPositionals);
         }
     }
 
-    const path = file orelse return ArgError.MissingFile;
+    const path = file orelse return argFail(stderr, binary_name, .identify, "identify: missing input file", ArgError.MissingFile);
     const resolved = try format.resolveInputFormat(stderr, path, input_override);
 
     return .{
@@ -314,7 +356,7 @@ fn parseQuery(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError!
         if (applyExtFlag(arg, &parse_config)) {
             // handled
         } else if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
-            const name = args.next() orelse return ArgError.MissingFormatValue;
+            const name = args.next() orelse return argFail(stderr, binary_name, .query, "query: -i/--input needs a format value", ArgError.MissingFormatValue);
             input_override = format.parseFormatName(name) orelse {
                 try stderr.print("error: unsupported input format '{s}'\n", .{name});
                 try format.printSupportedInputFormats(stderr);
@@ -326,12 +368,12 @@ fn parseQuery(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError!
         } else if (selector == null) {
             selector = arg;
         } else {
-            return ArgError.TooManyPositionals;
+            return argFail(stderr, binary_name, .query, "query: unexpected extra argument (expected just <file> and <selector>)", ArgError.TooManyPositionals);
         }
     }
 
-    const path = file orelse return ArgError.MissingFile;
-    const sel = selector orelse return ArgError.MissingSelector;
+    const path = file orelse return argFail(stderr, binary_name, .query, "query: missing input file", ArgError.MissingFile);
+    const sel = selector orelse return argFail(stderr, binary_name, .query, "query: missing selector", ArgError.MissingSelector);
     const resolved = try format.resolveInputFormat(stderr, path, input_override);
 
     return .{
@@ -354,7 +396,7 @@ fn parseFilter(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError
         if (applyExtFlag(arg, &parse_config)) {
             // handled
         } else if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
-            const name = args.next() orelse return ArgError.MissingFormatValue;
+            const name = args.next() orelse return argFail(stderr, binary_name, .filter, "filter: -i/--input needs a format value", ArgError.MissingFormatValue);
             input_override = format.parseFormatName(name) orelse {
                 try stderr.print("error: unsupported input format '{s}'\n", .{name});
                 try format.printSupportedInputFormats(stderr);
@@ -362,9 +404,9 @@ fn parseFilter(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError
                 return ArgError.UnsupportedFormat;
             };
         } else if (std.mem.eql(u8, arg, "--drop")) {
-            drop = args.next() orelse return ArgError.MissingFilterSelector;
+            drop = args.next() orelse return argFail(stderr, binary_name, .filter, "filter: --drop needs a selector value", ArgError.MissingFilterSelector);
         } else if (std.mem.eql(u8, arg, "--keep")) {
-            keep = args.next() orelse return ArgError.MissingFilterSelector;
+            keep = args.next() orelse return argFail(stderr, binary_name, .filter, "filter: --keep needs a selector value", ArgError.MissingFilterSelector);
         } else if (std.mem.eql(u8, arg, "--unwrap")) {
             unwrap_kept = true;
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
@@ -372,12 +414,12 @@ fn parseFilter(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError
         } else if (file == null) {
             file = arg;
         } else {
-            return ArgError.TooManyPositionals;
+            return argFail(stderr, binary_name, .filter, "filter: unexpected extra argument (only one input file is accepted)", ArgError.TooManyPositionals);
         }
     }
 
-    const path = file orelse return ArgError.MissingFile;
-    const drop_sel = drop orelse return ArgError.MissingFilterSelector;
+    const path = file orelse return argFail(stderr, binary_name, .filter, "filter: missing input file", ArgError.MissingFile);
+    const drop_sel = drop orelse return argFail(stderr, binary_name, .filter, "filter: missing required --drop <selector>", ArgError.MissingFilterSelector);
     const resolved = try format.resolveInputFormat(stderr, path, input_override);
 
     return .{
@@ -409,7 +451,7 @@ fn parseEdit(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError!C
         if (applyExtFlag(arg, &parse_config)) {
             // handled
         } else if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
-            const name = args.next() orelse return ArgError.MissingFormatValue;
+            const name = args.next() orelse return argFail(stderr, binary_name, .edit, "edit: -i/--input needs a format value", ArgError.MissingFormatValue);
             input_override = format.parseFormatName(name) orelse {
                 try stderr.print("error: unsupported input format '{s}'\n", .{name});
                 try format.printSupportedInputFormats(stderr);
@@ -420,45 +462,45 @@ fn parseEdit(args: anytype, stderr: *Writer, binary_name: []const u8) ArgError!C
             dry_run = true;
         } else if (std.mem.eql(u8, arg, "--replace")) {
             op = .replace;
-            path_str = args.next() orelse return ArgError.MissingEditArgument;
-            text = args.next() orelse return ArgError.MissingEditArgument;
+            path_str = args.next() orelse return argFail(stderr, binary_name, .edit, "edit: --replace needs a <path> and <text>", ArgError.MissingEditArgument);
+            text = args.next() orelse return argFail(stderr, binary_name, .edit, "edit: --replace needs a <text> after its <path>", ArgError.MissingEditArgument);
         } else if (std.mem.eql(u8, arg, "--replace-content")) {
             op = .replace_content;
-            path_str = args.next() orelse return ArgError.MissingEditArgument;
-            text = args.next() orelse return ArgError.MissingEditArgument;
+            path_str = args.next() orelse return argFail(stderr, binary_name, .edit, "edit: --replace-content needs a <path> and <text>", ArgError.MissingEditArgument);
+            text = args.next() orelse return argFail(stderr, binary_name, .edit, "edit: --replace-content needs a <text> after its <path>", ArgError.MissingEditArgument);
         } else if (std.mem.eql(u8, arg, "--insert-before")) {
             op = .insert_before;
-            path_str = args.next() orelse return ArgError.MissingEditArgument;
-            text = args.next() orelse return ArgError.MissingEditArgument;
+            path_str = args.next() orelse return argFail(stderr, binary_name, .edit, "edit: --insert-before needs a <path> and <text>", ArgError.MissingEditArgument);
+            text = args.next() orelse return argFail(stderr, binary_name, .edit, "edit: --insert-before needs a <text> after its <path>", ArgError.MissingEditArgument);
         } else if (std.mem.eql(u8, arg, "--insert-after")) {
             op = .insert_after;
-            path_str = args.next() orelse return ArgError.MissingEditArgument;
-            text = args.next() orelse return ArgError.MissingEditArgument;
+            path_str = args.next() orelse return argFail(stderr, binary_name, .edit, "edit: --insert-after needs a <path> and <text>", ArgError.MissingEditArgument);
+            text = args.next() orelse return argFail(stderr, binary_name, .edit, "edit: --insert-after needs a <text> after its <path>", ArgError.MissingEditArgument);
         } else if (std.mem.eql(u8, arg, "--insert-child")) {
             op = .insert_child;
-            path_str = args.next() orelse return ArgError.MissingEditArgument;
-            const idx_str = args.next() orelse return ArgError.MissingEditArgument;
+            path_str = args.next() orelse return argFail(stderr, binary_name, .edit, "edit: --insert-child needs a <path>, <index>, and <text>", ArgError.MissingEditArgument);
+            const idx_str = args.next() orelse return argFail(stderr, binary_name, .edit, "edit: --insert-child needs an <index> and <text> after its <path>", ArgError.MissingEditArgument);
             child_index = std.fmt.parseInt(usize, idx_str, 10) catch {
-                try stderr.print("error: invalid child index '{s}' (expected a non-negative integer)\n", .{idx_str});
-                try stderr.flush();
+                stderr.print("error: edit: invalid child index '{s}' (expected a non-negative integer)\nusage: {s} {s}\n", .{ idx_str, binary_name, commandUsage(.edit) }) catch {};
+                stderr.flush() catch {};
                 return ArgError.InvalidEditIndex;
             };
-            text = args.next() orelse return ArgError.MissingEditArgument;
+            text = args.next() orelse return argFail(stderr, binary_name, .edit, "edit: --insert-child needs a <text> after its <index>", ArgError.MissingEditArgument);
         } else if (std.mem.eql(u8, arg, "--delete")) {
             op = .delete;
-            path_str = args.next() orelse return ArgError.MissingEditArgument;
+            path_str = args.next() orelse return argFail(stderr, binary_name, .edit, "edit: --delete needs a <path>", ArgError.MissingEditArgument);
         } else if (std.mem.eql(u8, arg, "--unwrap")) {
             op = .unwrap;
-            path_str = args.next() orelse return ArgError.MissingEditArgument;
+            path_str = args.next() orelse return argFail(stderr, binary_name, .edit, "edit: --unwrap needs a <path>", ArgError.MissingEditArgument);
         } else if (file == null) {
             file = arg;
         } else {
-            return ArgError.TooManyPositionals;
+            return argFail(stderr, binary_name, .edit, "edit: unexpected extra argument", ArgError.TooManyPositionals);
         }
     }
 
-    const path = file orelse return ArgError.MissingFile;
-    const the_op = op orelse return ArgError.MissingEditOperation;
+    const path = file orelse return argFail(stderr, binary_name, .edit, "edit: missing input file", ArgError.MissingFile);
+    const the_op = op orelse return argFail(stderr, binary_name, .edit, "edit: missing an operation (e.g. --replace, --delete, --insert-child)", ArgError.MissingEditOperation);
     const resolved = try format.resolveInputFormat(stderr, path, input_override);
 
     return .{
@@ -548,6 +590,27 @@ test "parseConfig: convert -i/-o override inference, in either flag order" {
     const c2 = try parseConfig(&a2, &w2);
     try testing.expectEqual(InputFormat.xml, c2.options.convert.input);
     try testing.expectEqual(OutputMode.canonical, c2.options.convert.output);
+}
+
+test "parseConfig: a failed parse writes a command-scoped message and that command's usage, not the whole manual" {
+    var buf: [512]u8 = undefined;
+
+    // convert with no file: message names the command, usage is convert's
+    // one-liner, and no other command's synopsis leaks in (that would mean the
+    // full `runHelp` manual was printed instead).
+    var w = scratchWriter(&buf);
+    var a = TestArgs{ .items = &.{ "twig", "convert" } };
+    try testing.expectError(error.MissingFile, parseConfig(&a, &w));
+    const out = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "error: convert: missing input file") != null);
+    try testing.expect(std.mem.indexOf(u8, out, commandUsage(.convert)) != null);
+    try testing.expect(std.mem.indexOf(u8, out, commandUsage(.filter)) == null);
+
+    // The usage line is prefixed with the actual binary name from argv[0].
+    var w2 = scratchWriter(&buf);
+    var a2 = TestArgs{ .items = &.{ "mytwig", "edit", "doc.dj" } };
+    try testing.expectError(error.MissingEditOperation, parseConfig(&a2, &w2));
+    try testing.expect(std.mem.indexOf(u8, w2.buffered(), "usage: mytwig edit") != null);
 }
 
 test "parseConfig: convert stdin ('-') without -i errors clearly" {
