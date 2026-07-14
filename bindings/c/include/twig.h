@@ -7,6 +7,25 @@
 extern "C" {
 #endif
 
+// ── ABI stability contract ───────────────────────────────────────────────────
+// This header follows an APPEND-ONLY discipline so that adding capability is a
+// minor release, never a breaking one:
+//
+//   - Enum-like code spaces (TWIG_FORMAT_*, TwigStatus, TwigNodeKind,
+//     TwigInlineKind, TwigBlockKind, and the builder enums) only ever gain new
+//     values appended at the end. An existing value is NEVER renumbered or
+//     reused — so a new document format is TWIG_FORMAT_* = <next int>, leaving
+//     every prior code untouched.
+//   - New functions (e.g. a future twig_editor_undo) are added; existing
+//     signatures never change in place.
+//   - The struct layouts below are frozen. Any change to a struct's fields —
+//     or any renumbering of an existing enum value — is a breaking change that
+//     bumps TWIG_ABI_VERSION.
+//
+// A consumer records TWIG_ABI_VERSION at compile time and may call
+// twig_abi_version() at load time to confirm the linked library agrees.
+#define TWIG_ABI_VERSION 1
+
 #define TWIG_FORMAT_DJOT 1
 #define TWIG_FORMAT_MARKDOWN 2
 #define TWIG_FORMAT_XML 3
@@ -102,6 +121,11 @@ typedef struct TwigFlatNode {
     const uint8_t *destination_ptr;
     size_t destination_len;
 } TwigFlatNode;
+
+// The C ABI contract version (see the "ABI stability contract" above); compare
+// against the TWIG_ABI_VERSION you compiled with to detect a layout mismatch.
+// Bumped only on a breaking ABI change, never on an additive one.
+uint32_t twig_abi_version(void);
 
 // Packed as (major << 16) | (minor << 8) | patch.
 uint32_t twig_version(void);
@@ -374,6 +398,29 @@ TwigStatus twig_editor_last_change(
     TwigEditor *editor,
     TwigChange *out_change
 );
+
+// Undo the last edit step, restoring the previous source and reparsing. On
+// success, if out_change is non-NULL it receives the byte effect of the undo
+// (current -> restored) so a caret can re-anchor. Returns TWIG_STATUS_NOT_FOUND
+// when there is nothing to undo. History is per-editor and accrues across every
+// op that funnels through the splice primitive (splices and locator ops alike).
+TwigStatus twig_editor_undo(
+    TwigEditor *editor,
+    TwigChange *out_change
+);
+
+// Redo the most recently undone edit step, symmetric to twig_editor_undo.
+// Returns TWIG_STATUS_NOT_FOUND when the redo stack is empty (nothing undone, or
+// a fresh edit has since invalidated it).
+TwigStatus twig_editor_redo(
+    TwigEditor *editor,
+    TwigChange *out_change
+);
+
+// Fold the most recent edit into the undo step before it, so a caret editor can
+// coalesce a run of keystrokes into one undo. Call immediately after an
+// edit_range that continues a run. A no-op unless there are two steps to merge.
+TwigStatus twig_editor_coalesce_last(TwigEditor *editor);
 
 // Snapshot the editor's current tree as a flat array of TwigFlatNode, one per
 // arena node, indexed so array[i].id == i. The JSON-free read path for a

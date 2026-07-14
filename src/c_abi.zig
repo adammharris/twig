@@ -179,6 +179,78 @@ pub export fn twig_version_string() [*:0]const u8 {
     return s;
 }
 
+/// The C ABI contract version, independent of the semantic `twig_version`.
+///
+/// It is bumped ONLY on a breaking ABI change — an `extern struct`'s layout
+/// changing, or an existing enum value being renumbered. Purely additive
+/// changes do NOT bump it: appending a new `TwigFormat`/`TwigStatus`/
+/// `TwigNodeKind` value at the end, or adding a new `twig_*` function (e.g. a
+/// future `twig_editor_undo`), leaves every existing symbol binary-compatible,
+/// so an older consumer keeps working. See the "ABI stability" contract in
+/// `bindings/c/include/twig.h`.
+///
+/// A consumer records the `TWIG_ABI_VERSION` it compiled against and can call
+/// `twig_abi_version` at load time to confirm the library it linked speaks the
+/// same layout.
+pub const TWIG_ABI_VERSION: u32 = 1;
+
+pub export fn twig_abi_version() u32 {
+    return TWIG_ABI_VERSION;
+}
+
+// Freeze the canonical 64-bit C-ABI layout of every `extern struct` the
+// bindings mirror. A field reordered, retyped, inserted, or removed shifts an
+// offset or the size and fails the build here — turning a silent, memory-
+// corrupting drift between this file and `twig.h`/`ffi.rs` into a compile
+// error. Any *intentional* change to these numbers must also bump
+// `TWIG_ABI_VERSION` and the mirrored `assert!`s in `ffi.rs`.
+//
+// Gated on 64-bit because the offsets below are the LP64/LLP64 layout (the
+// shipped desktop/mobile targets); on a 32-bit target (e.g. `wasm32`) C-ABI
+// rules still make Zig and the bindings agree, they just pack tighter, so the
+// absolute numbers wouldn't apply.
+comptime {
+    if (@sizeOf(usize) == 8) {
+        const assert = std.debug.assert;
+
+        assert(@sizeOf(TwigSpan) == 16);
+        assert(@offsetOf(TwigSpan, "start") == 0);
+        assert(@offsetOf(TwigSpan, "end") == 8);
+
+        assert(@sizeOf(TwigQueryMatch) == 56);
+        assert(@offsetOf(TwigQueryMatch, "node_id") == 0);
+        assert(@offsetOf(TwigQueryMatch, "span") == 8);
+        assert(@offsetOf(TwigQueryMatch, "content_span") == 24);
+        assert(@offsetOf(TwigQueryMatch, "has_content_span") == 40);
+        assert(@offsetOf(TwigQueryMatch, "kind") == 48);
+
+        assert(@sizeOf(TwigChange) == 32);
+        assert(@offsetOf(TwigChange, "old") == 0);
+        assert(@offsetOf(TwigChange, "new") == 16);
+
+        assert(@sizeOf(TwigFlatNode) == 96);
+        assert(@offsetOf(TwigFlatNode, "id") == 0);
+        assert(@offsetOf(TwigFlatNode, "parent") == 4);
+        assert(@offsetOf(TwigFlatNode, "first_child") == 8);
+        assert(@offsetOf(TwigFlatNode, "next_sibling") == 12);
+        assert(@offsetOf(TwigFlatNode, "span") == 16);
+        assert(@offsetOf(TwigFlatNode, "content_span") == 32);
+        assert(@offsetOf(TwigFlatNode, "has_content_span") == 48);
+        assert(@offsetOf(TwigFlatNode, "level") == 52);
+        assert(@offsetOf(TwigFlatNode, "kind") == 56);
+        assert(@offsetOf(TwigFlatNode, "text_ptr") == 64);
+        assert(@offsetOf(TwigFlatNode, "text_len") == 72);
+        assert(@offsetOf(TwigFlatNode, "destination_ptr") == 80);
+        assert(@offsetOf(TwigFlatNode, "destination_len") == 88);
+
+        assert(@sizeOf(TwigKeyVal) == 32);
+        assert(@offsetOf(TwigKeyVal, "key") == 0);
+        assert(@offsetOf(TwigKeyVal, "key_len") == 8);
+        assert(@offsetOf(TwigKeyVal, "value") == 16);
+        assert(@offsetOf(TwigKeyVal, "value_len") == 24);
+    }
+}
+
 pub export fn twig_parse(
     input_ptr: ?[*]const u8,
     input_len: usize,
@@ -1009,6 +1081,50 @@ pub export fn twig_editor_last_change(
     const slot = out_change orelse return .invalid_argument;
     const change = asEditor(raw).editor.last_change orelse return .not_found;
     slot.* = changeC(change);
+    return .ok;
+}
+
+/// Undo the last edit step, restoring the previous source and reparsing. On
+/// success, if `out_change` is non-NULL it receives the byte effect of the undo
+/// (current → restored) so a caret can re-anchor. Returns `not_found` when
+/// there's nothing to undo. History is per-editor and spans every op that
+/// funnels through `replaceAtSpan` (splices and the locator ops alike).
+pub export fn twig_editor_undo(
+    ed: ?*TwigEditor,
+    out_change: ?*TwigChange,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const change = (asEditor(raw).editor.undo() catch |err| switch (err) {
+        error.OutOfMemory => return .out_of_memory,
+        else => return .edit_conflict,
+    }) orelse return .not_found;
+    if (out_change) |slot| slot.* = changeC(change);
+    return .ok;
+}
+
+/// Redo the most recently undone edit step, symmetric to `twig_editor_undo`.
+/// Returns `not_found` when the redo stack is empty (nothing was undone, or a
+/// fresh edit has since invalidated it).
+pub export fn twig_editor_redo(
+    ed: ?*TwigEditor,
+    out_change: ?*TwigChange,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const change = (asEditor(raw).editor.redo() catch |err| switch (err) {
+        error.OutOfMemory => return .out_of_memory,
+        else => return .edit_conflict,
+    }) orelse return .not_found;
+    if (out_change) |slot| slot.* = changeC(change);
+    return .ok;
+}
+
+/// Fold the most recent edit into the undo step before it, so a caret editor can
+/// coalesce a run of keystrokes into one undo. Call immediately after an
+/// `edit_range` that continues a run (same kind, no intervening caret move). A
+/// no-op unless there are at least two steps to merge.
+pub export fn twig_editor_coalesce_last(ed: ?*TwigEditor) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    asEditor(raw).editor.coalesceLastUndo();
     return .ok;
 }
 

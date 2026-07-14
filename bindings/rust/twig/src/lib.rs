@@ -153,6 +153,15 @@ pub fn version() -> Version {
     }
 }
 
+/// The C ABI contract version of the linked library. This crate is written
+/// against [`ffi::TWIG_ABI_VERSION`]; the two agreeing is what makes the
+/// `#[repr(C)]` mirrors in [`ffi`] sound. It is bumped only on a breaking ABI
+/// change (a struct layout change or a renumbered enum value), never on an
+/// additive one (a new format code or a new function).
+pub fn abi_version() -> u32 {
+    unsafe { ffi::twig_abi_version() }
+}
+
 pub fn version_string() -> &'static str {
     let ptr = unsafe { ffi::twig_version_string() };
     unsafe { std::ffi::CStr::from_ptr(ptr) }
@@ -465,6 +474,48 @@ impl Editor {
             ffi::TwigStatus::OK => Some(Change::from_ffi(change)),
             _ => None,
         }
+    }
+
+    /// Undo the last edit step, restoring the previous source and reparsing.
+    /// Returns the [`Change`] the undo produced (current → restored) so a caret
+    /// can re-anchor, or `None` when there's nothing to undo. History accrues
+    /// across every successful edit that funnels through the splice primitive.
+    pub fn undo(&mut self) -> Result<Option<Change>, Error> {
+        let mut change = ffi::TwigChange {
+            old_span: ffi::TwigSpan { start: 0, end: 0 },
+            new_span: ffi::TwigSpan { start: 0, end: 0 },
+        };
+        let status = unsafe { ffi::twig_editor_undo(self.raw.as_ptr(), &mut change) };
+        if status.0 == ffi::TwigStatus::NOT_FOUND {
+            return Ok(None);
+        }
+        Error::from_status(status)?;
+        Ok(Some(Change::from_ffi(change)))
+    }
+
+    /// Redo the most recently undone edit step; the inverse of [`Editor::undo`].
+    /// Returns `None` when the redo stack is empty (nothing undone, or a fresh
+    /// edit has invalidated it).
+    pub fn redo(&mut self) -> Result<Option<Change>, Error> {
+        let mut change = ffi::TwigChange {
+            old_span: ffi::TwigSpan { start: 0, end: 0 },
+            new_span: ffi::TwigSpan { start: 0, end: 0 },
+        };
+        let status = unsafe { ffi::twig_editor_redo(self.raw.as_ptr(), &mut change) };
+        if status.0 == ffi::TwigStatus::NOT_FOUND {
+            return Ok(None);
+        }
+        Error::from_status(status)?;
+        Ok(Some(Change::from_ffi(change)))
+    }
+
+    /// Fold the most recent edit into the undo step before it, so a caret editor
+    /// can coalesce a run of keystrokes into a single undo. Call right after an
+    /// `edit_range` that continues a run (same kind, no intervening caret move);
+    /// a no-op unless there are at least two steps to merge.
+    pub fn coalesce_last_undo(&mut self) -> Result<(), Error> {
+        let status = unsafe { ffi::twig_editor_coalesce_last(self.raw.as_ptr()) };
+        Error::from_status(status)
     }
 
     /// Snapshot the current tree as a flat [`FlatNode`] array (the JSON-free
@@ -1174,6 +1225,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn abi_version_matches() {
+        // The linked library must speak the exact ABI layout this crate's
+        // `#[repr(C)]` mirrors assume. If this fails, the Zig `TWIG_ABI_VERSION`
+        // was bumped without updating `ffi::TWIG_ABI_VERSION` (and the mirrors).
+        assert_eq!(abi_version(), ffi::TWIG_ABI_VERSION);
+    }
+
+    #[test]
     fn parses_and_renders_markdown_html() {
         let mut doc = Document::parse_str("# hi\n", Format::Markdown).expect("parse markdown");
         let html = doc.render_html().expect("render html");
@@ -1459,6 +1518,34 @@ mod tests {
 
         let mut xml = Editor::new_str("<a>hi</a>", Format::Xml).expect("editor");
         assert_eq!(xml.set_block(1, BlockKind::Heading(1)), Err(Error::UnsupportedFormat));
+    }
+
+    #[test]
+    fn editor_undo_redo_round_trip() {
+        let mut ed = Editor::new_str("hello\n", Format::Markdown).expect("editor");
+        ed.edit_range(5, 5, "!").expect("edit");
+        assert_eq!(ed.source_str().unwrap(), "hello!\n");
+
+        let change = ed.undo().expect("undo ok").expect("something to undo");
+        assert_eq!(ed.source_str().unwrap(), "hello\n");
+        assert_eq!(change.new.end, 5);
+        assert!(ed.undo().expect("undo ok").is_none(), "history exhausted");
+
+        ed.redo().expect("redo ok").expect("something to redo");
+        assert_eq!(ed.source_str().unwrap(), "hello!\n");
+    }
+
+    #[test]
+    fn editor_coalesce_folds_a_run() {
+        let mut ed = Editor::new_str("\n", Format::Markdown).expect("editor");
+        ed.edit_range(0, 0, "a").expect("edit");
+        ed.edit_range(1, 1, "b").expect("edit");
+        ed.coalesce_last_undo().expect("coalesce");
+        assert_eq!(ed.source_str().unwrap(), "ab\n");
+        // One undo removes the whole coalesced run.
+        ed.undo().expect("undo ok").expect("something to undo");
+        assert_eq!(ed.source_str().unwrap(), "\n");
+        assert!(ed.undo().expect("undo ok").is_none());
     }
 
     #[test]

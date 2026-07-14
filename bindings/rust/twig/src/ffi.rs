@@ -1,5 +1,58 @@
 use std::os::raw::{c_char, c_int};
 
+/// The C ABI contract version this binding is written against; see
+/// `twig_abi_version`. Must match the value baked into the linked library
+/// (asserted at runtime by the `abi_version_matches` test in `lib.rs`).
+pub const TWIG_ABI_VERSION: u32 = 1;
+
+// Freeze the canonical 64-bit layout of every `#[repr(C)]` mirror below so it
+// can never silently drift from the Zig `extern struct` it shadows. These are
+// the same offsets asserted on the Zig side in `src/c_abi.zig`; a change on
+// either side that isn't matched on the other fails to compile. Gated on 64-bit
+// (the offsets are the LP64/LLP64 layout); 32-bit targets pack tighter but the
+// C ABI still keeps both languages in agreement.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    use std::mem::offset_of;
+    use std::mem::size_of;
+
+    assert!(size_of::<TwigSpan>() == 16);
+    assert!(offset_of!(TwigSpan, start) == 0);
+    assert!(offset_of!(TwigSpan, end) == 8);
+
+    assert!(size_of::<TwigQueryMatch>() == 56);
+    assert!(offset_of!(TwigQueryMatch, node_id) == 0);
+    assert!(offset_of!(TwigQueryMatch, span) == 8);
+    assert!(offset_of!(TwigQueryMatch, content_span) == 24);
+    assert!(offset_of!(TwigQueryMatch, has_content_span) == 40);
+    assert!(offset_of!(TwigQueryMatch, kind) == 48);
+
+    assert!(size_of::<TwigChange>() == 32);
+    assert!(offset_of!(TwigChange, old_span) == 0);
+    assert!(offset_of!(TwigChange, new_span) == 16);
+
+    assert!(size_of::<TwigFlatNode>() == 96);
+    assert!(offset_of!(TwigFlatNode, id) == 0);
+    assert!(offset_of!(TwigFlatNode, parent) == 4);
+    assert!(offset_of!(TwigFlatNode, first_child) == 8);
+    assert!(offset_of!(TwigFlatNode, next_sibling) == 12);
+    assert!(offset_of!(TwigFlatNode, span) == 16);
+    assert!(offset_of!(TwigFlatNode, content_span) == 32);
+    assert!(offset_of!(TwigFlatNode, has_content_span) == 48);
+    assert!(offset_of!(TwigFlatNode, level) == 52);
+    assert!(offset_of!(TwigFlatNode, kind) == 56);
+    assert!(offset_of!(TwigFlatNode, text_ptr) == 64);
+    assert!(offset_of!(TwigFlatNode, text_len) == 72);
+    assert!(offset_of!(TwigFlatNode, destination_ptr) == 80);
+    assert!(offset_of!(TwigFlatNode, destination_len) == 88);
+
+    assert!(size_of::<TwigKeyVal>() == 32);
+    assert!(offset_of!(TwigKeyVal, key) == 0);
+    assert!(offset_of!(TwigKeyVal, key_len) == 8);
+    assert!(offset_of!(TwigKeyVal, value) == 16);
+    assert!(offset_of!(TwigKeyVal, value_len) == 24);
+};
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TwigStatus(pub c_int);
@@ -108,6 +161,7 @@ pub struct TwigFlatNode {
 }
 
 unsafe extern "C" {
+    pub fn twig_abi_version() -> u32;
     pub fn twig_version() -> u32;
     pub fn twig_version_string() -> *const c_char;
     pub fn twig_parse(
@@ -243,6 +297,9 @@ unsafe extern "C" {
         editor: *mut TwigEditor,
         out_change: *mut TwigChange,
     ) -> TwigStatus;
+    pub fn twig_editor_undo(editor: *mut TwigEditor, out_change: *mut TwigChange) -> TwigStatus;
+    pub fn twig_editor_redo(editor: *mut TwigEditor, out_change: *mut TwigChange) -> TwigStatus;
+    pub fn twig_editor_coalesce_last(editor: *mut TwigEditor) -> TwigStatus;
     pub fn twig_editor_nodes(
         editor: *mut TwigEditor,
         out_ptr: *mut *const TwigFlatNode,

@@ -42,6 +42,11 @@ const AST = @import("ast.zig");
 const Node = AST.Node;
 const Span = @import("../span.zig");
 
+/// Cap on retained undo steps, bounding history memory over a long session.
+/// Coalescing (`coalesceLastUndo`) makes a run of keystrokes one step, so this
+/// counts edit groups, not individual splices.
+const MAX_UNDO: usize = 200;
+
 pub const Editor = struct {
     /// What the most recent successful edit did to the source, in byte terms.
     /// `old` is the range of the *pre-edit* source that was replaced; `new` is
@@ -81,6 +86,12 @@ pub const Editor = struct {
     /// before the first edit. A failed edit leaves it untouched. Note: a
     /// multi-splice op (e.g. `Filter`) leaves only its *final* splice here.
     last_change: ?Change = null,
+    /// Undo/redo history as whole source buffers. `replaceAtSpan` retires the
+    /// pre-edit source onto `undo_stack` instead of freeing it; `undo`/`redo`
+    /// swap a buffer between the stacks and reparse. Each single-splice op is
+    /// one step; `coalesceLastUndo` folds a keystroke run into one.
+    undo_stack: std.ArrayList(std.ArrayList(u8)) = .empty,
+    redo_stack: std.ArrayList(std.ArrayList(u8)) = .empty,
 
     /// Parse `source_bytes` and build an editor over a private copy of them.
     /// `parse_ctx` is forwarded verbatim to `parse_fn` on the initial parse
@@ -96,6 +107,10 @@ pub const Editor = struct {
     pub fn deinit(self: *Editor) void {
         self.ast.deinit();
         self.source.deinit(self.allocator);
+        for (self.undo_stack.items) |*b| b.deinit(self.allocator);
+        self.undo_stack.deinit(self.allocator);
+        for (self.redo_stack.items) |*b| b.deinit(self.allocator);
+        self.redo_stack.deinit(self.allocator);
     }
 
     /// The current edited document bytes.
@@ -136,14 +151,101 @@ pub const Editor = struct {
             return err;
         };
 
-        // Commit: the reparse succeeded, so retire the old state.
+        // Commit: the reparse succeeded, so retire the old state. The pre-edit
+        // source goes onto the undo history (not freed), and any redo is dropped
+        // now that a fresh edit has diverged the timeline.
         self.ast.deinit();
         self.ast = new_ast;
-        self.source.deinit(self.allocator);
+        self.recordUndo(self.source);
+        self.clearRedo();
         self.source = new_src;
         self.last_change = .{
             .old = span,
             .new = Span.init(span.start, span.start + replacement.len),
+        };
+    }
+
+    // ── undo / redo ─────────────────────────────────────────────────────────
+
+    /// Retire a pre-edit source buffer onto the undo stack, evicting the oldest
+    /// entry once past the cap. Takes ownership of `buf`.
+    fn recordUndo(self: *Editor, buf: std.ArrayList(u8)) void {
+        self.undo_stack.append(self.allocator, buf) catch {
+            var b = buf;
+            b.deinit(self.allocator);
+            return;
+        };
+        if (self.undo_stack.items.len > MAX_UNDO) {
+            var oldest = self.undo_stack.orderedRemove(0);
+            oldest.deinit(self.allocator);
+        }
+    }
+
+    fn clearRedo(self: *Editor) void {
+        for (self.redo_stack.items) |*b| b.deinit(self.allocator);
+        self.redo_stack.clearRetainingCapacity();
+    }
+
+    /// Merge the most recent edit into the step before it, so a run of
+    /// keystrokes undoes as one. Drops the latest "before" snapshot, leaving the
+    /// run's earlier one; a no-op unless there are at least two steps to merge.
+    pub fn coalesceLastUndo(self: *Editor) void {
+        if (self.undo_stack.items.len < 2) return;
+        var top = self.undo_stack.pop().?;
+        top.deinit(self.allocator);
+    }
+
+    /// Restore the previous edit step, if any, moving the current source onto
+    /// the redo stack. Returns the byte-level `Change` (current → restored) so a
+    /// caret can re-anchor, or `null` when there's nothing to undo.
+    pub fn undo(self: *Editor) !?Change {
+        if (self.undo_stack.items.len == 0) return null;
+        const target = self.undo_stack.pop().?;
+        return try self.swapTo(target, &self.redo_stack);
+    }
+
+    /// Re-apply the most recently undone step, symmetric to `undo`.
+    pub fn redo(self: *Editor) !?Change {
+        if (self.redo_stack.items.len == 0) return null;
+        const target = self.redo_stack.pop().?;
+        return try self.swapTo(target, &self.undo_stack);
+    }
+
+    /// Make `target` the current source (reparsing it) and push the outgoing
+    /// source onto `other`. Returns the `Change` describing current → target.
+    fn swapTo(self: *Editor, target: std.ArrayList(u8), other: *std.ArrayList(std.ArrayList(u8))) !?Change {
+        var t = target;
+        const new_ast = self.parse_fn(self.parse_ctx, self.allocator, t.items) catch |err| {
+            // A stored snapshot parsed when it was recorded, so this shouldn't
+            // happen; if it does, drop the entry and surface the error rather
+            // than leave the editor half-swapped.
+            t.deinit(self.allocator);
+            return err;
+        };
+        const change = diffChange(self.source.items, t.items);
+        other.append(self.allocator, self.source) catch {
+            var cur = self.source;
+            cur.deinit(self.allocator); // OOM: lose this redo/undo entry, don't leak
+        };
+        self.ast.deinit();
+        self.ast = new_ast;
+        self.source = t;
+        self.last_change = change;
+        return change;
+    }
+
+    /// The minimal `[start, end)` byte range that differs between `before` and
+    /// `after`, as a `Change` (common prefix and suffix trimmed). Lets undo/redo
+    /// report where the edit landed without tracking edits through composition.
+    fn diffChange(before: []const u8, after: []const u8) Change {
+        const min = @min(before.len, after.len);
+        var p: usize = 0;
+        while (p < min and before[p] == after[p]) p += 1;
+        var s: usize = 0;
+        while (s < min - p and before[before.len - 1 - s] == after[after.len - 1 - s]) s += 1;
+        return .{
+            .old = Span.init(p, before.len - s),
+            .new = Span.init(p, after.len - s),
         };
     }
 
@@ -691,4 +793,63 @@ test "tidyDeletionSpan: the only block empties the document" {
 test "tidyDeletionSpan: a mid-line (inline) span is deleted exactly, no line surgery" {
     // "a *b* c\n", delete the "*b*" at [2,5): must NOT swallow the line.
     try expectTidy("a *b* c\n", 2, 5, "a  c\n");
+}
+
+// ── undo / redo ──────────────────────────────────────────────────────────────
+
+test "undo restores the pre-edit source; redo re-applies it" {
+    var ed = try Editor.init(testing.allocator, "hello\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+
+    try ed.replaceAtSpan(Span.init(5, 5), "!");
+    try testing.expectEqualStrings("hello!\n", ed.sourceBytes());
+
+    const undone = (try ed.undo()).?;
+    try testing.expectEqualStrings("hello\n", ed.sourceBytes());
+    // The change reports where the edit was, in the restored source.
+    try testing.expectEqual(@as(usize, 5), undone.new.end);
+
+    const redone = (try ed.redo()).?;
+    try testing.expectEqualStrings("hello!\n", ed.sourceBytes());
+    try testing.expectEqual(@as(usize, 6), redone.new.end);
+}
+
+test "undo and redo are no-ops (null) at the ends of history" {
+    var ed = try Editor.init(testing.allocator, "x\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    try testing.expect((try ed.undo()) == null);
+    try ed.replaceAtSpan(Span.init(1, 1), "y");
+    _ = try ed.undo();
+    try testing.expect((try ed.undo()) == null); // history exhausted
+    _ = try ed.redo();
+    try testing.expect((try ed.redo()) == null);
+}
+
+test "coalesceLastUndo folds a keystroke run into one undo step" {
+    var ed = try Editor.init(testing.allocator, "\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+
+    // Simulate typing "abc": the first splice is its own step, each following
+    // one coalesces into it (what a frontend does for a run of typing).
+    try ed.replaceAtSpan(Span.init(0, 0), "a");
+    try ed.replaceAtSpan(Span.init(1, 1), "b");
+    ed.coalesceLastUndo();
+    try ed.replaceAtSpan(Span.init(2, 2), "c");
+    ed.coalesceLastUndo();
+    try testing.expectEqualStrings("abc\n", ed.sourceBytes());
+
+    // One undo removes the whole run.
+    _ = try ed.undo();
+    try testing.expectEqualStrings("\n", ed.sourceBytes());
+    try testing.expect((try ed.undo()) == null);
+}
+
+test "a fresh edit invalidates the redo stack" {
+    var ed = try Editor.init(testing.allocator, "\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    try ed.replaceAtSpan(Span.init(0, 0), "a");
+    _ = try ed.undo(); // redo now holds the "a" state
+    try ed.replaceAtSpan(Span.init(0, 0), "b"); // diverge
+    try testing.expect((try ed.redo()) == null);
+    try testing.expectEqualStrings("b\n", ed.sourceBytes());
 }
