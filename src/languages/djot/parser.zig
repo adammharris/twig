@@ -1488,3 +1488,35 @@ test "content_span: an empty div (no children) stays null" {
     try testing.expectEqual(@as(?Node.Id, null), ast.nodes[div_id].first_child);
     try testing.expectEqual(@as(?Span, null), ast.nodes[div_id].content_span);
 }
+
+// djot.js records source positions as line:col:byte triples; Twig records the
+// byte range directly. This is the native equivalent of the corpus's
+// `sourcepos.test` AST-dump case (options `ap`): every node gets a
+// byte-accurate span. See conformance.zig for why that case is skipped there.
+test "span: a bullet list and its items carry byte-accurate spans (sourcepos parity)" {
+    const src = " - a\n - b\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const list = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[list].kind == .bullet_list);
+    try testing.expectEqual(@as(usize, 1), ast.nodes[list].span.start);
+    try testing.expectEqual(@as(usize, 10), ast.nodes[list].span.end);
+
+    const item1 = ast.nodes[list].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[item1].kind == .list_item);
+    try testing.expectEqual(@as(usize, 1), ast.nodes[item1].span.start);
+    try testing.expectEqual(@as(usize, 6), ast.nodes[item1].span.end);
+
+    const item2 = ast.nodes[item1].next_sibling orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[item2].kind == .list_item);
+    try testing.expectEqual(@as(usize, 6), ast.nodes[item2].span.start);
+    try testing.expectEqual(@as(usize, 10), ast.nodes[item2].span.end);
+
+    // The leaf `str` spans exactly its single character.
+    const para1 = ast.nodes[item1].first_child orelse return error.TestExpectedNonNull;
+    const str1 = ast.nodes[para1].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[str1].kind == .str);
+    try testing.expectEqualStrings("a", src[ast.nodes[str1].span.start..ast.nodes[str1].span.end]);
+}

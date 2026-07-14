@@ -295,17 +295,25 @@ test "CommonMark 0.31.2 spec conformance (full)" {
     var result = try run(allocator, 0, &failures);
     defer result.deinit(allocator);
 
-    std.debug.print(
-        "\nmarkdown conformance: {d}/{d} passed ({d} failed)\n",
-        .{ result.summary.passed, result.summary.total, result.summary.failed },
-    );
-    std.debug.print(
-        "  failure categories: inline-not-yet={d} rendering-divergence={d} other={d}\n",
-        .{ result.categories.inline_not_yet, result.categories.rendering_divergence, result.categories.other },
-    );
-    std.debug.print("  by section:\n", .{});
-    for (result.sections.items) |s| {
-        std.debug.print("    {s:<40} {d}/{d}\n", .{ s.name, s.passed, s.total });
+    // Report to stderr only on failure. A passing run stays silent on purpose:
+    // under `zig build test` the child's stderr carries the build runner's
+    // `std.Progress` IPC, so a raw `std.debug.print` can corrupt that protocol
+    // and surface as a confusing `failed command` even when every test passed.
+    // On failure the build is already red, so the detail earns its noise; run
+    // the test binary directly if you want a summary of a green run.
+    if (result.summary.failed > 0) {
+        std.debug.print(
+            "\nmarkdown conformance: {d}/{d} passed ({d} failed)\n",
+            .{ result.summary.passed, result.summary.total, result.summary.failed },
+        );
+        std.debug.print(
+            "  failure categories: inline-not-yet={d} rendering-divergence={d} other={d}\n",
+            .{ result.categories.inline_not_yet, result.categories.rendering_divergence, result.categories.other },
+        );
+        std.debug.print("  by section:\n", .{});
+        for (result.sections.items) |s| {
+            std.debug.print("    {s:<40} {d}/{d}\n", .{ s.name, s.passed, s.total });
+        }
     }
 
     // Full conformance: the ratchet floor is the whole suite, so this is

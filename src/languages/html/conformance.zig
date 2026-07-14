@@ -236,10 +236,16 @@ test "shared HTML printer matches djot.js conformance corpus exactly like djot/h
     }
     const summary = try run(allocator, 40, &failures);
 
+    // Report to stderr only on failure. A passing run stays silent on purpose:
+    // under `zig build test` the child's stderr carries the build runner's
+    // `std.Progress` IPC, so a raw `std.debug.print` can corrupt that protocol
+    // and surface as a confusing `failed command` even when every test passed.
+    // On failure the build is already red, so the detail earns its noise; run
+    // the test binary directly if you want a summary of a green run.
     if (summary.failed > 0) {
         std.debug.print(
-            "\nhtml printer conformance: {d}/{d} passed, {d} failed, {d} skipped (AST-print mode not implemented)\n",
-            .{ summary.passed, summary.total, summary.failed, summary.skipped },
+            "\nhtml printer conformance: {d}/{d} HTML cases passed, {d} failed ({d} djot.js AST-dump cases skipped; behaviours covered by native AST tests)\n",
+            .{ summary.passed, summary.total - summary.skipped, summary.failed, summary.skipped },
         );
         for (failures.items) |f| {
             std.debug.print(
@@ -247,11 +253,6 @@ test "shared HTML printer matches djot.js conformance corpus exactly like djot/h
                 .{ f.file, f.line, f.input, f.expected, f.actual },
             );
         }
-    } else {
-        std.debug.print(
-            "\nhtml printer conformance: {d}/{d} passed, {d} skipped (AST-print mode not implemented)\n",
-            .{ summary.passed, summary.total, summary.skipped },
-        );
     }
     try std.testing.expectEqual(@as(usize, 0), summary.failed);
 }

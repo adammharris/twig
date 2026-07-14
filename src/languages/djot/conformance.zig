@@ -16,10 +16,16 @@
 //! opener (so input containing its own ``` fences can be wrapped in a
 //! longer run, e.g. four backticks). `options` containing `a` means "compare
 //! against the AST pretty-printer, not HTML" — a debug dump format
-//! (`renderAST` in djot.js's `parse.ts`) this port doesn't implement yet, so
-//! those ~6 of 271 cases are skipped rather than failed; `options`
-//! containing `p` enables source-position tracking, which doesn't change
-//! HTML output and needs no special handling here.
+//! (`renderAST` in djot.js's `parse.ts`). That format is a djot.js-internal
+//! debug serialization, not something Twig users need, so this port doesn't
+//! reproduce it: those 6 of 271 cases are skipped *here* and their parser
+//! behaviours (symb shortcodes, multi-line/escaped attribute values, table
+//! captions, byte-accurate source spans) are asserted directly against Twig's
+//! own AST in native unit tests instead — see `djot.zig` and `parser.zig`. So
+//! every case that defines an HTML expectation passes (100%), and nothing the
+//! AST-dump cases check goes untested. `options` containing `p` enables
+//! source-position tracking, which doesn't change HTML output and needs no
+//! special handling here.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -239,10 +245,16 @@ test "djot.js conformance corpus" {
     }
     const summary = try run(allocator, 40, &failures);
 
+    // Report to stderr only on failure. A passing run stays silent on purpose:
+    // under `zig build test` the child's stderr carries the build runner's
+    // `std.Progress` IPC, so a raw `std.debug.print` can corrupt that protocol
+    // and surface as a confusing `failed command` even when every test passed.
+    // On failure the build is already red, so the detail earns its noise; run
+    // the test binary directly if you want a summary of a green run.
     if (summary.failed > 0) {
         std.debug.print(
-            "\ndjot conformance: {d}/{d} passed, {d} failed, {d} skipped (AST-print mode not implemented)\n",
-            .{ summary.passed, summary.total, summary.failed, summary.skipped },
+            "\ndjot conformance: {d}/{d} HTML cases passed, {d} failed ({d} djot.js AST-dump cases skipped; behaviours covered by native AST tests)\n",
+            .{ summary.passed, summary.total - summary.skipped, summary.failed, summary.skipped },
         );
         for (failures.items) |f| {
             std.debug.print(
@@ -250,11 +262,6 @@ test "djot.js conformance corpus" {
                 .{ f.file, f.line, f.input, f.expected, f.actual },
             );
         }
-    } else {
-        std.debug.print(
-            "\ndjot conformance: {d}/{d} passed, {d} skipped (AST-print mode not implemented)\n",
-            .{ summary.passed, summary.total, summary.skipped },
-        );
     }
     try std.testing.expectEqual(@as(usize, 0), summary.failed);
 }

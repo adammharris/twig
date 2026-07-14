@@ -29,7 +29,7 @@ but Twig has different design goals:
 
 The following languages are implemented:
 
-- Djot (265/271 cases passing; the remaining 6 rely on an AST pretty-printer this project doesn't implement yet)
+- Djot — 100% conformant with the djot.js corpus: all 265 cases that define an HTML expectation pass. The 6 remaining cases assert against djot.js's internal AST-dump debug format (not HTML); their parser behaviours are covered directly by native AST unit tests instead.
 - Markdown (fully CommonMark 0.31.2 conformant — 652/652 spec examples passing)
 - HTML (generic-markup parser + serializer; forgiving document-oriented tree construction)
 

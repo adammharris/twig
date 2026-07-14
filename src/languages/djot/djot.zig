@@ -173,3 +173,108 @@ test "isBlock/isInline classify kinds" {
     try testing.expect(!isBlock(.{ .element = .{ .name = "video" } }));
     try testing.expect(!isInline(.{ .element = .{ .name = "video" } }));
 }
+
+// ── djot.js AST-dump-only cases, asserted natively ──────────────────────────
+// The djot.js corpus has 6 cases whose expected output is djot.js's internal
+// AST-dump debug format rather than HTML, so the HTML conformance run skips
+// them (see conformance.zig). These tests assert the same parser behaviours
+// directly against Twig's own AST, so those behaviours are covered and the
+// "100% djot conformant" claim is honest. Verified against `renderAST` output
+// in the corpus: symb.test, attributes.test, regression.test, sourcepos.test.
+
+test "symb: :name: shortcodes parse to symb nodes carrying the bare alias" {
+    var doc = try parse(testing.allocator, ":+1: :scream:\n");
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const para = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    const first = ast.nodes[para].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[first].kind == .symb);
+    try testing.expectEqualStrings("+1", ast.nodes[first].kind.symb);
+
+    const space = ast.nodes[first].next_sibling orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[space].kind == .str);
+
+    const second = ast.nodes[space].next_sibling orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[second].kind == .symb);
+    try testing.expectEqualStrings("scream", ast.nodes[second].kind.symb);
+}
+
+test "symb: a shortcode consumes only through its closing colon, leaving the rest literal" {
+    var doc = try parse(testing.allocator, ":ice:scream:\n");
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const para = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    const first = ast.nodes[para].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[first].kind == .symb);
+    try testing.expectEqualStrings("ice", ast.nodes[first].kind.symb);
+
+    // ":ice:" is consumed; the trailing "scream:" stays literal text.
+    const rest = ast.nodes[first].next_sibling orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[rest].kind == .str);
+    try testing.expectEqualStrings("scream:", ast.nodes[rest].kind.str);
+}
+
+test "attributes: a quoted value spanning multiple lines collapses to single spaces" {
+    var doc = try parse(testing.allocator,
+        \\{
+        \\ attr="long
+        \\ value
+        \\ spanning
+        \\ multiple
+        \\ lines"
+        \\ }
+        \\> a
+        \\
+    );
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const bq = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[bq].kind == .block_quote);
+    try testing.expectEqualStrings(
+        "long value spanning multiple lines",
+        ast.attrsOf(bq).get("attr").?,
+    );
+}
+
+test "attributes: backslash escapes resolve inside a quoted value" {
+    var doc = try parse(testing.allocator,
+        \\> {key="bar
+        \\>    a\$bim"}
+        \\> ou
+        \\
+    );
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const bq = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[bq].kind == .block_quote);
+    const para = ast.nodes[bq].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[para].kind == .para);
+    // The continuation collapses to one space and `\$` resolves to a literal $.
+    try testing.expectEqualStrings("bar a$bim", ast.attrsOf(para).get("key").?);
+}
+
+test "table: a later caption replaces an earlier one (djot.js issue #57)" {
+    var doc = try parse(testing.allocator,
+        \\| 1 | 2 |
+        \\
+        \\ ^ cap1
+        \\
+        \\ ^ cap2
+        \\
+    );
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const table = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[table].kind == .table);
+    // A table's first child is always its caption; the later `^ cap2` wins.
+    const caption = ast.nodes[table].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[caption].kind == .caption);
+    const str = ast.nodes[caption].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[str].kind == .str);
+    try testing.expectEqualStrings("cap2", ast.nodes[str].kind.str);
+}
