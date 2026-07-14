@@ -1,11 +1,36 @@
 [package]
-name = "twig"
+# Published as `twig-doc` because the plain `twig` crate name is taken (by an
+# abandoned templating crate). The library itself is still Twig — `[lib] name`
+# below stays `twig`, so consumers write `use twig::…`; only the dependency
+# line is `twig-doc = "…"`.
+name = "twig-doc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Rust bindings for Twig document parsing/rendering."
+description = "Parse, query, edit, and losslessly round-trip Djot, Markdown, HTML, and XML documents."
 repository = "https://github.com/adammharris/twig"
+homepage = "https://github.com/adammharris/twig"
+documentation = "https://docs.rs/twig"
+readme = "README.md"
+keywords = ["djot", "markdown", "parser", "ast", "document"]
+categories = ["parser-implementations", "text-processing"]
+# `offset_of!` (1.77) + edition 2024 (1.85).
+rust-version = "1.85"
 links = "twig"
+
+# `include` is an allowlist: only these files are packaged. It deliberately
+# carries the vendored `zig/` tree (synced by `vendor-zig.sh` before publish and
+# otherwise .gitignore'd) so the published crate builds standalone, without the
+# surrounding repo. Keep this in sync with what `build.rs` compiles.
+include = [
+    "src/**/*.rs",
+    "build.rs",
+    "README.md",
+    "zig/build.zig",
+    "zig/build.zig.zon",
+    "zig/src/**/*",
+    "zig/bindings/c/include/twig.h",
+]
 
 [lib]
 name = "twig"

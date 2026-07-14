@@ -1,0 +1,80 @@
+name: Release
+
+# Publishes the `twig` Rust crate to crates.io and cuts a GitHub release when a
+# version tag is pushed. Tag the commit `v<major>.<minor>.<patch>` (matching the
+# crate/`build.zig.zon` version) to trigger it, e.g. `git tag v1.0.0 && git push
+# origin v1.0.0`. `workflow_dispatch` allows a manual dry run (publish is skipped
+# unless the run was triggered by a tag).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the GitHub release
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  publish:
+    name: publish crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Gate the release on a green build/test of both the Zig core and the
+      # binding before anything is published.
+      - name: Zig test
+        run: zig build test
+
+      - name: Rust binding test
+        working-directory: bindings/rust
+        run: cargo test --workspace
+
+      # Fail early if the pushed tag doesn't match the crate version, so a
+      # mistagged release can't publish the wrong number.
+      - name: Verify tag matches crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' bindings/rust/Cargo.toml | head -1)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          echo "crate=$crate_version tag=$tag_version"
+          if [ "$crate_version" != "$tag_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match crate version $crate_version"
+            exit 1
+          fi
+
+      # Sync the Zig source into bindings/rust/twig/zig so the published crate
+      # is self-contained (see vendor-zig.sh / build.rs). --allow-dirty because
+      # that vendored tree is untracked (.gitignore'd).
+      - name: Vendor Zig source
+        run: bash bindings/rust/twig/vendor-zig.sh
+
+      - name: Publish to crates.io
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: bindings/rust
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p twig-doc --allow-dirty
+
+      # A dry run for manual (workflow_dispatch) invocations: package and verify
+      # the crate without pushing it to the registry.
+      - name: Package (dry run)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        working-directory: bindings/rust
+        run: cargo publish -p twig-doc --allow-dirty --dry-run
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

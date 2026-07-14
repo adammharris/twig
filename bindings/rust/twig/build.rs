@@ -4,6 +4,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    // docs.rs builds documentation in a sandbox with no Zig toolchain. `cargo
+    // doc` type-checks the crate but never links the static library, so skip the
+    // native build entirely there — the bindings still document cleanly.
+    if env::var_os("DOCS_RS").is_some() {
+        return;
+    }
+
     let cargo_target = env::var("TARGET").expect("Cargo should set TARGET");
     let cargo_host = env::var("HOST").expect("Cargo should set HOST");
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());

@@ -153,11 +153,18 @@ pub fn version() -> Version {
     }
 }
 
+/// The C ABI contract version this crate was **compiled** against — the
+/// compile-time counterpart to [`abi_version`] (which reports the **linked
+/// library's**). This crate builds and links its own vendored copy of the Zig
+/// source, so the two always agree; the pair is exposed so a consumer embedding
+/// a separately-built library can verify layout compatibility at load time.
+pub const ABI_VERSION: u32 = ffi::TWIG_ABI_VERSION;
+
 /// The C ABI contract version of the linked library. This crate is written
-/// against [`ffi::TWIG_ABI_VERSION`]; the two agreeing is what makes the
-/// `#[repr(C)]` mirrors in [`ffi`] sound. It is bumped only on a breaking ABI
-/// change (a struct layout change or a renumbered enum value), never on an
-/// additive one (a new format code or a new function).
+/// against [`ABI_VERSION`]; the two agreeing is what makes the `#[repr(C)]`
+/// mirrors in `ffi` sound. It is bumped only on a breaking ABI change (a struct
+/// layout change or a renumbered enum value), never on an additive one (a new
+/// format code or a new function).
 pub fn abi_version() -> u32 {
     unsafe { ffi::twig_abi_version() }
 }
