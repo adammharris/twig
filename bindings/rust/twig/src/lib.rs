@@ -86,6 +86,15 @@ pub struct FlatNode {
     pub kind: String,
     pub text: Option<String>,
     pub destination: Option<String>,
+    /// Whether a `row`/`cell` belongs to the table head; `None` for every other
+    /// kind.
+    pub head: Option<bool>,
+    /// A `cell`'s column alignment; `None` for every other kind. The delimiter
+    /// row (`|:--|--:|`) that spells the alignment out is consumed by the parser
+    /// and has no node of its own, so this is the only way to recover it.
+    /// [`Alignment::Default`] is a real, unspecified alignment (a bare `---`) —
+    /// distinct from the `None` a non-cell node reports.
+    pub alignment: Option<Alignment>,
 }
 
 /// An inline mark for [`Editor::wrap_range`] / [`Editor::toggle_inline`] — a
@@ -732,6 +741,11 @@ fn flat_node_from_ffi(n: &ffi::TwigFlatNode) -> Result<FlatNode, Error> {
         kind: borrowed_cstr(n.kind)?,
         text: borrowed_bytes(n.text_ptr, n.text_len),
         destination: borrowed_bytes(n.destination_ptr, n.destination_len),
+        head: match n.head {
+            ffi::TWIG_HEAD_NONE => None,
+            v => Some(v != 0),
+        },
+        alignment: Alignment::from_c(n.alignment),
     })
 }
 
@@ -921,7 +935,8 @@ impl OrderedDelim {
     }
 }
 
-/// Table-cell alignment for [`Builder::add_cell`].
+/// Table-cell alignment: written via [`Builder::add_cell`], read back on
+/// [`FlatNode::alignment`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Alignment {
     Default,
@@ -933,10 +948,22 @@ pub enum Alignment {
 impl Alignment {
     fn to_c(self) -> c_int {
         match self {
-            Alignment::Default => 0,
-            Alignment::Left => 1,
-            Alignment::Right => 2,
-            Alignment::Center => 3,
+            Alignment::Default => ffi::TWIG_ALIGN_DEFAULT,
+            Alignment::Left => ffi::TWIG_ALIGN_LEFT,
+            Alignment::Right => ffi::TWIG_ALIGN_RIGHT,
+            Alignment::Center => ffi::TWIG_ALIGN_CENTER,
+        }
+    }
+
+    /// The inverse of [`Alignment::to_c`]; `None` for [`ffi::TWIG_ALIGN_NONE`]
+    /// (the node isn't a cell) or any code this binding doesn't know.
+    fn from_c(v: c_int) -> Option<Self> {
+        match v {
+            ffi::TWIG_ALIGN_DEFAULT => Some(Alignment::Default),
+            ffi::TWIG_ALIGN_LEFT => Some(Alignment::Left),
+            ffi::TWIG_ALIGN_RIGHT => Some(Alignment::Right),
+            ffi::TWIG_ALIGN_CENTER => Some(Alignment::Center),
+            _ => None,
         }
     }
 }
@@ -1426,6 +1453,10 @@ mod tests {
         assert_eq!(heading.level, Some(1));
         assert!(nodes.iter().any(|n| n.text.as_deref() == Some("Hi")));
 
+        // A kind with no row/cell payload reports neither.
+        assert_eq!(heading.head, None);
+        assert_eq!(heading.alignment, None);
+
         // Every non-root node's parent links back to a node that lists it as a
         // child (via first_child/next_sibling).
         for n in nodes.iter().filter(|n| n.parent.is_some()) {
@@ -1441,6 +1472,39 @@ mod tests {
             }
             assert!(seen, "node {:?} not found among its parent's children", n.id);
         }
+    }
+
+    #[test]
+    fn flat_nodes_carry_table_head_and_alignment() {
+        // The delimiter row (`|:-----|----:|`) is consumed by the parser and has
+        // no node of its own, so `alignment` on the cells is the only way a
+        // consumer can recover the column alignment from a snapshot.
+        let src = "| Name | Qty |\n|:-----|----:|\n| Pear | 3 |\n";
+        let mut ed = Editor::new_str(src, Format::Markdown).expect("editor");
+        let nodes = ed.nodes().expect("nodes");
+
+        let rows: Vec<_> = nodes.iter().filter(|n| n.kind == "row").collect();
+        assert_eq!(rows.len(), 2, "a header row and one body row");
+        assert_eq!(rows[0].head, Some(true), "first row is the header");
+        assert_eq!(rows[1].head, Some(false), "second row is a body row");
+
+        let cells: Vec<_> = nodes.iter().filter(|n| n.kind == "cell").collect();
+        assert_eq!(cells.len(), 4);
+        // Alignment comes from the delimiter row and applies down the column.
+        assert_eq!(cells[0].alignment, Some(Alignment::Left));
+        assert_eq!(cells[1].alignment, Some(Alignment::Right));
+        assert_eq!(cells[2].alignment, Some(Alignment::Left));
+        assert_eq!(cells[3].alignment, Some(Alignment::Right));
+        // Header cells are flagged too, not just their row.
+        assert_eq!(cells[0].head, Some(true));
+        assert_eq!(cells[2].head, Some(false));
+
+        // A table with no alignment spelled out reports Default — a real value,
+        // distinct from the None a non-cell reports.
+        let mut plain = Editor::new_str("| A |\n| --- |\n| b |\n", Format::Markdown).expect("editor");
+        let pnodes = plain.nodes().expect("nodes");
+        let pcell = pnodes.iter().find(|n| n.kind == "cell").expect("a cell");
+        assert_eq!(pcell.alignment, Some(Alignment::Default));
     }
 
     #[test]

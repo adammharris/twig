@@ -86,6 +86,15 @@ pub const TwigChange = extern struct {
 /// the current parse (the AST owns its own copies, not the source) and stay
 /// valid until the next successful edit or `twig_editor_destroy`; each is NULL
 /// when the kind carries no such payload.
+///
+/// `head` and `alignment` surface a `row`/`cell` payload the way `level`
+/// surfaces a `heading`'s, so a consumer can render a table from the snapshot
+/// alone. Both use `-1` for "this kind carries no such payload" rather than
+/// `level`'s 0-means-absent trick, because a cell's `default` alignment is
+/// itself a meaningful value.
+///
+/// New fields are *appended*: every offset above stays put across the bump, so
+/// the layout change is strictly additive (only `@sizeOf` moves).
 pub const TwigFlatNode = extern struct {
     id: u32,
     parent: u32,
@@ -100,7 +109,22 @@ pub const TwigFlatNode = extern struct {
     text_len: usize,
     destination_ptr: ?[*]const u8,
     destination_len: usize,
+    /// A `row`/`cell`'s header flag: 1 true, 0 false, -1 for every other kind.
+    head: c_int,
+    /// A `cell`'s column alignment (`TwigAlignment`), -1 for every other kind.
+    alignment: c_int,
 };
+
+/// `TwigFlatNode.head` for a node that is neither a `row` nor a `cell`.
+pub const TWIG_HEAD_NONE: c_int = -1;
+
+/// A `cell`'s column alignment, as reported by `TwigFlatNode.alignment`.
+/// `TWIG_ALIGN_NONE` (-1) means the node isn't a cell at all.
+pub const TWIG_ALIGN_NONE: c_int = -1;
+pub const TWIG_ALIGN_DEFAULT: c_int = 0;
+pub const TWIG_ALIGN_LEFT: c_int = 1;
+pub const TWIG_ALIGN_RIGHT: c_int = 2;
+pub const TWIG_ALIGN_CENTER: c_int = 3;
 
 pub const TwigDocument = opaque {};
 
@@ -192,7 +216,10 @@ pub export fn twig_version_string() [*:0]const u8 {
 /// A consumer records the `TWIG_ABI_VERSION` it compiled against and can call
 /// `twig_abi_version` at load time to confirm the library it linked speaks the
 /// same layout.
-pub const TWIG_ABI_VERSION: u32 = 1;
+/// 2: `TwigFlatNode` grew `head`/`alignment` (96 → 104 bytes). Appended, so
+/// every prior field kept its offset, but `@sizeOf` is part of the layout a
+/// consumer strides an array with — that's a bump.
+pub const TWIG_ABI_VERSION: u32 = 2;
 
 pub export fn twig_abi_version() u32 {
     return TWIG_ABI_VERSION;
@@ -228,7 +255,7 @@ comptime {
         assert(@offsetOf(TwigChange, "old") == 0);
         assert(@offsetOf(TwigChange, "new") == 16);
 
-        assert(@sizeOf(TwigFlatNode) == 96);
+        assert(@sizeOf(TwigFlatNode) == 104);
         assert(@offsetOf(TwigFlatNode, "id") == 0);
         assert(@offsetOf(TwigFlatNode, "parent") == 4);
         assert(@offsetOf(TwigFlatNode, "first_child") == 8);
@@ -242,6 +269,8 @@ comptime {
         assert(@offsetOf(TwigFlatNode, "text_len") == 72);
         assert(@offsetOf(TwigFlatNode, "destination_ptr") == 80);
         assert(@offsetOf(TwigFlatNode, "destination_len") == 88);
+        assert(@offsetOf(TwigFlatNode, "head") == 96);
+        assert(@offsetOf(TwigFlatNode, "alignment") == 100);
 
         assert(@sizeOf(TwigKeyVal) == 32);
         assert(@offsetOf(TwigKeyVal, "key") == 0);
@@ -1010,6 +1039,32 @@ fn kindLevel(node: *const twig.AST.Node) u32 {
     };
 }
 
+/// A `row`/`cell`'s header flag as a tri-state: 1 true, 0 false, -1 "not that
+/// kind" — a table renderer needs to tell a header row from a body row.
+fn kindHead(node: *const twig.AST.Node) c_int {
+    return switch (node.kind) {
+        .row => |r| @intFromBool(r.head),
+        .cell => |c| @intFromBool(c.head),
+        else => TWIG_HEAD_NONE,
+    };
+}
+
+/// A `cell`'s column alignment as a `TWIG_ALIGN_*` code, or `TWIG_ALIGN_NONE`
+/// for every other kind. The Markdown/Djot delimiter row (`|:--|--:|`) is
+/// consumed by the parser and has no node of its own, so this is the only way
+/// a consumer can recover the column alignment.
+fn kindAlignment(node: *const twig.AST.Node) c_int {
+    return switch (node.kind) {
+        .cell => |c| switch (c.alignment) {
+            .default => TWIG_ALIGN_DEFAULT,
+            .left => TWIG_ALIGN_LEFT,
+            .right => TWIG_ALIGN_RIGHT,
+            .center => TWIG_ALIGN_CENTER,
+        },
+        else => TWIG_ALIGN_NONE,
+    };
+}
+
 /// The node's primary text payload (a `str`'s bytes, a `code_block`'s body, …),
 /// or `null` for kinds that carry none. Borrows the AST-owned payload.
 fn kindText(node: *const twig.AST.Node) ?[]const u8 {
@@ -1170,6 +1225,8 @@ pub export fn twig_editor_nodes(
             .text_len = if (text) |t| t.len else 0,
             .destination_ptr = if (dest) |d| d.ptr else null,
             .destination_len = if (dest) |d| d.len else 0,
+            .head = kindHead(&node),
+            .alignment = kindAlignment(&node),
         };
     }
     // Parent pass: a `Node` stores children, not its parent, so derive it by

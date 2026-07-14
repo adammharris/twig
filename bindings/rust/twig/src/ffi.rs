@@ -3,7 +3,7 @@ use std::os::raw::{c_char, c_int};
 /// The C ABI contract version this binding is written against; see
 /// `twig_abi_version`. Must match the value baked into the linked library
 /// (asserted at runtime by the `abi_version_matches` test in `lib.rs`).
-pub const TWIG_ABI_VERSION: u32 = 1;
+pub const TWIG_ABI_VERSION: u32 = 2;
 
 // Freeze the canonical 64-bit layout of every `#[repr(C)]` mirror below so it
 // can never silently drift from the Zig `extern struct` it shadows. These are
@@ -31,7 +31,7 @@ const _: () = {
     assert!(offset_of!(TwigChange, old_span) == 0);
     assert!(offset_of!(TwigChange, new_span) == 16);
 
-    assert!(size_of::<TwigFlatNode>() == 96);
+    assert!(size_of::<TwigFlatNode>() == 104);
     assert!(offset_of!(TwigFlatNode, id) == 0);
     assert!(offset_of!(TwigFlatNode, parent) == 4);
     assert!(offset_of!(TwigFlatNode, first_child) == 8);
@@ -45,6 +45,8 @@ const _: () = {
     assert!(offset_of!(TwigFlatNode, text_len) == 72);
     assert!(offset_of!(TwigFlatNode, destination_ptr) == 80);
     assert!(offset_of!(TwigFlatNode, destination_len) == 88);
+    assert!(offset_of!(TwigFlatNode, head) == 96);
+    assert!(offset_of!(TwigFlatNode, alignment) == 100);
 
     assert!(size_of::<TwigKeyVal>() == 32);
     assert!(offset_of!(TwigKeyVal, key) == 0);
@@ -142,6 +144,8 @@ pub struct TwigChange {
 /// [`TWIG_NO_NODE`]. `content_span` is meaningful only when `has_content_span`.
 /// `kind` is static, library-owned storage; `text`/`destination` pointers
 /// borrow the current parse's payloads (NULL when the kind carries none).
+/// `head`/`alignment` carry a `row`/`cell` payload, each `-1` for a kind that
+/// has none (see [`TWIG_HEAD_NONE`] / [`TWIG_ALIGN_NONE`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct TwigFlatNode {
@@ -158,7 +162,22 @@ pub struct TwigFlatNode {
     pub text_len: usize,
     pub destination_ptr: *const u8,
     pub destination_len: usize,
+    pub head: c_int,
+    pub alignment: c_int,
 }
+
+/// `TwigFlatNode::head` for a node that is neither a `row` nor a `cell`.
+pub const TWIG_HEAD_NONE: c_int = -1;
+
+/// `TwigFlatNode::alignment` codes; `NONE` means the node isn't a `cell`.
+/// `NONE` is part of the ABI contract even though `Alignment::from_c` folds it
+/// into its catch-all, so spell it out rather than leaving the -1 a mystery.
+#[allow(dead_code)]
+pub const TWIG_ALIGN_NONE: c_int = -1;
+pub const TWIG_ALIGN_DEFAULT: c_int = 0;
+pub const TWIG_ALIGN_LEFT: c_int = 1;
+pub const TWIG_ALIGN_RIGHT: c_int = 2;
+pub const TWIG_ALIGN_CENTER: c_int = 3;
 
 unsafe extern "C" {
     pub fn twig_abi_version() -> u32;

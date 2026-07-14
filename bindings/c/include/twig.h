@@ -24,7 +24,10 @@ extern "C" {
 //
 // A consumer records TWIG_ABI_VERSION at compile time and may call
 // twig_abi_version() at load time to confirm the linked library agrees.
-#define TWIG_ABI_VERSION 1
+// 2: TwigFlatNode grew head/alignment (96 -> 104 bytes). The new fields are
+//    appended, so every prior field kept its offset, but sizeof is part of the
+//    layout a consumer strides an array with — hence the bump.
+#define TWIG_ABI_VERSION 2
 
 #define TWIG_FORMAT_DJOT 1
 #define TWIG_FORMAT_MARKDOWN 2
@@ -106,6 +109,12 @@ typedef struct TwigChange {
 // current parse and stay valid until the next successful edit or
 // twig_editor_destroy; each pointer is NULL when the kind carries no such
 // payload.
+//
+// `head` and `alignment` surface a row/cell payload the way `level` surfaces a
+// heading's, so a table can be rendered from the snapshot alone. Each is -1
+// (TWIG_HEAD_NONE / TWIG_ALIGN_NONE) for a kind that carries no such payload —
+// not `level`'s 0-means-absent trick, because a cell's TWIG_ALIGN_DEFAULT is
+// itself a meaningful value.
 typedef struct TwigFlatNode {
     uint32_t id;
     uint32_t parent;
@@ -120,7 +129,21 @@ typedef struct TwigFlatNode {
     size_t text_len;
     const uint8_t *destination_ptr;
     size_t destination_len;
+    int head;
+    int alignment;
 } TwigFlatNode;
+
+// TwigFlatNode.head for a node that is neither a row nor a cell.
+#define TWIG_HEAD_NONE (-1)
+
+// TwigFlatNode.alignment codes. NONE means the node isn't a cell at all; the
+// delimiter row (|:--|--:|) that spells the alignment out is consumed by the
+// parser and has no node, so this is the only way to recover it.
+#define TWIG_ALIGN_NONE (-1)
+#define TWIG_ALIGN_DEFAULT 0
+#define TWIG_ALIGN_LEFT 1
+#define TWIG_ALIGN_RIGHT 2
+#define TWIG_ALIGN_CENTER 3
 
 // The C ABI contract version (see the "ABI stability contract" above); compare
 // against the TWIG_ABI_VERSION you compiled with to detect a layout mismatch.
