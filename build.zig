@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "twig", .module = mod },
+                .{ .name = "build_options", .module = options_mod },
             },
         }),
     });

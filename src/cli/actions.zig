@@ -20,6 +20,7 @@ const Io = std.Io;
 const Writer = std.Io.Writer;
 
 const twig = @import("twig");
+const build_options = @import("build_options");
 
 const format = @import("format.zig");
 const args_mod = @import("args.zig");
@@ -39,10 +40,15 @@ pub const ActionError = error{ActionFailed};
 /// freed mid-process.
 const max_source_bytes = 16 * 1024 * 1024;
 
-const version = "twig 0.1.0";
-
 pub fn runVersion(stdout: *Writer) !void {
-    try stdout.print("{s}\n", .{version});
+    // Version comes from build.zig.zon (via build_options), the single source
+    // of truth — never hardcode it here, or `twig --version` drifts from the
+    // released tag (and the Homebrew formula's version test fails).
+    try stdout.print("twig {d}.{d}.{d}\n", .{
+        build_options.version_major,
+        build_options.version_minor,
+        build_options.version_patch,
+    });
     try stdout.flush();
 }
 
