@@ -259,6 +259,27 @@ unsafe extern "C" {
         out_ptr: *mut *const TwigQueryMatch,
         out_len: *mut usize,
     ) -> TwigStatus;
+    pub fn twig_editor_wrap_range(
+        editor: *mut TwigEditor,
+        start: usize,
+        end: usize,
+        kind: c_int,
+        out_change: *mut TwigChange,
+    ) -> TwigStatus;
+    pub fn twig_editor_toggle_inline(
+        editor: *mut TwigEditor,
+        start: usize,
+        end: usize,
+        kind: c_int,
+        out_change: *mut TwigChange,
+    ) -> TwigStatus;
+    pub fn twig_editor_set_block(
+        editor: *mut TwigEditor,
+        offset: usize,
+        block_kind: c_int,
+        level: u32,
+        out_change: *mut TwigChange,
+    ) -> TwigStatus;
 
     pub fn twig_builder_create(out_builder: *mut *mut TwigBuilder) -> TwigStatus;
     pub fn twig_builder_destroy(builder: *mut TwigBuilder);

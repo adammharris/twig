@@ -88,6 +88,55 @@ pub struct FlatNode {
     pub destination: Option<String>,
 }
 
+/// An inline mark for [`Editor::wrap_range`] / [`Editor::toggle_inline`] — a
+/// rich editor's Bold / Italic / Code / … buttons. Markdown spells only
+/// [`InlineKind::Strong`], [`InlineKind::Emph`], and [`InlineKind::Verbatim`];
+/// Djot spells all of them. An unsupported kind yields [`Error::UnsupportedFormat`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InlineKind {
+    Strong,
+    Emph,
+    Verbatim,
+    Mark,
+    Superscript,
+    Subscript,
+    Insert,
+    Delete,
+}
+
+impl InlineKind {
+    fn to_c(self) -> c_int {
+        match self {
+            InlineKind::Strong => 0,
+            InlineKind::Emph => 1,
+            InlineKind::Verbatim => 2,
+            InlineKind::Mark => 3,
+            InlineKind::Superscript => 4,
+            InlineKind::Subscript => 5,
+            InlineKind::Insert => 6,
+            InlineKind::Delete => 7,
+        }
+    }
+}
+
+/// A block target for [`Editor::set_block`] — the toolbar's H1…H6 / Body switch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockKind {
+    Paragraph,
+    /// A heading of the given level (1–6; out of range is [`Error::InvalidArgument`]).
+    Heading(u32),
+}
+
+impl BlockKind {
+    /// `(block_kind_code, level)` for the C ABI.
+    fn to_c(self) -> (c_int, u32) {
+        match self {
+            BlockKind::Paragraph => (0, 0),
+            BlockKind::Heading(level) => (1, level),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Version {
     pub major: u8,
@@ -475,6 +524,57 @@ impl Editor {
         }
         let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
         raw.iter().map(query_match_from_ffi).collect()
+    }
+
+    // ── range-oriented rich-text ops (the toolbar) ──────────────────────────
+
+    /// Wrap `[start, end)` with `kind`'s delimiters — the unconditional half of
+    /// the inline toolbar (always adds a mark; `*word*` → `**word**` stacks).
+    /// [`Error::UnsupportedFormat`] if the document's format can't spell `kind`
+    /// (e.g. a Markdown [`InlineKind::Mark`]); [`Error::InvalidArgument`] for a
+    /// bad range; [`Error::EditConflict`] if the result doesn't reparse.
+    pub fn wrap_range(&mut self, start: usize, end: usize, kind: InlineKind) -> Result<Change, Error> {
+        self.change_op(|ed, out| unsafe {
+            ffi::twig_editor_wrap_range(ed, start, end, kind.to_c(), out)
+        })
+    }
+
+    /// Toggle `kind` over `[start, end)`: remove the mark if the range already
+    /// *is* a node of `kind` (its whole span or its rendered interior), else
+    /// wrap it — a rich editor's Cmd-B. Same error rules as
+    /// [`Editor::wrap_range`].
+    pub fn toggle_inline(&mut self, start: usize, end: usize, kind: InlineKind) -> Result<Change, Error> {
+        self.change_op(|ed, out| unsafe {
+            ffi::twig_editor_toggle_inline(ed, start, end, kind.to_c(), out)
+        })
+    }
+
+    /// Convert the innermost heading/paragraph covering byte `offset` to `kind`,
+    /// rewriting its leading marker while keeping its inline content (the
+    /// toolbar's H1…H6 / Body switch). Djot and Markdown only, else
+    /// [`Error::UnsupportedFormat`]; [`Error::NotFound`] if no heading/paragraph
+    /// covers `offset`; [`Error::InvalidArgument`] for a heading level outside
+    /// 1–6.
+    pub fn set_block(&mut self, offset: usize, kind: BlockKind) -> Result<Change, Error> {
+        let (block_kind, level) = kind.to_c();
+        self.change_op(|ed, out| unsafe {
+            ffi::twig_editor_set_block(ed, offset, block_kind, level, out)
+        })
+    }
+
+    /// Shared plumbing for the change-returning ops: run `op` (which fills a
+    /// `TwigChange` out-param) and wrap the result.
+    fn change_op(
+        &mut self,
+        op: impl FnOnce(*mut ffi::TwigEditor, *mut ffi::TwigChange) -> ffi::TwigStatus,
+    ) -> Result<Change, Error> {
+        let mut change = ffi::TwigChange {
+            old_span: ffi::TwigSpan { start: 0, end: 0 },
+            new_span: ffi::TwigSpan { start: 0, end: 0 },
+        };
+        let status = op(self.raw.as_ptr(), &mut change);
+        Error::from_status(status)?;
+        Ok(Change::from_ffi(change))
     }
 
     /// Shared plumbing for the `(locator, text)` edit ops.
@@ -1293,6 +1393,80 @@ mod tests {
 
         // An out-of-range offset is an error; a gap covers nothing deeper than doc.
         assert_eq!(ed.node_at(999), Err(Error::InvalidArgument));
+    }
+
+    // ── range-oriented rich-text ops (P5) ───────────────────────────────────
+
+    #[test]
+    fn editor_wrap_and_toggle_inline_round_trip() {
+        let mut ed = Editor::new_str("a word b\n", Format::Markdown).expect("editor");
+
+        // Bold "word" [2,6); the Change reports the new "**word**" region.
+        let c = ed.wrap_range(2, 6, InlineKind::Strong).expect("wrap");
+        assert_eq!(ed.source_str().unwrap(), "a **word** b\n");
+        assert_eq!(&ed.source_str().unwrap()[c.new.clone()], "**word**");
+
+        // Toggle it off by selecting the strong node's interior [4,8).
+        ed.toggle_inline(4, 8, InlineKind::Strong).expect("toggle off");
+        assert_eq!(ed.source_str().unwrap(), "a word b\n");
+
+        // Toggle emphasis on when the range isn't already marked.
+        ed.toggle_inline(2, 6, InlineKind::Emph).expect("toggle on");
+        assert_eq!(ed.source_str().unwrap(), "a *word* b\n");
+    }
+
+    #[test]
+    fn editor_inline_kind_support_is_format_specific() {
+        // Markdown has no highlight/mark spelling.
+        let mut md = Editor::new_str("a word b\n", Format::Markdown).expect("editor");
+        assert_eq!(md.wrap_range(2, 6, InlineKind::Mark), Err(Error::UnsupportedFormat));
+
+        // Djot spells it {=…=}.
+        let mut dj = Editor::new_str("a word b\n", Format::Djot).expect("editor");
+        dj.wrap_range(2, 6, InlineKind::Mark).expect("djot mark");
+        assert_eq!(dj.source_str().unwrap(), "a {=word=} b\n");
+    }
+
+    #[test]
+    fn editor_toggle_strips_verbatim_without_content_span() {
+        let mut ed = Editor::new_str("a `code` b\n", Format::Markdown).expect("editor");
+        // The verbatim node [2,8) has no content_span; toggle peels the backticks.
+        ed.toggle_inline(2, 8, InlineKind::Verbatim).expect("toggle code off");
+        assert_eq!(ed.source_str().unwrap(), "a code b\n");
+    }
+
+    #[test]
+    fn editor_set_block_switches_para_and_heading_levels() {
+        let mut ed = Editor::new_str("Title\n\nbody text\n", Format::Markdown).expect("editor");
+
+        // Paragraph -> H2 (offset 0 is inside "Title").
+        ed.set_block(0, BlockKind::Heading(2)).expect("to h2");
+        assert_eq!(ed.source_str().unwrap(), "## Title\n\nbody text\n");
+
+        // H2 -> H1 (offset now inside "## Title").
+        ed.set_block(3, BlockKind::Heading(1)).expect("to h1");
+        assert_eq!(ed.source_str().unwrap(), "# Title\n\nbody text\n");
+
+        // Heading -> paragraph, dropping the marker.
+        ed.set_block(2, BlockKind::Paragraph).expect("to para");
+        assert_eq!(ed.source_str().unwrap(), "Title\n\nbody text\n");
+    }
+
+    #[test]
+    fn editor_set_block_rejects_bad_level_and_format() {
+        let mut md = Editor::new_str("hi\n", Format::Markdown).expect("editor");
+        assert_eq!(md.set_block(0, BlockKind::Heading(9)), Err(Error::InvalidArgument));
+
+        let mut xml = Editor::new_str("<a>hi</a>", Format::Xml).expect("editor");
+        assert_eq!(xml.set_block(1, BlockKind::Heading(1)), Err(Error::UnsupportedFormat));
+    }
+
+    #[test]
+    fn editor_set_block_converts_setext_heading() {
+        // A setext heading rebuilt from its content_span collapses the underline.
+        let mut ed = Editor::new_str("Title\n=====\n\nbody\n", Format::Markdown).expect("editor");
+        ed.set_block(0, BlockKind::Heading(1)).expect("setext to atx");
+        assert_eq!(ed.source_str().unwrap(), "# Title\n\nbody\n");
     }
 
     #[test]

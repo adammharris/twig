@@ -465,6 +465,10 @@ pub const TwigEditor = opaque {};
 
 const EditorHandle = struct {
     editor: twig.Editor,
+    /// The document's format — the reparse callback captures it, but the
+    /// range-oriented ops (`wrap_range`/`toggle_inline`/`set_block`) also need
+    /// it to pick format-specific delimiters, so it's kept explicitly.
+    format: TwigFormat,
     /// The parse configuration the editor's reparse callback borrows (via
     /// `twig.Editor.ParseFn`'s `ctx`). Stored ON the handle so its address is
     /// stable for the handle's whole lifetime — the editor holds `&this`.
@@ -582,7 +586,7 @@ pub export fn twig_editor_create_ext(
     // Set the config BEFORE `Editor.init` (which reads it via the ctx pointer on
     // its initial parse); the editor stores `&handle.parse_config`, stable for
     // the handle's lifetime.
-    handle.* = .{ .editor = undefined, .parse_config = .{ .markdown = markdownOptionsFromFlags(md_flags) } };
+    handle.* = .{ .editor = undefined, .format = target, .parse_config = .{ .markdown = markdownOptionsFromFlags(md_flags) } };
     handle.editor = twig.Editor.init(allocator, source, &handle.parse_config, parseFnFor(target)) catch |err| {
         allocator.destroy(handle);
         return switch (err) {
@@ -1183,6 +1187,223 @@ fn flatMatch(ast: *const twig.AST, id: twig.AST.Node.Id) TwigQueryMatch {
         .has_content_span = if (node.content_span != null) 1 else 0,
         .kind = kindName(node),
     };
+}
+
+// ── Range-oriented rich-text ops (the toolbar, P5) ───────────────────────────
+// wrap_range / toggle_inline / set_block: a caret editor's Bold / Italic / Code
+// buttons and its H1 / Body switch. The format-specific knowledge (which
+// delimiters mark a `strong`, how a heading is spelled) lives HERE, at the
+// boundary that knows the format; the `twig.Editor` engine stays language-
+// agnostic (it's handed delimiter bytes and a `Node.Kind` tag).
+
+/// The inline mark kinds `twig_editor_wrap_range` / `_toggle_inline` accept
+/// (C ABI enum; values are the wire contract, mirrored by `TwigInlineKind` in
+/// `twig.h`).
+const TwigInlineKind = enum(c_int) {
+    strong = 0,
+    emph = 1,
+    verbatim = 2,
+    mark = 3,
+    superscript = 4,
+    subscript = 5,
+    insert = 6,
+    delete = 7,
+};
+
+/// The block kinds `twig_editor_set_block` converts to.
+const TwigBlockKind = enum(c_int) {
+    paragraph = 0,
+    heading = 1,
+};
+
+/// Map a raw C `int` to a `TwigInlineKind`, or `null` if it names none.
+fn inlineKindFromInt(v: c_int) ?TwigInlineKind {
+    return switch (v) {
+        0 => .strong,
+        1 => .emph,
+        2 => .verbatim,
+        3 => .mark,
+        4 => .superscript,
+        5 => .subscript,
+        6 => .insert,
+        7 => .delete,
+        else => null,
+    };
+}
+
+/// Map a raw C `int` to a `TwigBlockKind`, or `null` if it names none.
+fn blockKindFromInt(v: c_int) ?TwigBlockKind {
+    return switch (v) {
+        0 => .paragraph,
+        1 => .heading,
+        else => null,
+    };
+}
+
+const Delims = struct { open: []const u8, close: []const u8 };
+
+/// The source delimiters that mark `kind` in `format`, or `null` when the
+/// format has no lightweight spelling for it (Markdown has only strong / emph /
+/// verbatim; XML and HTML have no lightweight inline markup at all). Values are
+/// exactly what each format's serializer emits, so a wrap round-trips.
+fn inlineDelims(format: TwigFormat, kind: TwigInlineKind) ?Delims {
+    return switch (format) {
+        .markdown => switch (kind) {
+            .strong => .{ .open = "**", .close = "**" },
+            .emph => .{ .open = "*", .close = "*" },
+            .verbatim => .{ .open = "`", .close = "`" },
+            else => null,
+        },
+        .djot => switch (kind) {
+            .strong => .{ .open = "*", .close = "*" },
+            .emph => .{ .open = "_", .close = "_" },
+            .verbatim => .{ .open = "`", .close = "`" },
+            .mark => .{ .open = "{=", .close = "=}" },
+            .superscript => .{ .open = "^", .close = "^" },
+            .subscript => .{ .open = "~", .close = "~" },
+            .insert => .{ .open = "{+", .close = "+}" },
+            .delete => .{ .open = "{-", .close = "-}" },
+        },
+        else => null,
+    };
+}
+
+/// The `Node.Kind` tag an inline kind detects as, for `toggleInline`'s
+/// "already marked?" test.
+fn inlineKindTag(kind: TwigInlineKind) twig.Editor.KindTag {
+    return switch (kind) {
+        .strong => .strong,
+        .emph => .emph,
+        .verbatim => .verbatim,
+        .mark => .mark,
+        .superscript => .superscript,
+        .subscript => .subscript,
+        .insert => .insert,
+        .delete => .delete,
+    };
+}
+
+/// Wrap `[start, end)` of the source with `kind`'s delimiters — the
+/// unconditional half of the inline toolbar (always adds a mark). `start <=
+/// end <= ` source length, else `invalid_argument`; a kind the format can't
+/// spell is `unsupported_format`; a reparse-breaking result rolls back to
+/// `edit_conflict`. On success fills `out_change` if non-NULL.
+pub export fn twig_editor_wrap_range(
+    ed: ?*TwigEditor,
+    start: usize,
+    end: usize,
+    kind: c_int,
+    out_change: ?*TwigChange,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const handle = asEditor(raw);
+    if (start > end or end > handle.editor.sourceBytes().len) return .invalid_argument;
+    const ik = inlineKindFromInt(kind) orelse return .invalid_argument;
+    const d = inlineDelims(handle.format, ik) orelse return .unsupported_format;
+
+    handle.editor.wrapRange(twig.Span.init(start, end), d.open, d.close) catch |err| switch (err) {
+        error.OutOfMemory => return .out_of_memory,
+        else => return .edit_conflict,
+    };
+    if (out_change) |slot| slot.* = changeC(handle.editor.last_change.?);
+    return .ok;
+}
+
+/// Toggle `kind` over `[start, end)`: strip the mark if the range already *is*
+/// a node of `kind` (its whole span or its interior), else wrap it — a rich
+/// editor's Cmd-B. Same argument/format/rollback rules as
+/// `twig_editor_wrap_range`; a matched-but-unrecoverable mark is `not_editable`.
+pub export fn twig_editor_toggle_inline(
+    ed: ?*TwigEditor,
+    start: usize,
+    end: usize,
+    kind: c_int,
+    out_change: ?*TwigChange,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const handle = asEditor(raw);
+    if (start > end or end > handle.editor.sourceBytes().len) return .invalid_argument;
+    const ik = inlineKindFromInt(kind) orelse return .invalid_argument;
+    const d = inlineDelims(handle.format, ik) orelse return .unsupported_format;
+
+    handle.editor.toggleInline(twig.Span.init(start, end), inlineKindTag(ik), d.open, d.close) catch |err| switch (err) {
+        error.OutOfMemory => return .out_of_memory,
+        error.NoNodeSpan, error.NoContentSpan => return .not_editable,
+        else => return .edit_conflict,
+    };
+    if (out_change) |slot| slot.* = changeC(handle.editor.last_change.?);
+    return .ok;
+}
+
+/// The innermost `heading`/`para` block on the descent to `offset`, or `null`.
+fn innermostBlock(ast: *const twig.AST, offset: usize, source_len: usize) ?twig.AST.Node.Id {
+    var result: ?twig.AST.Node.Id = null;
+    var cur = ast.root;
+    while (true) {
+        switch (std.meta.activeTag(ast.nodes[cur].kind)) {
+            .heading, .para => result = cur,
+            else => {},
+        }
+        cur = childContaining(ast, cur, offset, source_len) orelse break;
+    }
+    return result;
+}
+
+/// Convert the block at `offset` to `block_kind` (a `level`-N heading, or a
+/// paragraph) by rewriting its leading marker while keeping its inline content
+/// verbatim — the block half of the toolbar (H1 / Body). Works for Djot and
+/// Markdown (both spell headings `#`…); other formats are `unsupported_format`.
+/// `not_found` if no `heading`/`para` covers `offset`; `invalid_argument` for a
+/// heading `level` outside 1–6 or an `offset` past the source.
+pub export fn twig_editor_set_block(
+    ed: ?*TwigEditor,
+    offset: usize,
+    block_kind: c_int,
+    level: u32,
+    out_change: ?*TwigChange,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const handle = asEditor(raw);
+    switch (handle.format) {
+        .markdown, .djot => {},
+        else => return .unsupported_format,
+    }
+    const bk = blockKindFromInt(block_kind) orelse return .invalid_argument;
+    if (bk == .heading and (level < 1 or level > 6)) return .invalid_argument;
+
+    const src = handle.editor.sourceBytes();
+    if (offset > src.len) return .invalid_argument;
+    const ast = handle.editor.astView();
+    const block = innermostBlock(ast, offset, src.len) orelse return .not_found;
+    const node = ast.nodes[block];
+    const cs = node.content_span orelse return .not_editable;
+    const content = src[cs.start..cs.end];
+
+    // Rewrite [block start, end-of-text): the leading `#`-marker region (a
+    // heading) or nothing (a paragraph), plus the text — but NOT any trailing
+    // newline the block span includes (Djot blocks do), so we don't fuse with
+    // the next block. Rebuilding from `content_span` also collapses a setext
+    // heading's underline line away for free.
+    var end = node.span.end;
+    if (end > node.span.start and src[end - 1] == '\n') end -= 1;
+    if (end > node.span.start and src[end - 1] == '\r') end -= 1;
+
+    const allocator = activeAllocator();
+    const prefix_len: usize = if (bk == .heading) level + 1 else 0; // "#"*level + " "
+    const buf = allocator.alloc(u8, prefix_len + content.len) catch return .out_of_memory;
+    defer allocator.free(buf);
+    if (bk == .heading) {
+        @memset(buf[0..level], '#');
+        buf[level] = ' ';
+    }
+    @memcpy(buf[prefix_len..], content);
+
+    handle.editor.replaceAtSpan(twig.Span.init(node.span.start, end), buf) catch |err| switch (err) {
+        error.OutOfMemory => return .out_of_memory,
+        else => return .edit_conflict,
+    };
+    if (out_change) |slot| slot.* = changeC(handle.editor.last_change.?);
+    return .ok;
 }
 
 // ── Builder ──────────────────────────────────────────────────────────────────

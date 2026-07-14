@@ -322,6 +322,27 @@ TwigStatus twig_editor_query(
     size_t *out_len
 );
 
+// Inline mark kinds for twig_editor_wrap_range / twig_editor_toggle_inline.
+// Markdown spells only STRONG / EMPH / VERBATIM; Djot spells all of them.
+// (The integer values are the wire contract — do not renumber.)
+typedef enum TwigInlineKind {
+    TWIG_INLINE_STRONG = 0,
+    TWIG_INLINE_EMPH = 1,
+    TWIG_INLINE_VERBATIM = 2,
+    TWIG_INLINE_MARK = 3,
+    TWIG_INLINE_SUPERSCRIPT = 4,
+    TWIG_INLINE_SUBSCRIPT = 5,
+    TWIG_INLINE_INSERT = 6,
+    TWIG_INLINE_DELETE = 7,
+} TwigInlineKind;
+
+// Block kinds for twig_editor_set_block. For TWIG_BLOCK_HEADING the `level`
+// argument (1–6) applies; for TWIG_BLOCK_PARAGRAPH it is ignored.
+typedef enum TwigBlockKind {
+    TWIG_BLOCK_PARAGRAPH = 0,
+    TWIG_BLOCK_HEADING = 1,
+} TwigBlockKind;
+
 // ── Offset-addressed editing & read-back ──────────────────────────────────────
 // The rich-text-editor surface: a caret speaks byte offsets, not locator
 // strings. edit_range is the raw splice a keystroke maps onto; node_at /
@@ -388,6 +409,48 @@ TwigStatus twig_editor_nodes_at(
     size_t offset,
     const TwigQueryMatch **out_ptr,
     size_t *out_len
+);
+
+// ── Range-oriented rich-text ops (the toolbar) ────────────────────────────────
+// A caret editor's Bold / Italic / Code buttons and its H1 / Body switch, done
+// format-aware: twig knows a Markdown strong is `**…**` and a Djot one `*…*`.
+
+// Wrap [start, end) of the source with `kind`'s delimiters (always adds a mark).
+// start <= end <= source length, else TWIG_STATUS_INVALID_ARGUMENT; a kind the
+// format can't spell is TWIG_STATUS_UNSUPPORTED_FORMAT; a reparse-breaking result
+// rolls back to TWIG_STATUS_EDIT_CONFLICT. Fills out_change on success if non-NULL.
+TwigStatus twig_editor_wrap_range(
+    TwigEditor *editor,
+    size_t start,
+    size_t end,
+    int kind,
+    TwigChange *out_change
+);
+
+// Toggle `kind` over [start, end): strip the mark if the range already is a node
+// of `kind` (its whole span or its interior), else wrap it — a rich editor's
+// Cmd-B. Same argument/format/rollback rules as twig_editor_wrap_range; a
+// matched-but-unrecoverable mark is TWIG_STATUS_NOT_EDITABLE.
+TwigStatus twig_editor_toggle_inline(
+    TwigEditor *editor,
+    size_t start,
+    size_t end,
+    int kind,
+    TwigChange *out_change
+);
+
+// Convert the innermost heading/paragraph covering byte `offset` to `block_kind`
+// (a `level`-N heading, or a paragraph), rewriting its leading marker while
+// keeping its inline content. Djot and Markdown only (both spell headings `#`…),
+// else TWIG_STATUS_UNSUPPORTED_FORMAT. TWIG_STATUS_NOT_FOUND if no heading/para
+// covers `offset`; TWIG_STATUS_INVALID_ARGUMENT for a heading `level` outside 1–6
+// or an `offset` past the source. Fills out_change on success if non-NULL.
+TwigStatus twig_editor_set_block(
+    TwigEditor *editor,
+    size_t offset,
+    int block_kind,
+    uint32_t level,
+    TwigChange *out_change
 );
 
 // ── Builder ───────────────────────────────────────────────────────────────────

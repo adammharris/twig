@@ -314,6 +314,77 @@ pub const Editor = struct {
         const interior = self.source.items[cs.start..cs.end];
         try self.replaceAtSpan(span, interior);
     }
+
+    // ── range-oriented rich-text ops (the "toolbar", P5) ─────────────────────
+    // These stay language-agnostic: the caller (which knows the format) supplies
+    // the delimiter bytes and the target `Node.Kind` tag, so this engine never
+    // imports a language module. The format→delimiter table lives at the C-ABI
+    // boundary. `wrapRange` always adds; `toggleInline` adds or removes based on
+    // whether the range already *is* a node of that kind.
+
+    /// The tag half of `Node.Kind` — a plain enum of kind names, what a caller
+    /// names an inline kind by (`.strong`, `.emph`, …) without its payload.
+    pub const KindTag = std.meta.Tag(Node.Kind);
+
+    /// Wrap `[span.start, span.end)` with `open`/`close` in a single splice
+    /// (one reparse), e.g. `*`…`*` to bold a selection. Losslessly reversible
+    /// by `toggleInline`. The reparse validates the result; a delimiter that
+    /// doesn't parse in context rolls the edit back like any other.
+    pub fn wrapRange(self: *Editor, span: Span, open: []const u8, close: []const u8) !void {
+        std.debug.assert(span.start <= span.end);
+        std.debug.assert(span.end <= self.source.items.len);
+        const interior = self.source.items[span.start..span.end];
+        const buf = try self.allocator.alloc(u8, open.len + interior.len + close.len);
+        defer self.allocator.free(buf);
+        @memcpy(buf[0..open.len], open);
+        @memcpy(buf[open.len..][0..interior.len], interior);
+        @memcpy(buf[open.len + interior.len ..], close);
+        try self.replaceAtSpan(span, buf);
+    }
+
+    /// Toggle an inline mark of `kind` over `span`. If `span` already *is* a
+    /// node of `kind` — its whole span or its interior `content_span` exactly
+    /// equal to `span` — the mark is removed (delimiters stripped); otherwise
+    /// `span` is wrapped with `open`/`close`. Mirrors a rich editor's Cmd-B:
+    /// select a word, bold it; select it again, un-bold it.
+    pub fn toggleInline(self: *Editor, span: Span, kind: KindTag, open: []const u8, close: []const u8) !void {
+        const id = self.inlineNodeCovering(span, kind) orelse
+            return self.wrapRange(span, open, close);
+
+        const node = self.ast.nodes[id];
+        // Prefer the parser's interior (correct regardless of delimiter width);
+        // fall back to stripping the supplied delimiters for a kind the parser
+        // leaves without a `content_span` (e.g. `verbatim`). Both replacement
+        // slices alias `self.source`, which `replaceAtSpan` copies before
+        // retiring the old buffer — safe.
+        if (node.content_span) |cs| {
+            try self.replaceAtSpan(node.span, self.source.items[cs.start..cs.end]);
+            return;
+        }
+        const s = self.source.items[node.span.start..node.span.end];
+        if (s.len >= open.len + close.len and
+            std.mem.startsWith(u8, s, open) and std.mem.endsWith(u8, s, close))
+        {
+            try self.replaceAtSpan(node.span, s[open.len .. s.len - close.len]);
+            return;
+        }
+        // Matched a node of this kind but can't cleanly recover its interior.
+        return error.NoContentSpan;
+    }
+
+    /// The id of a node of `kind` whose whole span or interior exactly equals
+    /// `span` — the "is this selection already marked?" test behind
+    /// `toggleInline`. `null` if none.
+    fn inlineNodeCovering(self: *Editor, span: Span, kind: KindTag) ?Node.Id {
+        for (self.ast.nodes, 0..) |node, id| {
+            if (std.meta.activeTag(node.kind) != kind) continue;
+            if (node.span.eql(span)) return @intCast(id);
+            if (node.content_span) |cs| {
+                if (cs.eql(span)) return @intCast(id);
+            }
+        }
+        return null;
+    }
 };
 
 // ── smart-delete whitespace tidying ────────────────────────────────────────
@@ -523,6 +594,35 @@ test "last_change records the byte effect of the last successful edit" {
     try testing.expectError(error.MismatchedCloseTag, ed.replaceContent(&.{0}, "<b>"));
     const c2 = ed.last_change.?;
     try testing.expectEqual(@as(usize, 6), c2.new.end);
+}
+
+test "wrapRange bolds a selection; toggleInline removes it" {
+    var ed = try Editor.init(testing.allocator, "a word b\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+
+    // "word" is [2,6). Bold it (Markdown strong = **…**).
+    try ed.wrapRange(Span.init(2, 6), "**", "**");
+    try testing.expectEqualStrings("a **word** b\n", ed.sourceBytes());
+
+    // The strong node's interior is now "word" [4,8); toggle it back off.
+    try ed.toggleInline(Span.init(4, 8), .strong, "**", "**");
+    try testing.expectEqualStrings("a word b\n", ed.sourceBytes());
+}
+
+test "toggleInline wraps when the range isn't already marked" {
+    var ed = try Editor.init(testing.allocator, "a word b\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    try ed.toggleInline(Span.init(2, 6), .emph, "*", "*");
+    try testing.expectEqualStrings("a *word* b\n", ed.sourceBytes());
+}
+
+test "toggleInline strips a verbatim run by delimiter (no content_span)" {
+    var ed = try Editor.init(testing.allocator, "a `code` b\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    // The verbatim node is [2,8) "`code`" with no content_span; matched by whole
+    // span, its interior recovered by peeling the backticks.
+    try ed.toggleInline(Span.init(2, 8), .verbatim, "`", "`");
+    try testing.expectEqualStrings("a code b\n", ed.sourceBytes());
 }
 
 test "replaceContent on a leaf yields NoContentSpan" {
