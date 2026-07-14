@@ -15,6 +15,16 @@ env:
   ZIG_VERSION: "0.16.0"
 
 jobs:
+  # Cheap guard (no toolchain): the Rust workspace version must track
+  # build.zig.zon, the single source of truth. Catches a one-sided version bump
+  # on every push/PR instead of only at release-tag time.
+  version-sync:
+    name: version sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/sync-version.sh --check
+
   # Build the Zig library + CLI, run the test suite, and build the C ABI
   # static library and header across Linux and macOS. macOS is included
   # deliberately: the Rust binding's build.rs repacks the archive for
