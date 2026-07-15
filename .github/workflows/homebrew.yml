@@ -37,7 +37,7 @@ jobs:
     runs-on: macos-latest
     if: github.ref_type == 'tag'
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: mlugg/setup-zig@v2
       with: { version: "0.16.0" }
     - name: Build macOS arm64
@@ -49,7 +49,7 @@ jobs:
         zig build -Doptimize=ReleaseFast -Dtarget=x86_64-macos --prefix zig-out/macos-x64
         tar -czf twig-macos-x86_64.tar.gz -C zig-out/macos-x64/bin twig
     - name: Attach to the GitHub Release
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@v3
       with:
         tag_name: ${{ github.ref_name }}
         files: |
@@ -60,7 +60,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref_type == 'tag'
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: mlugg/setup-zig@v2
       with: { version: "0.16.0" }
     - name: Build Linux x86_64
@@ -72,7 +72,7 @@ jobs:
         zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux --prefix zig-out/linux-arm64
         tar -czf twig-linux-aarch64.tar.gz -C zig-out/linux-arm64/bin twig
     - name: Attach to the GitHub Release
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@v3
       with:
         tag_name: ${{ github.ref_name }}
         files: |
