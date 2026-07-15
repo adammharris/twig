@@ -73,7 +73,12 @@ impl Change {
 /// `text` is the node's primary payload (a `str`'s bytes, a `code_block`'s
 /// body, …) and `destination` a link/image target, each `None` when the kind
 /// carries no such payload.
+/// `#[non_exhaustive]`: a snapshot node is something twig *hands you*, never
+/// something you build, so it gains a field whenever a node kind's payload is
+/// surfaced (as `head`/`alignment` were for tables). Sealing construction here
+/// keeps every future addition a minor release instead of a major one.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct FlatNode {
     pub id: NodeId,
     pub parent: Option<NodeId>,
