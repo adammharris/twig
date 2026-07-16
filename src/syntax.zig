@@ -1,0 +1,174 @@
+//! What a format's *surface syntax* looks like — the spelling knowledge the
+//! authoring gestures in `ast/editor.zig` need, and the only thing standing
+//! between the language-agnostic `Splicer` and a working Cmd-B.
+//!
+//! ── Why this is a table and not a switch ───────────────────────────────────
+//! Twig's four formats are RAGGED: every one of them parses and renders, but
+//! only djot and Markdown can be *authored* into, and they don't even author
+//! the same set — djot spells all eight inline marks, Markdown only three
+//! (`**`/`*`/`` ` ``); XML and HTML spell none. A `?Delims` per (format, kind)
+//! makes that raggedness DATA. The alternative — a `switch (format)` per op,
+//! with an `else => unsupported_format` arm — is what the C ABI grew instead,
+//! and it put the spelling of djot's `{=mark=}` behind an `extern` boundary
+//! where the CLI couldn't reach it and only a C caller could test it.
+//!
+//! So: a `null` field means "this format has no spelling for that", and every
+//! caller turns that into one uniform "unsupported" error. Exactly how
+//! `format.zig`'s `serializeFromAst: ?*const fn(...)` already says "this
+//! language has no serializer yet".
+//!
+//! ── Why data, not behaviour ────────────────────────────────────────────────
+//! Everything here is a byte string or a flag except `spellsAutolink`, which
+//! has to run the format's OWN scanner (see below). That's deliberate: the
+//! *algorithms* — walk the destination escaping bytes, prefix each line of a
+//! covered block — are format-INDEPENDENT and live once in `ast/editor.zig`.
+//! Only the alphabet changes. Keeping the tables inert means a new format is a
+//! `Syntax` literal, not new code paths.
+//!
+//! `Syntax` names no format and imports no language module; `format.zig`'s
+//! registry is what binds a `Format` to its `Syntax`, and `ast/editor.zig`
+//! takes a `*const Syntax` without ever learning which format it came from.
+
+const std = @import("std");
+
+/// The inline marks a toolbar can wrap or toggle over a selection. Named for
+/// the `AST.Node.Kind` tags they parse back as — see `kindTag`.
+pub const InlineKind = enum {
+    strong,
+    emph,
+    verbatim,
+    mark,
+    superscript,
+    subscript,
+    insert,
+    delete,
+};
+
+/// The blocks `Editor.setBlock` converts between by rewriting a leading marker.
+pub const BlockKind = enum { paragraph, heading };
+
+/// The containers `Editor.toggleBlockContainer` wraps a block range in. Unlike
+/// a `BlockKind` these prefix EVERY line, they nest, and a list numbers its
+/// items — which is why they're a separate vocabulary.
+pub const ContainerKind = enum { block_quote, bullet_list, ordered_list };
+
+/// The source delimiters that mark an inline kind. Values are exactly what the
+/// format's serializer emits, so a wrap round-trips.
+pub const Delims = struct { open: []const u8, close: []const u8 };
+
+/// How a format spells a container's per-line prefix.
+pub const ContainerSpelling = struct {
+    /// Opens the container on the first line of each covered block.
+    marker: []const u8,
+    /// Holds a block's continuation lines inside the container.
+    cont: []const u8,
+    /// A blank line INSIDE the container. A blank line separates list items (it
+    /// merely makes the list loose) but BREAKS a quote in two, so a quote has to
+    /// mark its blanks and a list must not.
+    blank: []const u8,
+    /// The marker is a per-item ordinal (`1. `, `2. `…), built at emit time
+    /// rather than read from `marker`.
+    numbered: bool = false,
+};
+
+/// How a format escapes a link's `(destination)` position.
+///
+/// This is NOT `link_text_escapes`' alphabet: this one guards the position
+/// where parens end the destination and emphasis means nothing.
+pub const DestEscapes = struct {
+    /// Bytes to backslash-escape in the ordinary `(dest)` form.
+    plain: []const u8,
+    /// The `<dest>` form, used when the destination holds a space or tab —
+    /// `null` when the format has no angle form and must escape in place.
+    angle: ?struct {
+        /// Bytes to backslash-escape between the angle brackets. A different
+        /// alphabet: the brackets themselves now matter, parens no longer do.
+        escapes: []const u8,
+    } = null,
+};
+
+/// The spelling of a format that can't be authored into at all — every field
+/// left at "can't spell it". A parse-only language (XML, HTML) carries THIS
+/// rather than a `null`, which is what lets `Editor.syntax` be a plain pointer:
+/// every gesture consults a table, finds the `null` it would have found anyway,
+/// and reports unsupported through the one uniform path. There is no second
+/// "but does this format have a table at all?" question to forget to ask.
+pub const none: Syntax = .{};
+
+/// One format's surface spelling. Every field defaults to "can't spell it", so
+/// a format that only parses is `.{}` (see `none`) and every gesture over it
+/// reports unsupported without that format needing to say so.
+pub const Syntax = struct {
+    /// Delimiters per inline kind. `null` for a kind this format can't spell —
+    /// Markdown has no `{=mark=}`, so its `.mark` entry is `null`, and
+    /// `Editor.toggleInline(.mark)` on Markdown is `error.UnsupportedFormat`.
+    inline_delims: std.EnumArray(InlineKind, ?Delims) = .initFill(null),
+
+    /// Per-line prefixes per container kind.
+    container_spelling: std.EnumArray(ContainerKind, ?ContainerSpelling) = .initFill(null),
+
+    /// The byte that opens an ATX heading, repeated `level` times then a space.
+    /// `null` = this format has no heading marker, so `setBlock` is unsupported.
+    heading_marker: ?u8 = null,
+
+    /// The bytes a link's TEXT position must have backslash-escaped for the text
+    /// to reparse as the literal string handed in. Each one either opens a
+    /// construct that swallows the text — `*`/`_`/`` ` ``/`~`/`^` emphasis-ish
+    /// runs, djot's `{…}` attributes and `"`/`'`/`-`/`.`/`:` smart punctuation,
+    /// Markdown's `<…>` raw HTML and `&…;` entities — or breaks the brackets
+    /// outright (`[`/`]`/`\`).
+    ///
+    /// The sets differ because the metacharacters do: djot has attributes and no
+    /// entities, Markdown the reverse. Both read `\` + ASCII punctuation as that
+    /// literal character, so an escape here is always safe, never a stray
+    /// backslash.
+    ///
+    /// `null` = this format can't spell a link at all, and every link gesture
+    /// over it reports unsupported.
+    link_text_escapes: ?[]const u8 = null,
+
+    /// How to escape a link's destination. `null` alongside a non-null
+    /// `link_text_escapes` is a contradiction — see `assertCoherent`.
+    link_dest_escapes: ?DestEscapes = null,
+
+    /// Whether `angled` — a `<dest>` run, BRACKETS INCLUDED — spells an
+    /// autolink. `null` = this format has no autolink form.
+    ///
+    /// A function, not a table, because it must be asked of the format's OWN
+    /// scanner (the one its parser dispatches on) rather than re-derived here,
+    /// so it cannot drift from what a reparse will see. There is no shared rule
+    /// to hoist: the formats genuinely disagree. Markdown wants an absolute URI
+    /// (a 2-32 character `scheme:`) or a CommonMark email, and silently reads
+    /// anything else as raw HTML (`<foo>` is a tag!) or literal text. Djot
+    /// classifies on content alone — an `@` not preceded by `:` is an email,
+    /// else a `letter:` is a url — which is why `mailto:a@b.dev` is a `url` in
+    /// Markdown but an `email` in djot. Both refuse a relative path.
+    spellsAutolink: ?*const fn (angled: []const u8) bool = null,
+
+    /// Whether this format can be authored into at all — true once it can spell
+    /// any one gesture. `false` for a parse-only format (XML, HTML).
+    pub fn authorable(self: *const Syntax) bool {
+        return self.link_text_escapes != null or
+            self.heading_marker != null or
+            self.inline_delims.get(.strong) != null;
+    }
+
+    /// A `Syntax` literal is hand-maintained, so the invariants between its
+    /// fields are checked once at startup rather than trusted at every call
+    /// site — the same trust boundary `format.zig`'s registry relies on.
+    pub fn assertCoherent(self: *const Syntax) void {
+        // Text and destination escaping are two halves of spelling ONE link.
+        // A format with one but not the other would build `[text](` and then
+        // have nothing to say about what follows.
+        std.debug.assert((self.link_text_escapes == null) == (self.link_dest_escapes == null));
+    }
+};
+
+test "a parse-only format spells nothing" {
+    const s = Syntax{};
+    try std.testing.expect(!s.authorable());
+    try std.testing.expect(s.inline_delims.get(.strong) == null);
+    try std.testing.expect(s.container_spelling.get(.block_quote) == null);
+    try std.testing.expect(s.heading_marker == null);
+    s.assertCoherent();
+}

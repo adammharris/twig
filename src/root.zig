@@ -38,15 +38,51 @@ pub const Html = @import("languages/html/html.zig");
 /// `languages/markdown/markdown.zig`'s module doc comment for scope details.
 pub const Markdown = @import("languages/markdown/markdown.zig");
 
-/// The span-splice editor: lossless, in-place edits to a parsed document via
-/// index paths into the shared `AST`. Language-agnostic — construct it with a
-/// `parse_fn` for the source's format. See `ast/editor.zig`'s module doc
-/// comment for the reparse/rollback model and its current limits.
+/// The span-splice engine: lossless, in-place edits to a parsed document via
+/// index paths into the shared `AST`. Language-agnostic by construction —
+/// construct it with a `parse_fn` for the source's format and it never learns
+/// what that format was. See `ast/splicer.zig`'s module doc comment for the
+/// reparse/rollback model and its current limits.
+///
+/// For the authoring gestures a caret editor needs — Cmd-B, H1, quote, link —
+/// use `Editor`, which is this plus a `Syntax`.
+pub const Splicer = @import("ast/splicer.zig").Splicer;
+
+/// The authoring editor: a `Splicer` plus the `Syntax` table that says how its
+/// format is spelled. Hosts the gestures that need both an engine and a
+/// spelling — `toggleInline`, `setBlock`, `toggleBlockContainer`, `insertLink`.
+/// Build one from a `format.zig` registry entry, which pairs a language's
+/// `parseToAst` with its `syntax`. See `ast/editor.zig`'s module doc comment for
+/// why this layer exists and why it, not the engine, holds the `Editor` name.
 pub const Editor = @import("ast/editor.zig").Editor;
 
-/// A byte range `[start, end)` into the source — the currency of the span-
-/// splice editor and the offset-addressed `twig_editor_edit_range`/`node_at`
-/// C-ABI surface. See `span.zig`.
+/// What a format's surface syntax looks like — the delimiter/escape/spelling
+/// tables `Editor`'s gestures consult, and the `null`s that make a format's
+/// gaps (Markdown has no `{=mark=}`; XML has no inline markup at all) data
+/// rather than a `switch` arm. See `syntax.zig`.
+pub const Syntax = @import("syntax.zig").Syntax;
+
+/// The format registry: one entry per language, bundling its parser, reparse
+/// adapter, HTML renderer, optional serializers, and optional `Syntax` behind a
+/// uniform shape. The single place a new language plugs in, and the single
+/// source of `Format`. See `format.zig`.
+pub const format = @import("format.zig");
+
+/// Every language Twig can parse — re-exported from `format.zig` for reach.
+pub const Format = format.Format;
+
+/// Hit-testing: byte offset -> node (`deepestContaining`, `ancestorChain`), plus
+/// the line scanning the block gestures are built on. The addressing scheme a
+/// caret speaks. See `ast/locate.zig`.
+pub const locate = @import("ast/locate.zig");
+
+/// Locators: naming one node with a string that is either an index path
+/// (`0.2.1`) or a `Select` selector (`heading[level=2]`). See `ast/locator.zig`.
+pub const locator = @import("ast/locator.zig");
+
+/// A byte range `[start, end)` into the source — the currency of the span-splice
+/// engine, the authoring gestures, and the offset-addressed
+/// `twig_editor_edit_range`/`node_at` C-ABI surface. See `span.zig`.
 pub const Span = @import("span.zig");
 
 /// Content-based node addressing: `Select.parse` a CSS-lite selector (e.g.
@@ -56,7 +92,7 @@ pub const Span = @import("span.zig");
 /// See `ast/select.zig`'s module doc comment.
 pub const Select = @import("ast/select.zig");
 
-/// Declarative document pruning over `Select` + `Editor`: `Filter.apply` keeps
+/// Declarative document pruning over `Select` + `Splicer`: `Filter.apply` keeps
 /// only the family members (`drop` selector) matching a `keep` predicate,
 /// optionally unwrapping the survivors — the engine behind `twig filter`. See
 /// `ast/filter.zig`'s module doc comment.
@@ -74,7 +110,14 @@ test {
     _ = Xml;
     _ = Html;
     _ = Markdown;
+    _ = @import("ast/splicer.zig");
     _ = @import("ast/editor.zig");
+    _ = @import("ast/locate.zig");
+    _ = @import("ast/locator.zig");
+    _ = @import("syntax.zig");
+    _ = @import("format.zig");
+    _ = @import("languages/djot/syntax.zig");
+    _ = @import("languages/markdown/syntax.zig");
     _ = Select;
     _ = Filter;
     _ = ast_json;

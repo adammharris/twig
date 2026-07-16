@@ -1,5 +1,5 @@
 //! filter.zig — a declarative document-pruning pass, layered over `Select` +
-//! `Editor`. The higher-level counterpart to the editor's single-node ops:
+//! `Splicer`. The higher-level counterpart to the splicer's single-node ops:
 //! instead of "delete THIS node", it expresses "keep only the family members
 //! matching a predicate, drop the rest" over the whole document — the shape
 //! Diaryx's audience filtering needs (`:::vis{…}` blocks kept or dropped by
@@ -17,7 +17,7 @@
 //! matching both.
 //!
 //! ── Why it loops + re-resolves ─────────────────────────────────────────────
-//! The `Editor` reparses after every edit, so `Node.Id`s (and index paths) from
+//! The `Splicer` reparses after every edit, so `Node.Id`s (and index paths) from
 //! before an edit are stale afterward. Rather than track positions across
 //! edits, each step re-resolves both selectors against the CURRENT tree, acts
 //! on ONE node, and repeats — every edit strictly shrinks the tree, so the loop
@@ -30,7 +30,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const AST = @import("ast.zig");
 const Node = AST.Node;
-const Editor = @import("editor.zig").Editor;
+const Splicer = @import("splicer.zig").Splicer;
 const Select = @import("select.zig");
 
 pub const Options = struct {
@@ -43,7 +43,7 @@ pub const Options = struct {
     keep: ?[]const u8 = null,
     /// After the drop pass, unwrap each KEPT family member — replace it with
     /// its interior, peeling the surviving `:::vis` wrappers off their content
-    /// (`Editor.unwrapNode`). Only meaningful with `keep`.
+    /// (`Splicer.unwrapNode`). Only meaningful with `keep`.
     unwrap_kept: bool = false,
 };
 
@@ -57,7 +57,7 @@ pub const FilterError = error{FilterDidNotConverge};
 /// holds the pruned document. On any editor error (notably a reparse-breaking
 /// edit, already rolled back) the partial progress so far stands and the error
 /// is returned.
-pub fn apply(gpa: Allocator, editor: *Editor, options: Options) anyerror!void {
+pub fn apply(gpa: Allocator, editor: *Splicer, options: Options) anyerror!void {
     var drop_sel = try Select.parse(gpa, options.drop);
     defer drop_sel.deinit();
 
@@ -133,7 +133,7 @@ fn parseMarkdownDirectives(ctx: *const anyopaque, a: Allocator, s: []const u8) a
 const md_ctx: u8 = 0;
 
 fn runFilter(src: []const u8, options: Options) ![]u8 {
-    var ed = try Editor.init(testing.allocator, src, &md_ctx, parseMarkdownDirectives);
+    var ed = try Splicer.init(testing.allocator, src, &md_ctx, parseMarkdownDirectives);
     defer ed.deinit();
     try apply(testing.allocator, &ed, options);
     return testing.allocator.dupe(u8, ed.sourceBytes());

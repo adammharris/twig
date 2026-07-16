@@ -381,7 +381,7 @@ fn filterSource(allocator: Allocator, source: []const u8, opts: args_mod.FilterO
     const entry = format.entryFor(opts.input);
     // `&opts.parse_config` outlives `editor` (deinited before we return), so the
     // editor's borrowed parse context stays valid across every reparse.
-    var editor = twig.Editor.init(allocator, source, &opts.parse_config, entry.parseToAst) catch |err| {
+    var editor = twig.Splicer.init(allocator, source, &opts.parse_config, entry.parseToAst) catch |err| {
         stderr.print("error: failed to parse input as {s}: {t}\n", .{ @tagName(opts.input), err }) catch {};
         stderr.flush() catch {};
         return error.ActionFailed;
@@ -405,24 +405,6 @@ fn filterSource(allocator: Allocator, source: []const u8, opts: args_mod.FilterO
     return allocator.dupe(u8, editor.sourceBytes()) catch return error.ActionFailed;
 }
 
-/// Parse a dot-separated index path (`"0.3.1"` -> `&.{0,3,1}`; empty -> the
-/// root, `&.{}`). A non-numeric segment prints a message and fails.
-fn parsePath(allocator: Allocator, path_str: []const u8, stderr: *Writer) ActionError![]const usize {
-    if (path_str.len == 0) return &.{};
-    var list: std.ArrayList(usize) = .empty;
-    errdefer list.deinit(allocator);
-    var it = std.mem.splitScalar(u8, path_str, '.');
-    while (it.next()) |seg| {
-        const n = std.fmt.parseInt(usize, seg, 10) catch {
-            stderr.print("error: invalid path segment '{s}' in '{s}' (expected dot-separated indices like 0.3.1)\n", .{ seg, path_str }) catch {};
-            stderr.flush() catch {};
-            return error.ActionFailed;
-        };
-        list.append(allocator, n) catch return error.ActionFailed;
-    }
-    return list.toOwnedSlice(allocator) catch error.ActionFailed;
-}
-
 /// Parse `source`, resolve `locator` to a node, apply the one edit, and return
 /// the edited bytes (owned by `allocator`). Every failure — parse, an
 /// unresolvable/ambiguous locator, a bad interior, or a reparse-breaking edit
@@ -442,7 +424,7 @@ fn applyEditByLocator(
     // `&parse_config` (this stack frame's copy) outlives `editor`, which is
     // deinited before this function returns — so the editor's borrowed parse
     // context stays valid across every reparse.
-    var editor = twig.Editor.init(allocator, source, &parse_config, entry.parseToAst) catch |err| {
+    var editor = twig.Splicer.init(allocator, source, &parse_config, entry.parseToAst) catch |err| {
         stderr.print("error: failed to parse input as {s}: {t}\n", .{ @tagName(input), err }) catch {};
         stderr.flush() catch {};
         return error.ActionFailed;
@@ -478,50 +460,51 @@ fn applyEditByLocator(
     return allocator.dupe(u8, editor.sourceBytes()) catch return error.ActionFailed;
 }
 
-/// Resolve a locator to a single node id. A locator is EITHER an index path
-/// (all digits and dots, e.g. `0.3.1`) OR a CSS-lite selector (`heading("X")`),
-/// which must match exactly one node — on 0 or many, the candidates are listed
-/// so the user can refine (add `:nth(k)`, be more specific, or use a path).
+/// Resolve a locator to a single node id, with the CLI's diagnostics. A locator
+/// is EITHER an index path (all digits and dots, e.g. `0.3.1`) OR a CSS-lite
+/// selector (`heading("X")`), which must match exactly one node.
+///
+/// The RULE lives in `twig.locator` (the C ABI resolves the same strings and used
+/// to carry its own copy of it); what's added here is the human-facing half —
+/// naming which of the two forms failed, and listing the candidates on an
+/// ambiguous match so the user can refine (add `:nth(k)`, be more specific, or
+/// use a path).
 fn resolveLocator(allocator: Allocator, ast: *const twig.AST, locator: []const u8, stderr: *Writer) ActionError!twig.AST.Node.Id {
-    if (isIndexPath(locator)) {
-        const path = try parsePath(allocator, locator, stderr);
-        defer if (path.len > 0) allocator.free(path);
-        return ast.getIdByPath(path) catch {
-            stderr.print("error: no node at path '{s}' (index out of bounds)\n", .{locator}) catch {};
+    const is_path = twig.locator.isIndexPath(locator);
+    return twig.locator.resolve(allocator, ast, locator) catch |err| switch (err) {
+        error.OutOfMemory => error.ActionFailed,
+        error.InvalidLocator => {
+            if (is_path) {
+                stderr.print("error: invalid index path '{s}' (expected dot-separated indices like 0.3.1)\n", .{locator}) catch {};
+            } else {
+                stderr.print("error: could not parse selector '{s}'\n", .{locator}) catch {};
+            }
             stderr.flush() catch {};
             return error.ActionFailed;
-        };
-    }
-
-    var selector = twig.Select.parse(allocator, locator) catch |err| {
-        stderr.print("error: could not parse selector '{s}': {t}\n", .{ locator, err }) catch {};
-        stderr.flush() catch {};
-        return error.ActionFailed;
+        },
+        error.NotFound => {
+            if (is_path) {
+                stderr.print("error: no node at path '{s}' (index out of bounds)\n", .{locator}) catch {};
+            } else {
+                stderr.print("error: no node matches selector '{s}'\n", .{locator}) catch {};
+            }
+            stderr.flush() catch {};
+            return error.ActionFailed;
+        },
+        error.Ambiguous => {
+            // Re-resolve to list the candidates. Only a selector can be
+            // ambiguous, and this is a cold error path — worth one extra pass to
+            // keep the resolution rule itself in exactly one place.
+            var selector = twig.Select.parse(allocator, locator) catch return error.ActionFailed;
+            defer selector.deinit();
+            const matches = twig.Select.resolveAll(allocator, ast, &selector) catch return error.ActionFailed;
+            defer allocator.free(matches);
+            stderr.print("error: selector '{s}' is ambiguous — {d} nodes match. Refine it, add :nth(k), or use an index path:\n", .{ locator, matches.len }) catch {};
+            for (matches) |m| printMatchLine(allocator, ast, m.id, stderr) catch {};
+            stderr.flush() catch {};
+            return error.ActionFailed;
+        },
     };
-    defer selector.deinit();
-
-    const matches = twig.Select.resolveAll(allocator, ast, &selector) catch return error.ActionFailed;
-    defer allocator.free(matches);
-
-    if (matches.len == 0) {
-        stderr.print("error: no node matches selector '{s}'\n", .{locator}) catch {};
-        stderr.flush() catch {};
-        return error.ActionFailed;
-    }
-    if (matches.len > 1) {
-        stderr.print("error: selector '{s}' is ambiguous — {d} nodes match. Refine it, add :nth(k), or use an index path:\n", .{ locator, matches.len }) catch {};
-        for (matches) |m| printMatchLine(allocator, ast, m.id, stderr) catch {};
-        stderr.flush() catch {};
-        return error.ActionFailed;
-    }
-    return matches[0].id;
-}
-
-/// A locator is an index path when it's made only of digits and dots (so an
-/// empty string — the root — counts); anything else is a selector.
-fn isIndexPath(s: []const u8) bool {
-    for (s) |c| if (!std.ascii.isDigit(c) and c != '.') return false;
-    return true;
 }
 
 /// Overwrite `path` with `data` (truncating create + positional write). Used
@@ -662,18 +645,43 @@ test "convertSource: -o markdown with djot input cross-converts via Markdown.ser
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "*djot emphasis*") != null);
 }
 
-test "parsePath: dotted indices, empty = root, non-numeric errors" {
-    var buf: [256]u8 = undefined;
+// Locator RESOLUTION is `twig.locator`'s, and tested there. What's left here is
+// the CLI's own half: that each way of failing names the right form and says
+// something a human can act on.
+
+test "resolveLocator: each failure names the form that failed" {
+    var buf: [1024]u8 = undefined;
+    var ast = try twig.Xml.parse(testing.allocator, "<r><a/><a/></r>");
+    defer ast.deinit();
+
+    // A malformed index path is reported as a path. Note `0..1` and not `0.x.1`:
+    // the path/selector split is digits-and-dots, so `0.x.1` is not a broken
+    // path at all — it's a selector, and reported as one below.
     var err: Writer = .fixed(&buf);
+    try testing.expectError(error.ActionFailed, resolveLocator(testing.allocator, &ast, "0..1", &err));
+    try testing.expect(std.mem.indexOf(u8, err.buffered(), "index path") != null);
 
-    const p = try parsePath(testing.allocator, "0.3.1", &err);
-    defer testing.allocator.free(p);
-    try testing.expectEqualSlices(usize, &.{ 0, 3, 1 }, p);
+    // `0.x.1` has a non-digit, so it is a (malformed) SELECTOR, not a path.
+    err = .fixed(&buf);
+    try testing.expectError(error.ActionFailed, resolveLocator(testing.allocator, &ast, "0.x.1", &err));
+    try testing.expect(std.mem.indexOf(u8, err.buffered(), "selector") != null);
 
-    const root = try parsePath(testing.allocator, "", &err);
-    try testing.expectEqual(@as(usize, 0), root.len);
+    // An out-of-bounds path is 'no node at path', not 'no node matches'.
+    err = .fixed(&buf);
+    try testing.expectError(error.ActionFailed, resolveLocator(testing.allocator, &ast, "0.9", &err));
+    try testing.expect(std.mem.indexOf(u8, err.buffered(), "no node at path") != null);
 
-    try testing.expectError(error.ActionFailed, parsePath(testing.allocator, "0.x", &err));
+    // A malformed selector is reported as a selector.
+    err = .fixed(&buf);
+    try testing.expectError(error.ActionFailed, resolveLocator(testing.allocator, &ast, "element(", &err));
+    try testing.expect(std.mem.indexOf(u8, err.buffered(), "parse selector") != null);
+
+    // An ambiguous selector still lists its candidates — the reason this wrapper
+    // exists rather than calling `twig.locator.resolve` directly.
+    err = .fixed(&buf);
+    try testing.expectError(error.ActionFailed, resolveLocator(testing.allocator, &ast, "element[name=a]", &err));
+    try testing.expect(std.mem.indexOf(u8, err.buffered(), "ambiguous") != null);
+    try testing.expect(std.mem.indexOf(u8, err.buffered(), "2 nodes match") != null);
 }
 
 test "applyEditByLocator: index paths across xml, markdown, djot" {

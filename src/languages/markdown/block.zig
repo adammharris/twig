@@ -122,7 +122,7 @@ const Cursor = struct { pos: usize = 0, col: usize = 0, spent: usize = 0 };
 
 /// The degenerate `(0,0)` span `AST.Builder.addNode`/`addLeaf`/`addContainer`
 /// default every node to, meaning "never explicitly set" -- mirrors
-/// `ast/editor.zig`'s own `nodeSpan` check (the span-splice editor's
+/// `ast/splicer.zig`'s own `nodeSpan` check (the span-splice engine's
 /// definition of "this node has no usable span").
 fn isUnsetSpan(s: Span) bool {
     return s.start == 0 and s.end == 0;

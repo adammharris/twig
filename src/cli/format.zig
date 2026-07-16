@@ -1,69 +1,53 @@
-//! The format registry: the single place a new Twig language plugs into the
-//! CLI. Each `FormatEntry` bundles a parser adapter (`parse`), an HTML
-//! renderer adapter (`renderHtml`), and an optional round-trip serializer
-//! (`serializeCanonical`) behind one uniform shape (`ParsedDoc`), so `convert`
-//! and `identify` never need format-specific branches of their own — adding a
-//! language is "write three small adapter functions, add one `registry`
-//! entry", not touching `args.zig`/`actions.zig` at all.
+//! The CLI's view of the format registry: the `-i`/`-o` vocabulary and the
+//! diagnostics printed when one doesn't resolve.
 //!
-//! This module also owns extension inference and `-i`/`--input` name
-//! resolution (`detectFromExtension`, `parseFormatName`), and the
-//! "unsupported/undetectable format" diagnostics `args.zig` prints on
-//! failure — mirroring fig's `cli/args.zig` (`detectLanguageFromFileEnding`,
-//! `parseFormatName`) and `cli/types.zig` (`Format`) at Twig's smaller scale.
+//! The registry itself — the parser/renderer/serializer/syntax adapters, and
+//! `Format` itself — moved to `twig.format` (`src/format.zig`), because the C
+//! ABI needs the same table and cannot import the CLI; it used to keep a second
+//! hand-maintained copy of the parse adapters instead. What's left here is the
+//! part that is genuinely about being a command-line tool: which words `-o`
+//! accepts, and what to print at a human when they typo one.
+//!
+//! The core names are re-exported below so the rest of the CLI keeps saying
+//! `format.entryFor` / `format.InputFormat` and needn't care where they live.
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 
 const twig = @import("twig");
-const djot_serializer = twig.Djot.serializer;
-const markdown_serializer = twig.Markdown.serializer;
 
-/// Every language Twig can PARSE. This is the `-i`/`--input` vocabulary and
-/// the enum `ParsedDoc` is tagged by — see `registry` below for what each
-/// variant does.
-pub const InputFormat = enum {
-    djot,
-    markdown,
-    xml,
-    html,
-};
+// ── re-exports from the shared registry ────────────────────────────────────
 
-/// What `-o`/`--output` selects: not a source language like `InputFormat`,
-/// but one of the three ways `convert` can render a parsed document. `html`
-/// is the default; `ast` and `canonical` are documented on `registry`'s
-/// module doc comment above and on `actions.zig`'s `runConvert`.
+/// Every language Twig can PARSE — the `-i`/`--input` vocabulary. Named
+/// `InputFormat` here (against `twig.Format`) because in CLI terms it is
+/// specifically what `-i` accepts, as opposed to `-o`'s `OutputMode`.
+pub const InputFormat = twig.format.Format;
+pub const FormatEntry = twig.format.Entry;
+pub const ParsedDoc = twig.format.ParsedDoc;
+pub const ParseConfig = twig.format.ParseConfig;
+pub const registry = twig.format.registry;
+pub const entryFor = twig.format.entryFor;
+pub const parseFormatName = twig.format.parseFormatName;
+pub const detectFromExtension = twig.format.detectFromExtension;
+
+// ── the CLI's own vocabulary ───────────────────────────────────────────────
+
+/// What `-o`/`--output` selects: not a source language like `InputFormat`, but
+/// one of the three ways `convert` can render a parsed document. `html` is the
+/// default; `ast` and `canonical` are documented on `actions.zig`'s `runConvert`.
 pub const OutputMode = enum { html, ast, canonical };
-
-/// Per-invocation parse configuration, threaded from the CLI's feature flags
-/// (`args.zig`) into the `parse`/`parseToAst` adapters. Passed as an opaque
-/// `*const anyopaque` (so `editor.zig` can carry it across reparses without
-/// depending on this type — see `Editor.ParseFn`); every adapter that reads it
-/// `@ptrCast`s it back. Only Markdown consults it today; other formats'
-/// adapters ignore it.
-pub const ParseConfig = struct {
-    markdown: twig.Markdown.ParseOptions = .{},
-
-    /// Recover a `*const ParseConfig` from the opaque pointer the registry
-    /// adapters / the editor pass around.
-    fn from(ctx: *const anyopaque) *const ParseConfig {
-        return @ptrCast(@alignCast(ctx));
-    }
-};
 
 pub fn parseOutputMode(name: []const u8) ?OutputMode {
     return std.meta.stringToEnum(OutputMode, name);
 }
 
 /// What `-o`/`--output` resolved to: `mode` is always one of the three
-/// `OutputMode`s, plus (only ever set alongside `.canonical`) an explicit
-/// TARGET language when `-o` named one directly (e.g. `-o djot`) rather than
-/// the literal word `canonical` — which means "serialize back to whatever
-/// `-i` was", same format in, same format out. `-o <format-name>` is
-/// `.canonical` plus "but serialize as `<format-name>` even if that's not
-/// the input format", the cross-format `convert` path (`actions.zig`'s
-/// `convertSource`).
+/// `OutputMode`s, plus (only ever set alongside `.canonical`) an explicit TARGET
+/// language when `-o` named one directly (e.g. `-o djot`) rather than the
+/// literal word `canonical` — which means "serialize back to whatever `-i` was",
+/// same format in, same format out. `-o <format-name>` is `.canonical` plus "but
+/// serialize as `<format-name>` even if that's not the input format", the
+/// cross-format `convert` path (`actions.zig`'s `convertSource`).
 pub const OutputTarget = struct {
     mode: OutputMode,
     format: ?InputFormat = null,
@@ -71,273 +55,12 @@ pub const OutputTarget = struct {
 
 /// Parse an `-o`/`--output` value against both vocabularies it accepts:
 /// `OutputMode`'s own names (`html`, `ast`, `canonical`) first, then every
-/// `registry` entry's format name/aliases (`djot`/`dj`, `markdown`/`md`,
-/// `xml`) as a request to convert TO that format. Returns `null` when `name`
-/// matches neither, so the caller can print a diagnostic listing both.
+/// registry entry's format name/aliases (`djot`/`dj`, `markdown`/`md`, `xml`) as
+/// a request to convert TO that format. Returns `null` when `name` matches
+/// neither, so the caller can print a diagnostic listing both.
 pub fn parseOutputTarget(name: []const u8) ?OutputTarget {
     if (parseOutputMode(name)) |mode| return .{ .mode = mode };
     if (parseFormatName(name)) |fmt| return .{ .mode = .canonical, .format = fmt };
-    return null;
-}
-
-/// A parsed document, tagged by which `InputFormat` produced it. Exists
-/// because `Djot.parse`/`Markdown.parse` return a `Document` wrapper (the
-/// shared `AST` plus side tables — see `Djot.Document`'s doc comment) while
-/// `Xml.parse` returns the shared `AST` directly; this union gives
-/// `actions.zig` one type to hold, deinit, and pull an `*const AST` out of,
-/// regardless of which language produced it.
-pub const ParsedDoc = union(InputFormat) {
-    djot: twig.Djot.Document,
-    markdown: twig.Markdown.Document,
-    xml: twig.AST,
-    html: twig.AST,
-
-    /// The shared `AST` underneath, regardless of variant.
-    pub fn ast(self: *const ParsedDoc) *const twig.AST {
-        return switch (self.*) {
-            .djot => |*d| &d.ast,
-            .markdown => |*d| &d.ast,
-            .xml => |*a| a,
-            .html => |*a| a,
-        };
-    }
-
-    pub fn deinit(self: *ParsedDoc) void {
-        switch (self.*) {
-            .djot => |*d| d.deinit(),
-            .markdown => |*d| d.deinit(),
-            .xml => |*a| a.deinit(),
-            .html => |*a| a.deinit(),
-        }
-    }
-};
-
-fn parseDjot(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
-    _ = ctx;
-    return .{ .djot = try twig.Djot.parse(allocator, source) };
-}
-
-fn parseMarkdown(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
-    return .{ .markdown = try twig.Markdown.parse(allocator, source, ParseConfig.from(ctx).markdown) };
-}
-
-fn parseXml(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
-    _ = ctx;
-    return .{ .xml = try twig.Xml.parse(allocator, source) };
-}
-
-fn parseHtml(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!ParsedDoc {
-    _ = ctx;
-    return .{ .html = try twig.Html.parse(allocator, source) };
-}
-
-// ── editor reparse adapters ────────────────────────────────────────────────
-// The span-splice editor (`twig.Editor`) reparses after every edit and only
-// needs the bare shared `AST` — spans/structure, never a `Document`'s side
-// tables. These unwrap djot/Markdown's `Document`: its side-table map KEYS are
-// slices into `ast.owned_strings` and the maps own no AST memory (see each
-// `Document`'s doc comment), so freeing just the map *structures* and handing
-// back `.ast` is leak-free and leaves a fully valid tree. XML already returns a
-// bare `AST`.
-
-fn parseToAstDjot(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!twig.AST {
-    _ = ctx;
-    var doc = try twig.Djot.parse(allocator, source);
-    doc.references.deinit(allocator);
-    doc.auto_references.deinit(allocator);
-    doc.footnotes.deinit(allocator);
-    return doc.ast;
-}
-
-fn parseToAstMarkdown(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!twig.AST {
-    var doc = try twig.Markdown.parse(allocator, source, ParseConfig.from(ctx).markdown);
-    doc.link_references.deinit(allocator);
-    doc.footnotes.deinit(allocator);
-    return doc.ast;
-}
-
-fn parseToAstXml(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!twig.AST {
-    _ = ctx;
-    return twig.Xml.parse(allocator, source);
-}
-
-fn parseToAstHtml(ctx: *const anyopaque, allocator: Allocator, source: []const u8) anyerror!twig.AST {
-    _ = ctx;
-    return twig.Html.parse(allocator, source);
-}
-
-/// Djot needs its own HTML rendering path (`Djot.html.render`) rather than
-/// the generic printer: it resolves reference/footnote labels against
-/// `Document`'s side tables at render time (see `djot/html.zig`'s module doc
-/// comment) — the generic `Html.serialize` has no djot `Document` to pull
-/// those tables from. Using the generic printer here would silently drop
-/// footnotes and reference-style links.
-fn renderHtmlDjot(allocator: Allocator, doc: *const ParsedDoc, writer: *Writer) anyerror!void {
-    try twig.Djot.html.render(allocator, &doc.djot, writer, .{});
-}
-
-/// Every other language (XML and HTML) has no side tables to
-/// resolve, so the shared, language-neutral printer
-/// (`languages/html/serializer.zig`) is the whole story — `ctx = null`.
-fn renderHtmlGeneric(allocator: Allocator, doc: *const ParsedDoc, writer: *Writer) anyerror!void {
-    try twig.Html.serialize(allocator, doc.ast(), writer, null);
-}
-
-/// Markdown needs its own HTML rendering path (`Markdown.html.render`)
-/// rather than the generic printer for the same reason djot does
-/// (`renderHtmlDjot`'s doc comment): footnotes (`self.options.footnotes`)
-/// resolve/number/backlink entirely at RENDER time, against
-/// `Document.footnotes` — see `markdown/html.zig`'s module doc comment.
-/// Using the generic printer here would silently drop footnotes (every
-/// `link`/`image`, by contrast, is already fully resolved at PARSE time, so
-/// those are unaffected either way).
-fn renderHtmlMarkdown(allocator: Allocator, doc: *const ParsedDoc, writer: *Writer) anyerror!void {
-    try twig.Markdown.html.render(allocator, &doc.markdown, writer, .{});
-}
-
-fn serializeCanonicalXml(allocator: Allocator, doc: *const ParsedDoc) anyerror![]u8 {
-    return twig.Xml.serializeAlloc(allocator, doc.ast());
-}
-
-fn serializeCanonicalDjot(allocator: Allocator, doc: *const ParsedDoc) anyerror![]u8 {
-    return djot_serializer.serializeAlloc(allocator, &doc.djot);
-}
-
-fn serializeCanonicalMarkdown(allocator: Allocator, doc: *const ParsedDoc) anyerror![]u8 {
-    return markdown_serializer.serializeAlloc(allocator, &doc.markdown);
-}
-
-fn serializeFromAstDjot(allocator: Allocator, ast: *const twig.AST) anyerror![]u8 {
-    return djot_serializer.serializeAstAlloc(allocator, ast);
-}
-
-fn serializeFromAstMarkdown(allocator: Allocator, ast: *const twig.AST) anyerror![]u8 {
-    return markdown_serializer.serializeAstAlloc(allocator, ast);
-}
-
-/// One entry per `InputFormat`. This IS the extensibility point the CLI is
-/// built around: a new language is a new `parse`/`renderHtml` adapter pair
-/// (plus `serializeCanonical` if it has a serializer) and one more line here
-/// — `args.zig`'s extension/name resolution and `actions.zig`'s `convert`/
-/// `identify` handlers are written entirely against this table, never against
-/// a per-language switch of their own.
-pub const FormatEntry = struct {
-    id: InputFormat,
-    /// Lowercase, dot-less extensions that infer this format (checked
-    /// case-insensitively against a path's last `.`-separated segment).
-    extensions: []const []const u8,
-    /// Extra `-i`/`--input` names accepted besides `@tagName(id)` itself
-    /// (which `parseFormatName` always accepts via `std.meta.stringToEnum`).
-    aliases: []const []const u8 = &.{},
-    parse: *const fn (*const anyopaque, Allocator, []const u8) anyerror!ParsedDoc,
-    /// Source -> the bare shared `AST`, the reparse callback the span-splice
-    /// editor (`twig.Editor`, driving `twig edit`) needs. Discards any
-    /// `Document` side tables (see the editor-adapter note above) — editing is
-    /// language-neutral and only touches spans/structure. Every format has one.
-    /// Its shape matches `twig.Editor.ParseFn` (leading opaque `ParseConfig`
-    /// context) so it can be handed straight to `Editor.init`.
-    parseToAst: twig.Editor.ParseFn,
-    renderHtml: *const fn (Allocator, *const ParsedDoc, *Writer) anyerror!void,
-    /// Round-trip serializer back to this format's own source syntax —
-    /// `convert -o canonical`'s implementation. `null` means the language has
-    /// no serializer yet; `actions.zig` turns that into a clear "not supported
-    /// yet" error rather than a crash.
-    serializeCanonical: ?*const fn (Allocator, *const ParsedDoc) anyerror![]u8 = null,
-    /// Serialize a BARE shared `AST` (regardless of which format parsed it)
-    /// as this format's own source syntax — `convert -o <format>`'s
-    /// cross-format implementation (e.g. `-i markdown -o djot`). Unlike
-    /// `serializeCanonical`, this never needs a matching `ParsedDoc` variant:
-    /// it's handed whatever `ParsedDoc.ast()` returns and builds any side
-    /// tables it needs from that bare tree (see `Djot.serializer
-    /// .serializeAstAlloc`/`Markdown.serializer.serializeAstAlloc`). `null`
-    /// means the language has no serializer yet, same as `serializeCanonical`.
-    serializeFromAst: ?*const fn (Allocator, *const twig.AST) anyerror![]u8 = null,
-};
-
-pub const registry = [_]FormatEntry{
-    .{
-        .id = .djot,
-        .extensions = &.{ "dj", "djot" },
-        .aliases = &.{"dj"},
-        .parse = parseDjot,
-        .parseToAst = parseToAstDjot,
-        .renderHtml = renderHtmlDjot,
-        .serializeCanonical = serializeCanonicalDjot,
-        .serializeFromAst = serializeFromAstDjot,
-    },
-    .{
-        .id = .markdown,
-        .extensions = &.{ "md", "markdown" },
-        .aliases = &.{"md"},
-        .parse = parseMarkdown,
-        .parseToAst = parseToAstMarkdown,
-        .renderHtml = renderHtmlMarkdown,
-        .serializeCanonical = serializeCanonicalMarkdown,
-        .serializeFromAst = serializeFromAstMarkdown,
-    },
-    .{
-        .id = .xml,
-        .extensions = &.{"xml"},
-        .parse = parseXml,
-        .parseToAst = parseToAstXml,
-        .renderHtml = renderHtmlGeneric,
-        .serializeCanonical = serializeCanonicalXml,
-        // No `serializeFromAst`: XML's serializer only understands the
-        // generic-markup kinds (`element`/`comment`/`doctype`/...) its own
-        // parser produces (see `xml/serializer.zig`'s `else => unreachable`);
-        // it has no mapping for djot/Markdown's semantic kinds
-        // (`heading`/`emph`/`link`/...), so cross-format conversion INTO xml
-        // from another format isn't meaningful yet — same-format `-o
-        // canonical`/`-o xml` (via `serializeCanonical` above) still works.
-    },
-    .{
-        .id = .html,
-        .extensions = &.{ "html", "htm" },
-        .parse = parseHtml,
-        .parseToAst = parseToAstHtml,
-        .renderHtml = renderHtmlGeneric,
-    },
-};
-
-/// Look up `fmt`'s entry. Every `InputFormat` variant has exactly one
-/// `registry` entry (enforced by inspection, not the type system — same
-/// trust boundary fig's own hand-maintained tables rely on), so this never
-/// legitimately misses.
-pub fn entryFor(fmt: InputFormat) *const FormatEntry {
-    for (&registry) |*e| {
-        if (e.id == fmt) return e;
-    }
-    unreachable;
-}
-
-/// Map a `-i`/`--input` token to an `InputFormat`: the enum's own tag name
-/// first (`std.meta.stringToEnum`, so `"djot"`/`"markdown"`/`"xml"` always
-/// work), then each entry's `aliases` (`"dj"`, `"md"`). Returns `null` for an
-/// unrecognized name so the caller can print a tailored error.
-pub fn parseFormatName(name: []const u8) ?InputFormat {
-    if (std.meta.stringToEnum(InputFormat, name)) |f| return f;
-    for (&registry) |*e| {
-        for (e.aliases) |alias| {
-            if (std.mem.eql(u8, alias, name)) return e.id;
-        }
-    }
-    return null;
-}
-
-/// Infer an `InputFormat` from a file path's extension (the part after its
-/// last `.`), matched case-insensitively against every `registry` entry's
-/// `extensions`. Returns `null` when the path has no extension or it matches
-/// no known format — the caller then either falls back to `-i`/`--input` or
-/// reports the "couldn't infer a format" error (`resolveInputFormat`).
-pub fn detectFromExtension(file_path: []const u8) ?InputFormat {
-    const dot = std.mem.lastIndexOfScalar(u8, file_path, '.') orelse return null;
-    const ext = file_path[dot + 1 ..];
-    if (ext.len == 0) return null;
-    for (&registry) |*e| {
-        for (e.extensions) |known| {
-            if (std.ascii.eqlIgnoreCase(known, ext)) return e.id;
-        }
-    }
     return null;
 }
 
@@ -356,22 +79,21 @@ pub fn printSupportedInputFormats(w: *Writer) Writer.Error!void {
 /// Errors `resolveInputFormat` can produce, beyond the write failures its own
 /// diagnostics can hit. Folded into `args.zig`'s `ArgError` via `||`.
 pub const ResolveInputFormatError = Writer.Error || error{
-    /// `-`  (stdin) was given as the file with no `-i`/`--input` override —
-    /// there is no extension to infer from, so the caller MUST say what it
-    /// is.
+    /// `-` (stdin) was given as the file with no `-i`/`--input` override — there
+    /// is no extension to infer from, so the caller MUST say what it is.
     StdinRequiresInputFormat,
     /// A real file path was given, but its extension is missing or matches no
-    /// `registry` entry, and no `-i`/`--input` override was given either.
+    /// registry entry, and no `-i`/`--input` override was given either.
     UnknownExtension,
 };
 
 /// Resolve the definitive `InputFormat` for `convert`/`identify`: an explicit
 /// `override` (from `-i`/`--input`) always wins; otherwise infer from
-/// `file_path`'s extension; otherwise fail with a diagnostic written to
-/// `stderr` (mirrors fig's `ArgError.UnsupportedFileFormat` handling in
-/// `main.zig`, but resolved eagerly here in one place instead of deferred to
-/// every action). `file_path == "-"` (stdin) skips extension inference
-/// entirely, since there is no path to infer from.
+/// `file_path`'s extension; otherwise fail with a diagnostic written to `stderr`
+/// (mirrors fig's `ArgError.UnsupportedFileFormat` handling in `main.zig`, but
+/// resolved eagerly here in one place instead of deferred to every action).
+/// `file_path == "-"` (stdin) skips extension inference entirely, since there is
+/// no path to infer from.
 pub fn resolveInputFormat(stderr: *Writer, file_path: []const u8, override: ?InputFormat) ResolveInputFormatError!InputFormat {
     if (override) |f| return f;
 
@@ -388,65 +110,4 @@ pub fn resolveInputFormat(stderr: *Writer, file_path: []const u8, override: ?Inp
     try printSupportedInputFormats(stderr);
     try stderr.flush();
     return error.UnknownExtension;
-}
-
-const testing = std.testing;
-
-test "detectFromExtension matches known extensions case-insensitively, else null" {
-    try testing.expectEqual(@as(?InputFormat, .djot), detectFromExtension("post.dj"));
-    try testing.expectEqual(@as(?InputFormat, .djot), detectFromExtension("post.DJOT"));
-    try testing.expectEqual(@as(?InputFormat, .markdown), detectFromExtension("readme.md"));
-    try testing.expectEqual(@as(?InputFormat, .markdown), detectFromExtension("readme.markdown"));
-    try testing.expectEqual(@as(?InputFormat, .xml), detectFromExtension("feed.xml"));
-    try testing.expectEqual(@as(?InputFormat, .html), detectFromExtension("doc.html"));
-    try testing.expectEqual(@as(?InputFormat, .html), detectFromExtension("doc.HTM"));
-    try testing.expectEqual(@as(?InputFormat, null), detectFromExtension("noext"));
-    try testing.expectEqual(@as(?InputFormat, null), detectFromExtension("data.json"));
-    try testing.expectEqual(@as(?InputFormat, null), detectFromExtension("-"));
-}
-
-test "parseFormatName accepts both canonical names and aliases" {
-    try testing.expectEqual(@as(?InputFormat, .djot), parseFormatName("djot"));
-    try testing.expectEqual(@as(?InputFormat, .djot), parseFormatName("dj"));
-    try testing.expectEqual(@as(?InputFormat, .markdown), parseFormatName("markdown"));
-    try testing.expectEqual(@as(?InputFormat, .markdown), parseFormatName("md"));
-    try testing.expectEqual(@as(?InputFormat, .xml), parseFormatName("xml"));
-    try testing.expectEqual(@as(?InputFormat, .html), parseFormatName("html"));
-    try testing.expectEqual(@as(?InputFormat, null), parseFormatName("bogus"));
-}
-
-test "entryFor round-trips every InputFormat variant" {
-    inline for (@typeInfo(InputFormat).@"enum".fields) |field| {
-        const fmt = @field(InputFormat, field.name);
-        try testing.expectEqual(fmt, entryFor(fmt).id);
-    }
-}
-
-test "resolveInputFormat: explicit override wins over both stdin and extension" {
-    var buf: [256]u8 = undefined;
-    var w: Writer = .fixed(&buf);
-    try testing.expectEqual(InputFormat.xml, try resolveInputFormat(&w, "-", .xml));
-    try testing.expectEqual(InputFormat.djot, try resolveInputFormat(&w, "post.md", .djot));
-}
-
-test "resolveInputFormat: stdin without an override errors" {
-    var buf: [512]u8 = undefined;
-    var w: Writer = .fixed(&buf);
-    try testing.expectError(error.StdinRequiresInputFormat, resolveInputFormat(&w, "-", null));
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "--input") != null);
-}
-
-test "resolveInputFormat: undetectable extension errors and lists supported formats" {
-    var buf: [512]u8 = undefined;
-    var w: Writer = .fixed(&buf);
-    try testing.expectError(error.UnknownExtension, resolveInputFormat(&w, "notes.txt", null));
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "supported input formats") != null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "djot") != null);
-}
-
-test "resolveInputFormat: recognized extension infers without an override" {
-    var buf: [16]u8 = undefined;
-    var w: Writer = .fixed(&buf);
-    try testing.expectEqual(InputFormat.xml, try resolveInputFormat(&w, "feed.xml", null));
-    try testing.expectEqual(@as(usize, 0), w.end); // nothing written on the success path
 }

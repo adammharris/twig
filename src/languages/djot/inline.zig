@@ -621,9 +621,9 @@ pub const InlineParser = struct {
     /// not an autolink at all and stays literal text.
     ///
     /// Split out of `matchAutolink` so a caller needing to know whether a string
-    /// *would* spell an autolink — the C ABI's `insert_link`, choosing how to
-    /// spell a link with no text — asks the scanner itself rather than
-    /// re-deriving the rule and drifting from it.
+    /// *would* spell an autolink — `Editor.insertLink`, choosing how to spell a
+    /// link with no text, via `djot/syntax.zig`'s table — asks the scanner itself
+    /// rather than re-deriving the rule and drifting from it.
     pub fn autolinkKindOf(content: []const u8) ?AutolinkKind {
         if (content.len == 0) return null;
         // The delimiters and any whitespace would have ended the scan below

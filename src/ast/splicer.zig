@@ -1,0 +1,855 @@
+//! The span-splice editor — Twig's reason for existing: precise, LOSSLESS
+//! in-place edits to a document, driven by the AST's byte spans. The document
+//! analogue of how `fig` edits config files (see `~/Documents/fig/src/editor
+//! .zig`), reduced to its essence.
+//!
+//! ── The one primitive ──────────────────────────────────────────────────────
+//! Everything reduces to `replaceAtSpan(span, replacement)`: build a new source
+//! buffer that is the old bytes with `[span.start, span.end)` overwritten by
+//! `replacement`, reparse it, and — only if the reparse succeeds — swap it in.
+//! On reparse failure the edit is abandoned and the editor is left exactly as
+//! it was (the new buffer is discarded; the old source and AST are untouched),
+//! so a failed edit can never corrupt the document. Losslessness is automatic:
+//! bytes outside the spliced span are copied verbatim and never reflow — Twig
+//! never reformats what it didn't edit. An insertion is just a zero-width span.
+//!
+//! ── Language-agnostic by construction ──────────────────────────────────────
+//! The editor holds only source bytes plus a `parse_fn` callback (source ->
+//! `AST`), so the same engine edits djot, Markdown, or XML — the caller
+//! supplies the right parser. It deliberately does NOT import any language
+//! module (the CLI wires the per-language `parse_fn` adapters; djot/Markdown's
+//! `Document` side tables are irrelevant to editing, so an adapter frees those
+//! maps and hands back the bare `AST`). Tests below `@import` a real language
+//! (XML) only inside the test bodies, so non-test builds carry no such dep.
+//!
+//! ── What it can't do yet (honest limits) ───────────────────────────────────
+//!   - `replaceContent`/`insertChild`-into-empty need a container's interior
+//!     offset (`content_span`); djot leaves that `null` for empty containers
+//!     (XML always has it), so those ops return `error.NoContentSpan` there.
+//!   - Payload fields (a `link`'s destination, a `code_block`'s language) are
+//!     string payloads, not child nodes with their own spans — so there is no
+//!     sub-node span to splice; editing one means `replaceNode` on the whole
+//!     node's source. Per-field spans are future parser work.
+//!   - `deleteNode` removes exactly the node's span and nothing else (no
+//!     surrounding-whitespace cleanup) — predictable and lossless, but it can
+//!     leave a blank line behind. `deleteNodeSmart` is the block-aware variant
+//!     that tidies the surrounding blank lines (and falls back to the exact
+//!     delete for an inline, mid-line node); the CLI's `--delete` uses it.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const AST = @import("ast.zig");
+const Node = AST.Node;
+const Span = @import("../span.zig");
+
+/// Cap on retained undo steps, bounding history memory over a long session.
+/// Coalescing (`coalesceLastUndo`) makes a run of keystrokes one step, so this
+/// counts edit groups, not individual splices.
+const MAX_UNDO: usize = 200;
+
+pub const Splicer = struct {
+    /// What the most recent successful edit did to the source, in byte terms.
+    /// `old` is the range of the *pre-edit* source that was replaced; `new` is
+    /// the range the replacement now occupies in the *post-edit* source (they
+    /// share a start). An insertion has an empty `old`; a deletion an empty
+    /// `new`. The net length delta is `new.len() - old.len()`. Everything a
+    /// caret/selection needs to re-anchor across an edit without re-diffing.
+    pub const Change = struct { old: Span, new: Span };
+
+    /// Source -> a freshly-allocated `AST` the editor takes ownership of.
+    /// Runtime (not comptime-generic) so the CLI can pick the language at run
+    /// time; the error set is open (`anyerror`) because each language's parse
+    /// error set differs and a reparse failure is a legitimate, caller-visible
+    /// outcome.
+    ///
+    /// The leading `ctx` is an opaque pointer the caller supplies to `init`
+    /// and the editor passes back to every reparse, unread — the hook for
+    /// parse configuration the editor itself has no business knowing about
+    /// (the CLI passes a `*const format.ParseConfig` so an edited Markdown
+    /// document reparses with the SAME extension flags, e.g. `--directives`,
+    /// it was first parsed with; a callback that needs no configuration just
+    /// ignores it). It must outlive the editor.
+    pub const ParseFn = *const fn (ctx: *const anyopaque, Allocator, []const u8) anyerror!AST;
+
+    allocator: Allocator,
+    /// The current (edited) document bytes. Owns its memory.
+    source: std.ArrayList(u8),
+    /// The parse of `source.items` as of the last successful edit. Owns its
+    /// memory; replaced wholesale on every successful edit.
+    ast: AST,
+    parse_fn: ParseFn,
+    /// Opaque configuration handed to `parse_fn` on every reparse (see
+    /// `ParseFn`). Borrowed; must outlive the editor.
+    parse_ctx: *const anyopaque,
+    /// The byte-level effect of the last successful `replaceAtSpan` (and hence
+    /// of the last successful op, since every op funnels through it), or `null`
+    /// before the first edit. A failed edit leaves it untouched. Note: a
+    /// multi-splice op (e.g. `Filter`) leaves only its *final* splice here.
+    last_change: ?Change = null,
+    /// Undo/redo history as whole source buffers. `replaceAtSpan` retires the
+    /// pre-edit source onto `undo_stack` instead of freeing it; `undo`/`redo`
+    /// swap a buffer between the stacks and reparse. Each single-splice op is
+    /// one step; `coalesceLastUndo` folds a keystroke run into one.
+    undo_stack: std.ArrayList(std.ArrayList(u8)) = .empty,
+    redo_stack: std.ArrayList(std.ArrayList(u8)) = .empty,
+
+    /// Parse `source_bytes` and build an editor over a private copy of them.
+    /// `parse_ctx` is forwarded verbatim to `parse_fn` on the initial parse
+    /// and every reparse — see `ParseFn`.
+    pub fn init(allocator: Allocator, source_bytes: []const u8, parse_ctx: *const anyopaque, parse_fn: ParseFn) !Splicer {
+        var source: std.ArrayList(u8) = .empty;
+        errdefer source.deinit(allocator);
+        try source.appendSlice(allocator, source_bytes);
+        const ast = try parse_fn(parse_ctx, allocator, source.items);
+        return .{ .allocator = allocator, .source = source, .ast = ast, .parse_fn = parse_fn, .parse_ctx = parse_ctx };
+    }
+
+    pub fn deinit(self: *Splicer) void {
+        self.ast.deinit();
+        self.source.deinit(self.allocator);
+        for (self.undo_stack.items) |*b| b.deinit(self.allocator);
+        self.undo_stack.deinit(self.allocator);
+        for (self.redo_stack.items) |*b| b.deinit(self.allocator);
+        self.redo_stack.deinit(self.allocator);
+    }
+
+    /// The current edited document bytes.
+    pub fn sourceBytes(self: *const Splicer) []const u8 {
+        return self.source.items;
+    }
+
+    /// The current parse (valid until the next successful edit).
+    pub fn astView(self: *const Splicer) *const AST {
+        return &self.ast;
+    }
+
+    // ── the primitive ──────────────────────────────────────────────────────
+
+    /// Overwrite `[span.start, span.end)` of the source with `replacement`,
+    /// reparse, and swap in the result. On reparse failure nothing changes and
+    /// the parser's error is returned. A zero-width `span` is an insertion.
+    pub fn replaceAtSpan(self: *Splicer, span: Span, replacement: []const u8) !void {
+        std.debug.assert(span.start <= span.end);
+        std.debug.assert(span.end <= self.source.items.len);
+        const s = self.source.items;
+
+        // Assemble the whole new source once, then reparse it. Building a fresh
+        // buffer (rather than mutating in place) means the rollback path is
+        // just "throw the new buffer away" — the old source/AST never moved.
+        const total = span.start + replacement.len + (s.len - span.end);
+        var new_src: std.ArrayList(u8) = .empty;
+        new_src.ensureTotalCapacityPrecise(self.allocator, total) catch |err| {
+            new_src.deinit(self.allocator);
+            return err;
+        };
+        new_src.appendSliceAssumeCapacity(s[0..span.start]);
+        new_src.appendSliceAssumeCapacity(replacement);
+        new_src.appendSliceAssumeCapacity(s[span.end..]);
+
+        const new_ast = self.parse_fn(self.parse_ctx, self.allocator, new_src.items) catch |err| {
+            new_src.deinit(self.allocator);
+            return err;
+        };
+
+        // Commit: the reparse succeeded, so retire the old state. The pre-edit
+        // source goes onto the undo history (not freed), and any redo is dropped
+        // now that a fresh edit has diverged the timeline.
+        self.ast.deinit();
+        self.ast = new_ast;
+        self.recordUndo(self.source);
+        self.clearRedo();
+        self.source = new_src;
+        self.last_change = .{
+            .old = span,
+            .new = Span.init(span.start, span.start + replacement.len),
+        };
+    }
+
+    // ── undo / redo ─────────────────────────────────────────────────────────
+
+    /// Retire a pre-edit source buffer onto the undo stack, evicting the oldest
+    /// entry once past the cap. Takes ownership of `buf`.
+    fn recordUndo(self: *Splicer, buf: std.ArrayList(u8)) void {
+        self.undo_stack.append(self.allocator, buf) catch {
+            var b = buf;
+            b.deinit(self.allocator);
+            return;
+        };
+        if (self.undo_stack.items.len > MAX_UNDO) {
+            var oldest = self.undo_stack.orderedRemove(0);
+            oldest.deinit(self.allocator);
+        }
+    }
+
+    fn clearRedo(self: *Splicer) void {
+        for (self.redo_stack.items) |*b| b.deinit(self.allocator);
+        self.redo_stack.clearRetainingCapacity();
+    }
+
+    /// Merge the most recent edit into the step before it, so a run of
+    /// keystrokes undoes as one. Drops the latest "before" snapshot, leaving the
+    /// run's earlier one; a no-op unless there are at least two steps to merge.
+    pub fn coalesceLastUndo(self: *Splicer) void {
+        if (self.undo_stack.items.len < 2) return;
+        var top = self.undo_stack.pop().?;
+        top.deinit(self.allocator);
+    }
+
+    /// Restore the previous edit step, if any, moving the current source onto
+    /// the redo stack. Returns the byte-level `Change` (current → restored) so a
+    /// caret can re-anchor, or `null` when there's nothing to undo.
+    pub fn undo(self: *Splicer) !?Change {
+        if (self.undo_stack.items.len == 0) return null;
+        const target = self.undo_stack.pop().?;
+        return try self.swapTo(target, &self.redo_stack);
+    }
+
+    /// Re-apply the most recently undone step, symmetric to `undo`.
+    pub fn redo(self: *Splicer) !?Change {
+        if (self.redo_stack.items.len == 0) return null;
+        const target = self.redo_stack.pop().?;
+        return try self.swapTo(target, &self.undo_stack);
+    }
+
+    /// Make `target` the current source (reparsing it) and push the outgoing
+    /// source onto `other`. Returns the `Change` describing current → target.
+    fn swapTo(self: *Splicer, target: std.ArrayList(u8), other: *std.ArrayList(std.ArrayList(u8))) !?Change {
+        var t = target;
+        const new_ast = self.parse_fn(self.parse_ctx, self.allocator, t.items) catch |err| {
+            // A stored snapshot parsed when it was recorded, so this shouldn't
+            // happen; if it does, drop the entry and surface the error rather
+            // than leave the editor half-swapped.
+            t.deinit(self.allocator);
+            return err;
+        };
+        const change = diffChange(self.source.items, t.items);
+        other.append(self.allocator, self.source) catch {
+            var cur = self.source;
+            cur.deinit(self.allocator); // OOM: lose this redo/undo entry, don't leak
+        };
+        self.ast.deinit();
+        self.ast = new_ast;
+        self.source = t;
+        self.last_change = change;
+        return change;
+    }
+
+    /// The minimal `[start, end)` byte range that differs between `before` and
+    /// `after`, as a `Change` (common prefix and suffix trimmed). Lets undo/redo
+    /// report where the edit landed without tracking edits through composition.
+    fn diffChange(before: []const u8, after: []const u8) Change {
+        const min = @min(before.len, after.len);
+        var p: usize = 0;
+        while (p < min and before[p] == after[p]) p += 1;
+        var s: usize = 0;
+        while (s < min - p and before[before.len - 1 - s] == after[after.len - 1 - s]) s += 1;
+        return .{
+            .old = Span.init(p, before.len - s),
+            .new = Span.init(p, after.len - s),
+        };
+    }
+
+    // ── ops ─────────────────────────────────────────────────────────────
+    // Two flavors of each op: a `…ById` form taking a resolved `Node.Id` (what
+    // a selector match hands you), and a path form that just resolves the index
+    // path and delegates. Both converge on `replaceAtSpan`. Ids are valid only
+    // against the CURRENT `ast` (recompute after any successful edit).
+
+    /// A node's span, or `error.NoNodeSpan` if it's the degenerate `(0,0)` that
+    /// means "unset". Some parsers don't populate spans for every kind yet
+    /// (notably Markdown inline nodes — links, emphasis), and splicing at a
+    /// `(0,0)` span would silently corrupt the document at offset 0 instead of
+    /// touching the intended node. Guarding the whole-node ops turns that into
+    /// a clear error. (A real node never legitimately occupies zero bytes at
+    /// offset 0.)
+    fn nodeSpan(self: *Splicer, id: Node.Id) !Span {
+        const s = self.ast.nodes[id].span;
+        if (s.start == 0 and s.end == 0) return error.NoNodeSpan;
+        return s;
+    }
+
+    /// Replace the whole source of the node at `path`.
+    pub fn replaceNode(self: *Splicer, path: []const usize, text: []const u8) !void {
+        try self.replaceNodeById(try self.ast.getIdByPath(path), text);
+    }
+    pub fn replaceNodeById(self: *Splicer, id: Node.Id, text: []const u8) !void {
+        try self.replaceAtSpan(try self.nodeSpan(id), text);
+    }
+
+    /// Replace the interior (between-delimiters `content_span`) of the
+    /// container. `error.NoContentSpan` if it has none (a leaf, or a djot
+    /// container the parser left with a null interior — see the module doc).
+    pub fn replaceContent(self: *Splicer, path: []const usize, text: []const u8) !void {
+        try self.replaceContentById(try self.ast.getIdByPath(path), text);
+    }
+    pub fn replaceContentById(self: *Splicer, id: Node.Id, text: []const u8) !void {
+        const cs = self.ast.nodes[id].content_span orelse return error.NoContentSpan;
+        try self.replaceAtSpan(cs, text);
+    }
+
+    /// Insert `text` immediately before / after the node (at its span start /
+    /// end). The caller supplies any needed separators/newlines — the editor
+    /// does no whitespace guessing.
+    pub fn insertBefore(self: *Splicer, path: []const usize, text: []const u8) !void {
+        try self.insertBeforeById(try self.ast.getIdByPath(path), text);
+    }
+    pub fn insertBeforeById(self: *Splicer, id: Node.Id, text: []const u8) !void {
+        const at = (try self.nodeSpan(id)).start;
+        try self.replaceAtSpan(Span.init(at, at), text);
+    }
+    pub fn insertAfter(self: *Splicer, path: []const usize, text: []const u8) !void {
+        try self.insertAfterById(try self.ast.getIdByPath(path), text);
+    }
+    pub fn insertAfterById(self: *Splicer, id: Node.Id, text: []const u8) !void {
+        const at = (try self.nodeSpan(id)).end;
+        try self.replaceAtSpan(Span.init(at, at), text);
+    }
+
+    /// Insert `text` as the `index`-th child of the container. Anchor rules:
+    /// `index == 0` -> before the current first child; an index at or past the
+    /// child count -> after the current last child; otherwise -> before the
+    /// index-th child. An *empty* container is anchored at its `content_span`
+    /// start (`error.NoContentSpan` if it has none).
+    pub fn insertChild(self: *Splicer, path: []const usize, index: usize, text: []const u8) !void {
+        try self.insertChildById(try self.ast.getIdByPath(path), index, text);
+    }
+    pub fn insertChildById(self: *Splicer, id: Node.Id, index: usize, text: []const u8) !void {
+        const first = self.ast.nodes[id].first_child orelse {
+            const cs = self.ast.nodes[id].content_span orelse return error.NoContentSpan;
+            return self.replaceAtSpan(Span.init(cs.start, cs.start), text);
+        };
+
+        var cur: ?Node.Id = first;
+        var i: usize = 0;
+        var last: Node.Id = first;
+        var prev_last: ?Node.Id = null; // the sibling before `last`, for gap sampling
+        while (cur) |c| {
+            if (i == index) {
+                const at = self.ast.nodes[c].span.start;
+                return self.replaceAtSpan(Span.init(at, at), text);
+            }
+            if (i > 0) prev_last = last;
+            last = c;
+            cur = self.ast.nodes[c].next_sibling;
+            i += 1;
+        }
+        // Appending past the last child. The between-child branch above anchors
+        // at the next sibling's start; with no next sibling we must synthesize
+        // the point a sibling *would* start — otherwise the new node joins onto
+        // the last one (`- b` + `- new` -> `- b- new`). The separator between
+        // siblings is format-specific (a newline for block lists, nothing for
+        // inline XML children), so infer it from the source rather than assume:
+        //   1. A trailing newline already sits after the last child -> step past
+        //      it (its own line ended; the new node starts on the next line).
+        //   2. No trailing newline, but the existing siblings are newline-
+        //      separated (sampled gap contains '\n') -> the last line just lacks
+        //      its terminator (e.g. EOF); inject one before the new node.
+        //   3. Otherwise siblings are adjacent (inline) -> splice verbatim.
+        const src = self.source.items;
+        const at = self.ast.nodes[last].span.end;
+        if (at < src.len and src[at] == '\n') {
+            return self.replaceAtSpan(Span.init(at + 1, at + 1), text);
+        }
+        const siblings_line_separated = if (prev_last) |p| blk: {
+            const gap = src[self.ast.nodes[p].span.end..self.ast.nodes[last].span.start];
+            break :blk std.mem.indexOfScalar(u8, gap, '\n') != null;
+        } else false;
+        if (siblings_line_separated) {
+            const buf = try self.allocator.alloc(u8, text.len + 1);
+            defer self.allocator.free(buf);
+            buf[0] = '\n';
+            @memcpy(buf[1..], text);
+            return self.replaceAtSpan(Span.init(at, at), buf);
+        }
+        try self.replaceAtSpan(Span.init(at, at), text);
+    }
+
+    /// Delete the node (remove exactly its span; no whitespace cleanup). The
+    /// predictable primitive — see `deleteNodeSmart` for the block-aware
+    /// variant that also tidies the surrounding blank lines.
+    pub fn deleteNode(self: *Splicer, path: []const usize) !void {
+        try self.deleteNodeById(try self.ast.getIdByPath(path));
+    }
+    pub fn deleteNodeById(self: *Splicer, id: Node.Id) !void {
+        try self.replaceAtSpan(try self.nodeSpan(id), "");
+    }
+
+    /// Delete the node, tidying surrounding whitespace so no dangling blank
+    /// line is left behind. For a node that occupies WHOLE LINES (a block —
+    /// paragraph, heading, list, container directive, …) this also removes the
+    /// block's terminating newline and one blank-line separator, collapsing
+    /// `A⏎⏎B⏎⏎C` down to `A⏎⏎C` when `B` is deleted (and trimming the now-
+    /// dangling separator at a document edge). For a MID-LINE node (an inline
+    /// — emphasis, a link) line surgery would be wrong, so it falls back to the
+    /// exact-span delete of `deleteNode`. See `tidyDeletionSpan`.
+    pub fn deleteNodeSmart(self: *Splicer, path: []const usize) !void {
+        try self.deleteNodeSmartById(try self.ast.getIdByPath(path));
+    }
+    pub fn deleteNodeSmartById(self: *Splicer, id: Node.Id) !void {
+        const span = try self.nodeSpan(id);
+        try self.replaceAtSpan(tidyDeletionSpan(self.source.items, span), "");
+    }
+
+    /// Unwrap the node: replace its whole span with the source text of its
+    /// interior (`content_span`), dropping the wrapper but keeping the children
+    /// in place — e.g. peel a `:::vis{…}` container down to just the blocks
+    /// inside it, or a `<div>` down to its contents. Lossless: the interior is
+    /// spliced in verbatim, and the wrapper's own surrounding blank lines are
+    /// left untouched (the interior takes the block's place). A node with no
+    /// interior (`content_span == null`: a leaf, or an EMPTY container — nothing
+    /// to keep) degrades to a smart delete.
+    ///
+    /// Because the interior is spliced VERBATIM, unwrap is exactly right for
+    /// containers whose content lines carry no per-line marker (directives,
+    /// divs, sections). For a marker-prefixed container (a block quote's `>`, a
+    /// list item's indent) the markers live inside `content_span` and would
+    /// survive the unwrap — stripping those needs serializer-assisted
+    /// re-emission, which this span-splice editor deliberately doesn't do.
+    pub fn unwrapNode(self: *Splicer, path: []const usize) !void {
+        try self.unwrapNodeById(try self.ast.getIdByPath(path));
+    }
+    pub fn unwrapNodeById(self: *Splicer, id: Node.Id) !void {
+        const span = try self.nodeSpan(id);
+        const cs = self.ast.nodes[id].content_span orelse return self.deleteNodeSmartById(id);
+        // `interior` aliases `self.source`; `replaceAtSpan` copies it into the
+        // new buffer before retiring the old source, so this is safe.
+        const interior = self.source.items[cs.start..cs.end];
+        try self.replaceAtSpan(span, interior);
+    }
+
+    // ── range-oriented rich-text ops (the "toolbar", P5) ─────────────────────
+    // These stay language-agnostic: the caller (which knows the format) supplies
+    // the delimiter bytes and the target `Node.Kind` tag, so this engine never
+    // imports a language module. The format→delimiter table lives at the C-ABI
+    // boundary. `wrapRange` always adds; `toggleInline` adds or removes based on
+    // whether the range already *is* a node of that kind.
+
+    /// The tag half of `Node.Kind` — a plain enum of kind names, what a caller
+    /// names an inline kind by (`.strong`, `.emph`, …) without its payload.
+    pub const KindTag = std.meta.Tag(Node.Kind);
+
+    /// Wrap `[span.start, span.end)` with `open`/`close` in a single splice
+    /// (one reparse), e.g. `*`…`*` to bold a selection. Losslessly reversible
+    /// by `toggleInline`. The reparse validates the result; a delimiter that
+    /// doesn't parse in context rolls the edit back like any other.
+    pub fn wrapRange(self: *Splicer, span: Span, open: []const u8, close: []const u8) !void {
+        std.debug.assert(span.start <= span.end);
+        std.debug.assert(span.end <= self.source.items.len);
+        const interior = self.source.items[span.start..span.end];
+        const buf = try self.allocator.alloc(u8, open.len + interior.len + close.len);
+        defer self.allocator.free(buf);
+        @memcpy(buf[0..open.len], open);
+        @memcpy(buf[open.len..][0..interior.len], interior);
+        @memcpy(buf[open.len + interior.len ..], close);
+        try self.replaceAtSpan(span, buf);
+    }
+
+    /// Toggle an inline mark of `kind` over `span`. If `span` already *is* a
+    /// node of `kind` — its whole span or its interior `content_span` exactly
+    /// equal to `span` — the mark is removed (delimiters stripped); otherwise
+    /// `span` is wrapped with `open`/`close`. Mirrors a rich editor's Cmd-B:
+    /// select a word, bold it; select it again, un-bold it.
+    pub fn toggleInline(self: *Splicer, span: Span, kind: KindTag, open: []const u8, close: []const u8) !void {
+        const id = self.inlineNodeCovering(span, kind) orelse
+            return self.wrapRange(span, open, close);
+
+        const node = self.ast.nodes[id];
+        // Prefer the parser's interior (correct regardless of delimiter width);
+        // fall back to stripping the supplied delimiters for a kind the parser
+        // leaves without a `content_span` (e.g. `verbatim`). Both replacement
+        // slices alias `self.source`, which `replaceAtSpan` copies before
+        // retiring the old buffer — safe.
+        if (node.content_span) |cs| {
+            try self.replaceAtSpan(node.span, self.source.items[cs.start..cs.end]);
+            return;
+        }
+        const s = self.source.items[node.span.start..node.span.end];
+        if (s.len >= open.len + close.len and
+            std.mem.startsWith(u8, s, open) and std.mem.endsWith(u8, s, close))
+        {
+            try self.replaceAtSpan(node.span, s[open.len .. s.len - close.len]);
+            return;
+        }
+        // Matched a node of this kind but can't cleanly recover its interior.
+        return error.NoContentSpan;
+    }
+
+    /// The id of a node of `kind` whose whole span or interior exactly equals
+    /// `span` — the "is this selection already marked?" test behind
+    /// `toggleInline`. `null` if none.
+    fn inlineNodeCovering(self: *Splicer, span: Span, kind: KindTag) ?Node.Id {
+        for (self.ast.nodes, 0..) |node, id| {
+            if (std.meta.activeTag(node.kind) != kind) continue;
+            if (node.span.eql(span)) return @intCast(id);
+            if (node.content_span) |cs| {
+                if (cs.eql(span)) return @intCast(id);
+            }
+        }
+        return null;
+    }
+};
+
+// ── smart-delete whitespace tidying ────────────────────────────────────────
+
+/// A line's content (its bytes excluding the terminating newline) is "blank"
+/// if it holds only spaces/tabs (and a lone `\r` from a CRLF ending).
+fn isBlankRun(s: []const u8) bool {
+    for (s) |c| {
+        if (c != ' ' and c != '\t' and c != '\r') return false;
+    }
+    return true;
+}
+
+/// From `from` (a line start), consume consecutive blank lines, returning the
+/// offset of the first non-blank line (or `source.len`). A trailing blank
+/// "line" with no newline (just whitespace before EOF) is consumed too.
+fn consumeBlankLinesForward(source: []const u8, from: usize) usize {
+    var i = from;
+    while (i < source.len) {
+        var j = i;
+        while (j < source.len and source[j] != '\n') j += 1;
+        if (!isBlankRun(source[i..j])) break;
+        i = if (j < source.len) j + 1 else j;
+        if (j >= source.len) break; // trailing blank without a newline
+    }
+    return i;
+}
+
+/// From `from` (a line start), consume consecutive PRECEDING blank lines,
+/// returning the start offset of the earliest one (or `from` if the previous
+/// line isn't blank / there is none).
+fn consumeBlankLinesBackward(source: []const u8, from: usize) usize {
+    var s = from;
+    while (s > 0 and source[s - 1] == '\n') {
+        const nl = s - 1; // the newline terminating the previous line
+        var pstart = nl;
+        while (pstart > 0 and source[pstart - 1] != '\n') pstart -= 1;
+        if (!isBlankRun(source[pstart..nl])) break;
+        s = pstart;
+    }
+    return s;
+}
+
+/// The range to delete for a "tidy" removal of a node whose exact span is
+/// `span`. If `span` occupies whole lines (starts at a line start and ends at
+/// a line end — i.e. a block), the returned range also swallows the block's
+/// terminating newline and the blank-line separator on one side: the trailing
+/// blanks normally (leaving the leading blank as the surviving neighbors'
+/// separator), or — when the block was the LAST thing in the document — the
+/// leading blanks too, so nothing dangles at EOF. A mid-line span (an inline
+/// node) is returned unchanged: exact delete, since line surgery there would
+/// clip unrelated text.
+fn tidyDeletionSpan(source: []const u8, span: Span) Span {
+    const len = source.len;
+    var s = span.start;
+    var e = span.end;
+
+    const at_line_start = (s == 0) or (s <= len and source[s - 1] == '\n');
+    const at_line_end = (e == len) or (e < len and (source[e] == '\n' or source[e] == '\r'));
+    if (!at_line_start or !at_line_end) return span;
+
+    if (e < len and source[e] == '\r') e += 1;
+    if (e < len and source[e] == '\n') e += 1;
+    e = consumeBlankLinesForward(source, e);
+    if (e >= len) s = consumeBlankLinesBackward(source, s);
+
+    return Span.init(s, e);
+}
+
+// ── tests ────────────────────────────────────────────────────────────────
+// XML is the test vehicle: it has real spans + `content_span` and, uniquely
+// among Twig's languages, can fail to parse — which is what exercises the
+// rollback path. Imported inside the test bodies so non-test builds of this
+// module stay language-dependency-free.
+
+const testing = std.testing;
+
+fn parseXml(ctx: *const anyopaque, a: Allocator, s: []const u8) anyerror!AST {
+    _ = ctx;
+    const Xml = @import("../languages/xml/xml.zig");
+    return Xml.parse(a, s);
+}
+
+/// Second test vehicle: Markdown, whose block children (list items, paragraphs)
+/// are direct siblings separated by real newlines in the source — the shape XML
+/// can't produce (it interns inter-element whitespace as its own text nodes).
+/// Needed to exercise `insertChild`'s line-separated append path.
+fn parseMarkdown(ctx: *const anyopaque, a: Allocator, s: []const u8) anyerror!AST {
+    _ = ctx;
+    const Markdown = @import("../languages/markdown/markdown.zig");
+    var doc = try Markdown.parse(a, s, .{});
+    doc.link_references.deinit(a);
+    doc.footnotes.deinit(a);
+    return doc.ast;
+}
+
+/// A throwaway context for the tests below, which use `parseXml` (which
+/// ignores its `ctx`). Any stable pointer works; this is the conventional one.
+const test_ctx: u8 = 0;
+
+test "replaceContent rewrites an element interior, losslessly" {
+    var ed = try Splicer.init(testing.allocator, "<a><b>hi</b></a>", &test_ctx, parseXml);
+    defer ed.deinit();
+
+    // Path [0,0] = doc -> <a> -> <b>. Replace <b>'s interior "hi".
+    try ed.replaceContent(&.{ 0, 0 }, "bye");
+    try testing.expectEqualStrings("<a><b>bye</b></a>", ed.sourceBytes());
+}
+
+test "insertChild appends and inserts by index" {
+    var ed = try Splicer.init(testing.allocator, "<r><a/><c/></r>", &test_ctx, parseXml);
+    defer ed.deinit();
+
+    // Insert between the two children (index 1 of <r>).
+    try ed.insertChild(&.{0}, 1, "<b/>");
+    try testing.expectEqualStrings("<r><a/><b/><c/></r>", ed.sourceBytes());
+
+    // Append at the end (index past child count).
+    try ed.insertChild(&.{0}, 99, "<d/>");
+    try testing.expectEqualStrings("<r><a/><b/><c/><d/></r>", ed.sourceBytes());
+
+    // Insert at the front (index 0).
+    try ed.insertChild(&.{0}, 0, "<z/>");
+    try testing.expectEqualStrings("<r><z/><a/><b/><c/><d/></r>", ed.sourceBytes());
+}
+
+test "insertChild appends a block child onto its own line" {
+    // The bullet list is the doc's first child (path [0]); its items are
+    // newline-separated siblings. Appending past the end must start the new
+    // item on a fresh line rather than join the last one (`- b` + `- c`).
+    var ed = try Splicer.init(testing.allocator, "- a\n- b\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+
+    try ed.insertChild(&.{0}, 99, "- c\n");
+    try testing.expectEqualStrings("- a\n- b\n- c\n", ed.sourceBytes());
+}
+
+test "insertChild append injects a separator when the last line lacks a newline" {
+    // No trailing newline after `- b`: the append can't step past one, so it
+    // infers from the newline-separated siblings that a separator is needed and
+    // injects it (rather than producing `- b- c`).
+    var ed = try Splicer.init(testing.allocator, "- a\n- b", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+
+    try ed.insertChild(&.{0}, 99, "- c\n");
+    try testing.expectEqualStrings("- a\n- b\n- c\n", ed.sourceBytes());
+}
+
+test "insertBefore / insertAfter / deleteNode" {
+    var ed = try Splicer.init(testing.allocator, "<r><a/><b/></r>", &test_ctx, parseXml);
+    defer ed.deinit();
+
+    try ed.insertAfter(&.{ 0, 0 }, "<x/>");
+    try testing.expectEqualStrings("<r><a/><x/><b/></r>", ed.sourceBytes());
+
+    try ed.deleteNode(&.{ 0, 0 });
+    try testing.expectEqualStrings("<r><x/><b/></r>", ed.sourceBytes());
+
+    try ed.insertBefore(&.{ 0, 0 }, "<y/>");
+    try testing.expectEqualStrings("<r><y/><x/><b/></r>", ed.sourceBytes());
+}
+
+test "unwrapNode keeps a container's children, drops the wrapper" {
+    var ed = try Splicer.init(testing.allocator, "<r><box><b/><c/></box></r>", &test_ctx, parseXml);
+    defer ed.deinit();
+    try ed.unwrapNode(&.{ 0, 0 }); // the <box> (doc=.{}, <r>=.{0}, <box>=.{0,0})
+    try testing.expectEqualStrings("<r><b/><c/></r>", ed.sourceBytes());
+}
+
+test "unwrapNode on an empty/childless container degrades to delete" {
+    var ed = try Splicer.init(testing.allocator, "<r><box/></r>", &test_ctx, parseXml);
+    defer ed.deinit();
+    // A self-closing element has no interior (null content_span) -> nothing to
+    // keep -> the wrapper is removed.
+    try ed.unwrapNode(&.{ 0, 0 });
+    try testing.expectEqualStrings("<r></r>", ed.sourceBytes());
+}
+
+test "a reparse-breaking edit rolls back and leaves the document untouched" {
+    var ed = try Splicer.init(testing.allocator, "<a>ok</a>", &test_ctx, parseXml);
+    defer ed.deinit();
+
+    // Replace <a>'s interior with a fragment that makes the doc malformed
+    // (`<a><b></a>` — the close tag no longer matches) -> the reparse fails
+    // and the whole edit is abandoned.
+    try testing.expectError(error.MismatchedCloseTag, ed.replaceContent(&.{0}, "<b>"));
+    // Byte-for-byte unchanged, and still a valid, navigable tree.
+    try testing.expectEqualStrings("<a>ok</a>", ed.sourceBytes());
+    _ = try ed.astView().getIdByPath(&.{0});
+}
+
+test "last_change records the byte effect of the last successful edit" {
+    var ed = try Splicer.init(testing.allocator, "<a>hi</a>", &test_ctx, parseXml);
+    defer ed.deinit();
+
+    try testing.expectEqual(@as(?Splicer.Change, null), ed.last_change);
+
+    // Replace "hi" [3,5) with "bye" -> new interior occupies [3,6).
+    try ed.replaceContent(&.{0}, "bye");
+    const c = ed.last_change.?;
+    try testing.expectEqual(@as(usize, 3), c.old.start);
+    try testing.expectEqual(@as(usize, 5), c.old.end);
+    try testing.expectEqual(@as(usize, 3), c.new.start);
+    try testing.expectEqual(@as(usize, 6), c.new.end);
+
+    // A failed edit leaves last_change untouched.
+    try testing.expectError(error.MismatchedCloseTag, ed.replaceContent(&.{0}, "<b>"));
+    const c2 = ed.last_change.?;
+    try testing.expectEqual(@as(usize, 6), c2.new.end);
+}
+
+test "wrapRange bolds a selection; toggleInline removes it" {
+    var ed = try Splicer.init(testing.allocator, "a word b\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+
+    // "word" is [2,6). Bold it (Markdown strong = **…**).
+    try ed.wrapRange(Span.init(2, 6), "**", "**");
+    try testing.expectEqualStrings("a **word** b\n", ed.sourceBytes());
+
+    // The strong node's interior is now "word" [4,8); toggle it back off.
+    try ed.toggleInline(Span.init(4, 8), .strong, "**", "**");
+    try testing.expectEqualStrings("a word b\n", ed.sourceBytes());
+}
+
+test "toggleInline wraps when the range isn't already marked" {
+    var ed = try Splicer.init(testing.allocator, "a word b\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    try ed.toggleInline(Span.init(2, 6), .emph, "*", "*");
+    try testing.expectEqualStrings("a *word* b\n", ed.sourceBytes());
+}
+
+test "toggleInline strips a verbatim run by delimiter (no content_span)" {
+    var ed = try Splicer.init(testing.allocator, "a `code` b\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    // The verbatim node is [2,8) "`code`" with no content_span; matched by whole
+    // span, its interior recovered by peeling the backticks.
+    try ed.toggleInline(Span.init(2, 8), .verbatim, "`", "`");
+    try testing.expectEqualStrings("a code b\n", ed.sourceBytes());
+}
+
+test "replaceContent on a leaf yields NoContentSpan" {
+    var ed = try Splicer.init(testing.allocator, "<a>hi</a>", &test_ctx, parseXml);
+    defer ed.deinit();
+    // [0,0] = the "hi" text node, a leaf: no interior to splice.
+    try testing.expectError(error.NoContentSpan, ed.replaceContent(&.{ 0, 0 }, "x"));
+}
+
+test "path navigation reports out-of-bounds" {
+    var ed = try Splicer.init(testing.allocator, "<a><b/></a>", &test_ctx, parseXml);
+    defer ed.deinit();
+    try testing.expectError(error.PathOutOfBounds, ed.astView().getIdByPath(&.{ 0, 5 }));
+    try testing.expectError(error.PathOutOfBounds, ed.astView().getIdByPath(&.{ 0, 0, 0 }));
+}
+
+// ── smart-delete (tidyDeletionSpan) ─────────────────────────────────────────
+
+/// Apply `tidyDeletionSpan` to `src` at `[start,end)` and return the resulting
+/// bytes (what a smart delete of that span would leave behind).
+fn tidyDelete(src: []const u8, start: usize, end: usize) [256]u8 {
+    var buf: [256]u8 = undefined;
+    const del = tidyDeletionSpan(src, Span.init(start, end));
+    const n = del.start + (src.len - del.end);
+    @memcpy(buf[0..del.start], src[0..del.start]);
+    @memcpy(buf[del.start..n], src[del.end..]);
+    return buf;
+}
+
+fn expectTidy(src: []const u8, start: usize, end: usize, want: []const u8) !void {
+    const buf = tidyDelete(src, start, end);
+    const del = tidyDeletionSpan(src, Span.init(start, end));
+    const got = buf[0 .. del.start + (src.len - del.end)];
+    try testing.expectEqualStrings(want, got);
+}
+
+test "tidyDeletionSpan: middle block leaves exactly one blank-line separator" {
+    // "A\n\nB\n\nC\n", delete B ([3,4)).
+    try expectTidy("A\n\nB\n\nC\n", 3, 4, "A\n\nC\n");
+}
+
+test "tidyDeletionSpan: first block leaves the rest clean at the top" {
+    try expectTidy("A\n\nB\n\nC\n", 0, 1, "B\n\nC\n");
+}
+
+test "tidyDeletionSpan: last block trims the now-dangling trailing blank" {
+    // "A\n\nB\n\nC\n", delete C ([6,7)) -> no trailing blank left after B.
+    try expectTidy("A\n\nB\n\nC\n", 6, 7, "A\n\nB\n");
+}
+
+test "tidyDeletionSpan: adjacent blocks with no blank line between them" {
+    try expectTidy("# A\n# B\n# C\n", 4, 7, "# A\n# C\n");
+}
+
+test "tidyDeletionSpan: a multi-line block plus its blank separator" {
+    // A two-line block between two others; delete it and one separator.
+    const src = "top\n\n:::x\nbody\n:::\n\nbottom\n";
+    // block span = the ":::x\nbody\n:::" region = [5, 18)
+    try expectTidy(src, 5, 18, "top\n\nbottom\n");
+}
+
+test "tidyDeletionSpan: the only block empties the document" {
+    try expectTidy("A\n", 0, 1, "");
+}
+
+test "tidyDeletionSpan: a mid-line (inline) span is deleted exactly, no line surgery" {
+    // "a *b* c\n", delete the "*b*" at [2,5): must NOT swallow the line.
+    try expectTidy("a *b* c\n", 2, 5, "a  c\n");
+}
+
+// ── undo / redo ──────────────────────────────────────────────────────────────
+
+test "undo restores the pre-edit source; redo re-applies it" {
+    var ed = try Splicer.init(testing.allocator, "hello\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+
+    try ed.replaceAtSpan(Span.init(5, 5), "!");
+    try testing.expectEqualStrings("hello!\n", ed.sourceBytes());
+
+    const undone = (try ed.undo()).?;
+    try testing.expectEqualStrings("hello\n", ed.sourceBytes());
+    // The change reports where the edit was, in the restored source.
+    try testing.expectEqual(@as(usize, 5), undone.new.end);
+
+    const redone = (try ed.redo()).?;
+    try testing.expectEqualStrings("hello!\n", ed.sourceBytes());
+    try testing.expectEqual(@as(usize, 6), redone.new.end);
+}
+
+test "undo and redo are no-ops (null) at the ends of history" {
+    var ed = try Splicer.init(testing.allocator, "x\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    try testing.expect((try ed.undo()) == null);
+    try ed.replaceAtSpan(Span.init(1, 1), "y");
+    _ = try ed.undo();
+    try testing.expect((try ed.undo()) == null); // history exhausted
+    _ = try ed.redo();
+    try testing.expect((try ed.redo()) == null);
+}
+
+test "coalesceLastUndo folds a keystroke run into one undo step" {
+    var ed = try Splicer.init(testing.allocator, "\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+
+    // Simulate typing "abc": the first splice is its own step, each following
+    // one coalesces into it (what a frontend does for a run of typing).
+    try ed.replaceAtSpan(Span.init(0, 0), "a");
+    try ed.replaceAtSpan(Span.init(1, 1), "b");
+    ed.coalesceLastUndo();
+    try ed.replaceAtSpan(Span.init(2, 2), "c");
+    ed.coalesceLastUndo();
+    try testing.expectEqualStrings("abc\n", ed.sourceBytes());
+
+    // One undo removes the whole run.
+    _ = try ed.undo();
+    try testing.expectEqualStrings("\n", ed.sourceBytes());
+    try testing.expect((try ed.undo()) == null);
+}
+
+test "a fresh edit invalidates the redo stack" {
+    var ed = try Splicer.init(testing.allocator, "\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    try ed.replaceAtSpan(Span.init(0, 0), "a");
+    _ = try ed.undo(); // redo now holds the "a" state
+    try ed.replaceAtSpan(Span.init(0, 0), "b"); // diverge
+    try testing.expect((try ed.redo()) == null);
+    try testing.expectEqualStrings("b\n", ed.sourceBytes());
+}
