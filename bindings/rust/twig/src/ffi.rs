@@ -320,6 +320,9 @@ unsafe extern "C" {
     pub fn twig_editor_redo(editor: *mut TwigEditor, out_change: *mut TwigChange) -> TwigStatus;
     pub fn twig_editor_coalesce_last(editor: *mut TwigEditor) -> TwigStatus;
     pub fn twig_editor_revision(editor: *mut TwigEditor) -> u64;
+    pub fn twig_editor_dirty_range(editor: *mut TwigEditor, out_span: *mut TwigSpan)
+        -> TwigStatus;
+    pub fn twig_editor_clear_dirty(editor: *mut TwigEditor) -> TwigStatus;
     pub fn twig_editor_set_caret_blob(
         editor: *mut TwigEditor,
         blob_ptr: *const u8,

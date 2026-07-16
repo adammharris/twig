@@ -1093,6 +1093,46 @@ pub export fn twig_editor_revision(ed: ?*TwigEditor) u64 {
     return asEditor(raw).editor.splicer.revision;
 }
 
+/// Report the cumulative dirty byte range for `ed` — the union of every
+/// mutation's byte effect (`edit_range`, the locator ops, and undo/redo alike)
+/// since the last `twig_editor_clear_dirty`, or since the editor was created if
+/// it has never been cleared. In CURRENT source coordinates. Writes the range
+/// into `out_span` and returns `.ok`; returns `.not_found` when the document is
+/// clean relative to the last clear (`out_span` left untouched).
+///
+/// This is the incremental-rebuild companion to `twig_editor_revision`:
+/// `revision` says *whether* to rebuild a cached view, this says *which bytes*
+/// to rebuild so a consumer can touch only the affected rows/spans. The range
+/// is a single CONSERVATIVE interval — it always covers every changed byte and
+/// may over-cover the gap between edits to disjoint regions, but never
+/// under-covers.
+///
+/// It reports where BYTES differ (exact, because Twig splices losslessly and
+/// never reflows untouched bytes), NOT where the PARSE differs: an edit can
+/// reinterpret bytes outside this range — opening a code fence, a `#` promoting
+/// a paragraph to a heading. A consumer rebuilding STRUCTURE from the range
+/// should widen it to the enclosing block(s) itself (e.g. via
+/// `twig_editor_node_at` on each end); that policy is the renderer's, not
+/// Twig's. Typical loop: on a repaint, if `twig_editor_revision` moved, read
+/// this range, rebuild the rows it (widened) covers, then `twig_editor_clear_dirty`.
+pub export fn twig_editor_dirty_range(ed: ?*TwigEditor, out_span: ?*TwigSpan) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const slot = out_span orelse return .invalid_argument;
+    const d = asEditor(raw).editor.splicer.dirtyRange() orelse return .not_found;
+    slot.* = spanC(d);
+    return .ok;
+}
+
+/// Acknowledge the current dirty range: mark `ed` clean so the next
+/// `twig_editor_dirty_range` reports only mutations made after this call. Call
+/// it once you have consumed the range (rebuilt the affected view). Leaves the
+/// document, `twig_editor_revision`, and `twig_editor_last_change` untouched.
+pub export fn twig_editor_clear_dirty(ed: ?*TwigEditor) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    asEditor(raw).editor.splicer.clearDirty();
+    return .ok;
+}
+
 /// Attach an opaque, caller-owned blob (e.g. a serialized caret/selection) to
 /// the editor's CURRENT document state. Twig copies the bytes and never
 /// interprets them; it only carries them through the undo history so undo/redo

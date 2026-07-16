@@ -161,12 +161,7 @@ done
 
 ---
 
-## Gotchas (verified, not hypothetical)
-
-- **Inline nodes may lack source spans.** In Markdown, inline nodes (links,
-  emphasis, etc.) aren't given byte spans, so `edit` on them fails with
-  *"that node has no source span"* — edit the enclosing block instead. `query`
-  still finds them fine.
+## Notes
 
 - **`edit` takes exactly one node.** By design — an ambiguous selector errors
   rather than editing all matches. Loop in the shell for many.

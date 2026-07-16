@@ -462,6 +462,30 @@ TwigStatus twig_editor_coalesce_last(TwigEditor *editor);
 // NULL editor (which also matches a fresh editor — harmless as a cache key).
 uint64_t twig_editor_revision(TwigEditor *editor);
 
+// Report the cumulative dirty byte range for `editor` — the union of every
+// mutation's byte effect (edit_range, the locator ops, and undo/redo alike)
+// since the last twig_editor_clear_dirty, or since the editor was created if it
+// has never been cleared — in CURRENT source coordinates. Writes it into
+// `out_span` and returns TWIG_OK; returns TWIG_NOT_FOUND when the document is
+// clean relative to the last clear (`out_span` untouched).
+//
+// The incremental-rebuild companion to twig_editor_revision: revision says
+// WHETHER to rebuild a cached view, this says WHICH bytes, so a consumer touches
+// only the affected rows/spans. A single CONSERVATIVE interval: always covers
+// every changed byte, may over-cover the gap between disjoint edits, never
+// under-covers. It reports where BYTES differ (exact — Twig splices losslessly)
+// NOT where the PARSE differs: an edit can reinterpret bytes outside the range
+// (opening a code fence, a `#` promoting a paragraph to a heading), so a
+// consumer rebuilding STRUCTURE should widen the range to the enclosing
+// block(s) itself (e.g. via twig_editor_node_at on each end).
+TwigStatus twig_editor_dirty_range(TwigEditor *editor, TwigSpan *out_span);
+
+// Acknowledge the current dirty range: mark `editor` clean so the next
+// twig_editor_dirty_range reports only mutations made after this call. Call it
+// once you've consumed the range. Leaves the document, twig_editor_revision, and
+// twig_editor_last_change untouched.
+TwigStatus twig_editor_clear_dirty(TwigEditor *editor);
+
 // Attach an opaque, caller-owned blob (e.g. a serialized caret/selection) to the
 // editor's CURRENT document state. Twig copies the bytes and never interprets
 // them; it only carries them through the undo history so undo/redo hand back the

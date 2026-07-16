@@ -121,6 +121,26 @@ pub const Splicer = struct {
     /// hand-maintaining its own "did something change?" flag: equal revision ⇒
     /// identical document. Starts at 0 for the initial parse.
     revision: u64 = 0,
+    /// The cumulative byte range that has changed since the last `clearDirty`
+    /// (or since `init`), in CURRENT source coordinates, or `null` when nothing
+    /// has changed since then. A single conservative interval, composed from
+    /// each edit's `Change` in O(1): it always covers every byte an edit (or
+    /// undo/redo) touched, and after several edits to disjoint regions may
+    /// over-cover the gap between them, but it never under-covers. The host
+    /// consumes it to rebuild only the affected part of a derived view (glyph
+    /// rows, syntax spans, …) instead of the whole document, then calls
+    /// `clearDirty` to acknowledge it.
+    ///
+    /// A companion to `revision`, not a replacement: `revision` answers "did
+    /// anything change?" (cache key); `dirty` answers "which bytes?" (rebuild
+    /// scope). This reports where BYTES differ, which — because Twig splices
+    /// losslessly and never reflows untouched bytes — is exact. It does NOT
+    /// report where the PARSE differs: an edit can reinterpret bytes outside
+    /// this range (opening a code fence, a `#` promoting a paragraph to a
+    /// heading). A consumer that rebuilds *structure* from the range must widen
+    /// it to the enclosing block(s) itself; that is a render-side policy Twig
+    /// has no business fixing.
+    dirty: ?Span = null,
 
     /// Parse `source_bytes` and build an editor over a private copy of them.
     /// `parse_ctx` is forwarded verbatim to `parse_fn` on the initial parse
@@ -210,11 +230,10 @@ pub const Splicer = struct {
         self.current_caret = .empty;
         self.clearRedo();
         self.source = new_src;
-        self.last_change = .{
+        self.noteChange(.{
             .old = span,
             .new = Span.init(span.start, span.start + replacement.len),
-        };
-        self.revision += 1;
+        });
     }
 
     // ── undo / redo ─────────────────────────────────────────────────────────
@@ -290,8 +309,7 @@ pub const Splicer = struct {
         self.ast = new_ast;
         self.source = t.source;
         self.current_caret = t.caret;
-        self.last_change = change;
-        self.revision += 1;
+        self.noteChange(change);
         return change;
     }
 
@@ -308,6 +326,68 @@ pub const Splicer = struct {
             .old = Span.init(p, before.len - s),
             .new = Span.init(p, after.len - s),
         };
+    }
+
+    // ── change notification (revision + last_change + dirty range) ───────────
+
+    /// The single choke point every successful mutation routes through, so the
+    /// three things that describe "what just changed" can never drift apart:
+    /// publish the byte effect as `last_change`, fold it into the running
+    /// `dirty` range, and bump `revision`. Called by `replaceAtSpan` and
+    /// undo/redo's `swapTo` after they have swapped the new state in.
+    fn noteChange(self: *Splicer, change: Change) void {
+        self.accumulateDirty(change);
+        self.last_change = change;
+        self.revision += 1;
+    }
+
+    /// Fold one edit's `Change` into the running `dirty` interval, in CURRENT
+    /// (post-edit) source coordinates. The existing interval is in the PRE-edit
+    /// coordinate space, so it is first shifted across this edit — positions at
+    /// or after `old.end` move by the length delta, a position landing inside
+    /// the replaced region collapses onto the edit window — then unioned with
+    /// the edit's own `new` range. Unioning into one interval is what makes this
+    /// conservative: it can only ever over-cover, never miss a changed byte.
+    fn accumulateDirty(self: *Splicer, change: Change) void {
+        const old = change.old;
+        const new = change.new;
+        const d = self.dirty orelse {
+            self.dirty = new;
+            return;
+        };
+        // Shift a pre-edit position into post-edit coordinates. A position
+        // interior to the replaced span no longer exists, so a low bound
+        // collapses to the window start and a high bound to the window end
+        // (`new.start`/`new.end`) — either way it is then absorbed by the union
+        // with `new` below. No underflow: for `p >= old.end`, `p >= old.len()`.
+        const shifted_lo = if (d.start <= old.start)
+            d.start
+        else if (d.start >= old.end)
+            d.start - old.len() + new.len()
+        else
+            new.start;
+        const shifted_hi = if (d.end <= old.start)
+            d.end
+        else if (d.end >= old.end)
+            d.end - old.len() + new.len()
+        else
+            new.end;
+        self.dirty = Span.init(@min(shifted_lo, new.start), @max(shifted_hi, new.end));
+    }
+
+    /// The cumulative dirty byte range since the last `clearDirty` (or `init`),
+    /// or `null` if the document is clean relative to that mark. See the `dirty`
+    /// field for the full contract (conservative interval; bytes, not parse).
+    pub fn dirtyRange(self: *const Splicer) ?Span {
+        return self.dirty;
+    }
+
+    /// Acknowledge the current dirty range: mark the document clean so a later
+    /// `dirtyRange` reports only mutations made after this call. The host calls
+    /// it once it has consumed the range (rebuilt the affected view). Leaves
+    /// `revision`, `last_change`, and the document itself untouched.
+    pub fn clearDirty(self: *Splicer) void {
+        self.dirty = null;
     }
 
     // ── ops ─────────────────────────────────────────────────────────────
@@ -985,6 +1065,99 @@ test "revision starts at 0 and bumps once per successful mutation" {
     const r = ed.revision;
     try testing.expect((try ed.undo()) == null);
     try testing.expectEqual(r, ed.revision);
+}
+
+// ── dirty range ─────────────────────────────────────────────────────────────
+
+test "dirty range is null on a fresh editor and after clearDirty" {
+    var ed = try Splicer.init(testing.allocator, "abc\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    try testing.expect(ed.dirtyRange() == null);
+
+    try ed.replaceAtSpan(Span.init(1, 1), "X"); // "aXbc\n"
+    try testing.expect(ed.dirtyRange() != null);
+
+    ed.clearDirty();
+    try testing.expect(ed.dirtyRange() == null);
+    // clearDirty leaves revision untouched — it only acknowledges the range.
+    const rev = ed.revision;
+    ed.clearDirty();
+    try testing.expectEqual(rev, ed.revision);
+}
+
+test "a single edit's dirty range is exactly its inserted bytes" {
+    var ed = try Splicer.init(testing.allocator, "abcd\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    // Insert two bytes at offset 2: the changed span is [2,4).
+    try ed.replaceAtSpan(Span.init(2, 2), "XY"); // "abXYcd\n"
+    const d = ed.dirtyRange().?;
+    try testing.expectEqual(@as(usize, 2), d.start);
+    try testing.expectEqual(@as(usize, 4), d.end);
+    // Everything the dirty range excludes is byte-identical to before — the
+    // losslessness guarantee the range rides on.
+    try testing.expectEqualStrings("abXYcd\n", ed.sourceBytes());
+}
+
+test "dirty range accumulates conservatively across disjoint edits" {
+    var ed = try Splicer.init(testing.allocator, "abcdefgh\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    // Edit near the end first: insert at offset 6 -> changed [6,7).
+    try ed.replaceAtSpan(Span.init(6, 6), "Z"); // "abcdefZgh\n"
+    try testing.expectEqual(@as(usize, 6), ed.dirtyRange().?.start);
+    try testing.expectEqual(@as(usize, 7), ed.dirtyRange().?.end);
+
+    // Now edit near the start: insert at offset 1 -> changed [1,2). The prior
+    // range [6,7) shifts right by the +1 delta to [7,8); the union spans both.
+    try ed.replaceAtSpan(Span.init(1, 1), "Y"); // "aYbcdefZgh\n"
+    const d = ed.dirtyRange().?;
+    try testing.expectEqual(@as(usize, 1), d.start); // low bound = new start
+    try testing.expectEqual(@as(usize, 8), d.end); // high bound = shifted old end
+    // The reported range is a superset of both individual edits (conservative).
+    try testing.expect(d.start <= 1 and d.end >= 8);
+}
+
+test "a deletion shifts a later dirty region left" {
+    var ed = try Splicer.init(testing.allocator, "abcdefgh\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    // Dirty a late region: insert at 6 -> [6,7).
+    try ed.replaceAtSpan(Span.init(6, 6), "Z"); // "abcdefZgh\n", dirty [6,7)
+    // Delete two bytes near the front: [1,3) -> "" (delta -2). The late region
+    // shifts left by 2 to [4,5); union with the deletion point [1,1) is [1,5).
+    try ed.replaceAtSpan(Span.init(1, 3), ""); // "adefZgh\n"
+    const d = ed.dirtyRange().?;
+    try testing.expectEqual(@as(usize, 1), d.start);
+    try testing.expectEqual(@as(usize, 5), d.end);
+    // The shifted high bound still lands on the 'Z' it was tracking.
+    try testing.expectEqualStrings("adefZgh\n", ed.sourceBytes());
+    try testing.expectEqual(@as(u8, 'Z'), ed.sourceBytes()[4]);
+}
+
+test "undo and redo dirty the range they touch" {
+    var ed = try Splicer.init(testing.allocator, "abc\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    try ed.replaceAtSpan(Span.init(3, 3), "d"); // "abcd\n"
+    ed.clearDirty();
+    try testing.expect(ed.dirtyRange() == null);
+
+    // Undo restores "abc\n": the byte that differs is the removed 'd' at [3,3).
+    _ = try ed.undo();
+    try testing.expect(ed.dirtyRange() != null);
+
+    ed.clearDirty();
+    // Redo re-adds 'd': changed span [3,4).
+    _ = try ed.redo();
+    const d = ed.dirtyRange().?;
+    try testing.expectEqual(@as(usize, 3), d.start);
+    try testing.expectEqual(@as(usize, 4), d.end);
+}
+
+test "a failed edit leaves the dirty range untouched" {
+    var xml = try Splicer.init(testing.allocator, "<a>ok</a>", &test_ctx, parseXml);
+    defer xml.deinit();
+    try testing.expect(xml.dirtyRange() == null);
+    // A reparse-breaking edit rolls back; nothing is dirtied.
+    try testing.expectError(error.MismatchedCloseTag, xml.replaceContent(&.{0}, "<b>"));
+    try testing.expect(xml.dirtyRange() == null);
 }
 
 // ── opaque caret blob ─────────────────────────────────────────────────────────

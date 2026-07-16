@@ -570,6 +570,43 @@ impl Editor {
         unsafe { ffi::twig_editor_revision(self.raw.as_ptr()) }
     }
 
+    /// The cumulative dirty byte range since the last [`Editor::clear_dirty`]
+    /// (or since the editor was created) — the union of every mutation's byte
+    /// effect over that window, in current source coordinates — or `None` when
+    /// the document is clean relative to the last clear.
+    ///
+    /// The incremental-rebuild companion to [`Editor::revision`]: `revision`
+    /// says *whether* a cached view (glyph rows, syntax spans) needs rebuilding,
+    /// this says *which bytes* changed, so a consumer rebuilds only the affected
+    /// part instead of the whole document. A single conservative interval: it
+    /// always covers every changed byte and may over-cover the gap between edits
+    /// to disjoint regions, but never under-covers.
+    ///
+    /// It reports where *bytes* differ — exact, because twig splices losslessly
+    /// and never reflows untouched bytes — not where the *parse* differs. An
+    /// edit can reinterpret bytes outside the range (opening a code fence, a `#`
+    /// promoting a paragraph to a heading), so a consumer rebuilding *structure*
+    /// from it should widen the range to the enclosing block(s) itself (e.g. via
+    /// [`Editor::node_at`] on each end). Typical loop: on a repaint, if
+    /// [`Editor::revision`] moved, read this range, rebuild the rows it (widened)
+    /// covers, then call [`Editor::clear_dirty`].
+    pub fn dirty_range(&mut self) -> Option<Range<usize>> {
+        let mut span = ffi::TwigSpan { start: 0, end: 0 };
+        let status = unsafe { ffi::twig_editor_dirty_range(self.raw.as_ptr(), &mut span) };
+        match status.0 {
+            ffi::TwigStatus::OK => Some(span.start..span.end),
+            _ => None,
+        }
+    }
+
+    /// Acknowledge the current dirty range: mark the document clean so a later
+    /// [`Editor::dirty_range`] reports only mutations made after this call. Call
+    /// it once you've consumed the range (rebuilt the affected view). Leaves the
+    /// document, [`Editor::revision`], and [`Editor::last_change`] untouched.
+    pub fn clear_dirty(&mut self) {
+        unsafe { ffi::twig_editor_clear_dirty(self.raw.as_ptr()) };
+    }
+
     /// Attach an opaque, caller-owned blob (e.g. a serialized caret/selection)
     /// to the editor's current document state. Twig copies the bytes and never
     /// interprets them; it only carries them through the undo history so
@@ -1914,6 +1951,33 @@ mod tests {
         assert_eq!(ed.revision(), 2);
         ed.redo().expect("redo ok").expect("something to redo");
         assert_eq!(ed.revision(), 3);
+    }
+
+    #[test]
+    fn editor_dirty_range_tracks_and_clears() {
+        let mut ed = Editor::new_str("abcdefgh\n", Format::Markdown).expect("editor");
+        // Clean to start.
+        assert_eq!(ed.dirty_range(), None);
+
+        // One insertion of two bytes at offset 2 dirties exactly [2, 4).
+        ed.edit_range(2, 2, "XY").expect("edit");
+        assert_eq!(ed.dirty_range(), Some(2..4));
+
+        // A second, disjoint edit near the end accumulates conservatively: the
+        // reported range is a superset covering both edits.
+        ed.edit_range(9, 9, "Z").expect("edit"); // source is now "abXYcdefgZh\n"
+        let d = ed.dirty_range().expect("dirty");
+        assert!(d.start <= 2 && d.end >= 10, "range {d:?} must cover both edits");
+
+        // clear_dirty acknowledges without moving the revision.
+        let rev = ed.revision();
+        ed.clear_dirty();
+        assert_eq!(ed.dirty_range(), None);
+        assert_eq!(ed.revision(), rev);
+
+        // Post-clear, only new mutations show up — and undo counts as one.
+        ed.undo().expect("undo ok").expect("something to undo");
+        assert!(ed.dirty_range().is_some());
     }
 
     #[test]
