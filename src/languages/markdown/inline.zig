@@ -398,8 +398,9 @@ fn runScan(sc: *Scanner, text: []const u8) Allocator.Error![]Node.Id {
                 // (which stays on unconditionally via the `<` case above,
                 // regardless of this flag). See `tryExtUrlAutolink`/
                 // `tryExtWwwAutolink` for the word-boundary and trailing-
-                // punctuation-trimming rules approximated here.
-                const auto_end: ?usize = if (sc.options.autolinks)
+                // punctuation-trimming rules approximated here, and
+                // `inBracket` for why an open bracket suppresses them.
+                const auto_end: ?usize = if (sc.options.autolinks and !sc.inBracket())
                     (if (c == 'w') try tryExtWwwAutolink(sc, text, i) else try tryExtUrlAutolink(sc, text, i))
                 else
                     null;
@@ -654,6 +655,35 @@ pub const Scanner = struct {
         self.head = null;
         self.tail = null;
         self.segments = segments;
+    }
+
+    /// Whether an UNCLOSED `[`/`![` sits to the left in this block — twig's
+    /// `cmark_inline_parser_in_bracket`, which cmark-gfm's extended-autolink
+    /// `match` callback consults to refuse firing inside a bracket
+    /// (`extensions/autolink.c`: `if (in_bracket(p, false) || in_bracket(p,
+    /// true)) return NULL;`). Only the `www.`/url forms consult this; the
+    /// email form deliberately does NOT (see `tryExtEmailAutolink`).
+    ///
+    /// Two things about this are surprising enough to spell out, because both
+    /// are load-bearing and neither is guessable:
+    ///
+    ///   1. It ignores `Bracket.active`, matching cmark, whose `in_bracket`
+    ///      reads cached per-bracket flags and never consults `active`. So a
+    ///      bracket deactivated by an inner link still suppresses.
+    ///   2. The bracket does NOT have to resolve into a link. An unmatched
+    ///      `[` suppresses extended autolinks for the REST of the block —
+    ///      `[a https://x.dev` is `<p>[a https://x.dev</p>`, no link at all,
+    ///      per cmark. That falls out of cmark popping its bracket on EVERY
+    ///      `]` path (link or not), so only a `[` with no `]` at all stays
+    ///      open; `[a] https://x.dev` does autolink. `handleCloseBracket`
+    ///      pops in every path too, so a plain length check reproduces this.
+    ///
+    /// This is why the extension can't simply scan the URL body up to the
+    /// next `]`: per the spec a `]` is an ordinary non-space autolink byte
+    /// (`www.example.com/a]b` links whole), so the bracket context — not the
+    /// byte — is what decides.
+    fn inBracket(self: *const Scanner) bool {
+        return self.brackets.items.len > 0;
     }
 
     /// `text[local_start..local_end)`'s absolute source span, or `null` if

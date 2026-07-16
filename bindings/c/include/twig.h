@@ -583,15 +583,22 @@ TwigStatus twig_editor_toggle_block_container(
 //     text kept — re-linking is the common gesture, and it keeps the op from
 //     nesting `[[t](a)](b)`. To unlink, use twig_editor_unwrap, which peels a
 //     node down to its interior.
-//   * A CARET in an existing autolink (`<https://x.dev>`, `<a@b.dev>`) re-points
-//     it the same way, but there is no text to keep: an autolink's text IS its
-//     destination, so the node is replaced WHOLE, spelled canonically for the
-//     new destination (below) — a `<url>` re-pointed at a relative path becomes
-//     `[dest](dest)`. Only a caret: a selection carries text of its own to link,
-//     and one straddling the autolink's edges has no re-point to mean, so it
-//     wraps as usual. A caret inside BOTH an autolink and a link
-//     (`[<https://x.dev>](d)`) re-points the LINK, whose text is separable from
-//     its destination and so survives.
+//   * A RANGE INSIDE an existing autolink (`<https://x.dev>`, `<a@b.dev>`)
+//     re-points it the same way, but there is no text to keep: an autolink's
+//     text IS its destination, so the node is replaced WHOLE, spelled
+//     canonically for the new destination (below) — a `<url>` re-pointed at a
+//     relative path becomes `[dest](dest)`. This covers a caret and any
+//     selection the autolink contains, including one covering it exactly: an
+//     autolink's URL is not editable text, so no part of it can host a `[`, and
+//     "link half this URL" has no spelling. A caret inside BOTH an autolink and
+//     a link (`[<https://x.dev>](d)`) re-points the LINK, whose text is
+//     separable from its destination and so survives.
+//   * A selection starting or ending strictly INSIDE an autolink without being
+//     contained by it — running from ordinary text into the middle of a URL —
+//     is refused with TWIG_STATUS_NOT_EDITABLE. Half of it is real text, so
+//     there is nothing to re-point, and any splice would rewrite the URL into
+//     something the caller never asked for. A selection that CONTAINS an
+//     autolink whole is unaffected: it splices at the edges and wraps as usual.
 //   * A link with NO TEXT — an empty range, or re-pointing an existing
 //     `[](old)` — is spelled canonically for the destination given, never as
 //     `[](destination)`: a childless link has nothing to render, so consumers

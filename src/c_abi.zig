@@ -2292,24 +2292,52 @@ fn linkCovering(
 }
 
 /// The innermost autolink — the `<https://x.dev>` / `<a@b.dev>` form — on the
-/// chain. Callers pass a chain built at a CARET; see `twig_editor_insert_link`
-/// for why a selection doesn't consult this.
+/// chain that wholly contains `[start, end)`.
 ///
 /// Both node kinds are matched in both formats because the split is not the one
 /// the names suggest — it follows the FORMAT, not just the destination.
 /// `<mailto:a@b.dev>` parses as a `url` in Markdown and an `email` in djot, so
 /// picking one kind per format would miss half the autolinks it was meant to
 /// catch.
-fn autolinkCovering(ast: *const twig.AST, chain: []const twig.AST.Node.Id) ?twig.AST.Node.Id {
+fn autolinkCovering(
+    ast: *const twig.AST,
+    chain: []const twig.AST.Node.Id,
+    start: usize,
+    end: usize,
+) ?twig.AST.Node.Id {
     var i = chain.len;
     while (i > 0) {
         i -= 1;
-        switch (std.meta.activeTag(ast.nodes[chain[i]].kind)) {
-            .url, .email => return chain[i],
+        const node = ast.nodes[chain[i]];
+        switch (std.meta.activeTag(node.kind)) {
+            .url, .email => if (node.span.start <= start and node.span.end >= end) return chain[i],
             else => {},
         }
     }
     return null;
+}
+
+/// Whether writing at `pos` would land STRICTLY INSIDE an autolink's URL —
+/// an autolink covers `pos`, and `pos` is neither of its edges. A splice at an
+/// edge is safe (it lands beside the node); one strictly inside rewrites the
+/// URL itself, which is never what any caller meant. See
+/// `twig_editor_insert_link` for what that corruption looks like.
+///
+/// Builds its own chain because the caller's is rooted at `start`, and the
+/// offset that lands inside can be `end` (a selection running from ordinary
+/// text into the middle of a URL).
+fn splitsAutolink(
+    allocator: Allocator,
+    ast: *const twig.AST,
+    source_len: usize,
+    pos: usize,
+) Allocator.Error!bool {
+    var chain: std.ArrayList(twig.AST.Node.Id) = .empty;
+    defer chain.deinit(allocator);
+    try ancestorChain(allocator, ast, pos, source_len, &chain);
+    const id = autolinkCovering(ast, chain.items, pos, pos) orelse return false;
+    const span = ast.nodes[id].span;
+    return span.start < pos and pos < span.end;
 }
 
 /// Link `[start, end)` to `destination`, or repoint the link already there.
@@ -2319,19 +2347,35 @@ fn autolinkCovering(ast: *const twig.AST, chain: []const twig.AST.Node.Id) ?twig
 ///     text kept. Re-linking is the common gesture (fix a URL), and it keeps the
 ///     op idempotent instead of nesting `[[t](a)](b)`. Removing a link is
 ///     already `twig_editor_unwrap`, which peels a node to its interior.
-///   * A CARET in an existing autolink re-points it the same way, but there is
-///     no text to keep: an autolink's text IS its destination, so the node is
+///   * A RANGE INSIDE an existing autolink re-points it the same way, but there
+///     is no text to keep: an autolink's text IS its destination, so the node is
 ///     respelled whole for the new one (canonically — see below — so a `<url>`
 ///     re-pointed at a relative path becomes `[dest](dest)`, not a broken `<>`).
 ///     Without this the op reads the URL as ordinary text and splices a link
 ///     into the middle of it: `<https<https://y.dev>://x.dev>`.
 ///
-///     Only a caret, never a selection. A selection carries text of its own to
-///     link, and can straddle the autolink's edges, where "re-point" means
-///     nothing; a caret is the unambiguous gesture. And a caret inside BOTH
-///     (`[<https://x.dev>](d)`) re-points the link, not the autolink: a link's
-///     text is separable from its destination, so re-pointing it keeps text that
-///     re-pointing the autolink would discard.
+///     This covers a caret AND any selection the autolink contains — including
+///     one covering it exactly. An autolink's URL is not editable text: no part
+///     of it can host a `[`, so "link half this URL" has no spelling, and the
+///     selection carries no text a splice could keep. Selecting `.dev` in
+///     `see <https://x.dev> ok` and linking it to `y.dev` therefore re-points
+///     the whole autolink, exactly as a caret there would.
+///
+///     A selection that starts or ends strictly INSIDE an autolink but isn't
+///     contained by it (`see <https://x` ... `.dev> ok`) is refused with
+///     `not_editable`: half of it is real text, so there is nothing to
+///     re-point, and any splice would rewrite the URL. Refusing beats silently
+///     changing the caller's URL, for the same reason a newline destination is
+///     `invalid_argument`.
+///
+///     A range inside BOTH a link and an autolink (`[<https://x.dev>](d)`)
+///     re-points the link, not the autolink: a link's text is separable from its
+///     destination, so re-pointing it keeps text that re-pointing the autolink
+///     would discard.
+///
+///     A range that CONTAINS an autolink whole plus text around it is untouched
+///     by all of the above — it splices at the autolink's edges, corrupting
+///     nothing, and the autolink stays as the new link's text.
 ///   * A link with NO TEXT gets the canonical spelling for the destination it
 ///     was given, never `[](dest)`: a childless link has nothing to render, so
 ///     consumers fall back to showing the destination and the caret has nowhere
@@ -2378,7 +2422,17 @@ pub export fn twig_editor_insert_link(
     var text: []const u8 = src[start..end];
     var target = twig.Span.init(start, end);
     var repoint = linkCovering(ast, chain.items, start, end);
-    if (repoint == null and start == end) repoint = autolinkCovering(ast, chain.items);
+    if (repoint == null) repoint = autolinkCovering(ast, chain.items, start, end);
+    // Not covered by an autolink, but still landing inside one: the range runs
+    // from ordinary text into the middle of a URL (either end can be the one
+    // inside). There is nothing to re-point — half the selection is real text —
+    // and no way to spell the result, so refuse rather than corrupt the URL.
+    if (repoint == null and start != end) {
+        const splits =
+            (splitsAutolink(allocator, ast, src.len, start) catch return .out_of_memory) or
+            (splitsAutolink(allocator, ast, src.len, end) catch return .out_of_memory);
+        if (splits) return .not_editable;
+    }
     if (repoint) |id| {
         const node = ast.nodes[id];
         if (node.span.start == 0 and node.span.end == 0) return .not_editable;
@@ -3975,14 +4029,73 @@ test "insert_link: an autolink's boundaries read like a link's — start in, end
     }
 }
 
-test "insert_link: a SELECTION overlapping an autolink still wraps, never re-points" {
-    // A selection carries its own text to link, so it takes the wrap path
-    // whether or not an autolink is under it — the re-point is a caret gesture.
+test "insert_link: a SELECTION of a whole autolink re-points it, like a caret" {
+    // Reversed from the original carve-out ("a selection always wraps"), which
+    // assumed a selection carries text of its own to link. Over an autolink it
+    // does not: the bytes it covers are a URL. Wrapping them spelled
+    // `[<https://x.dev>](https://y.dev)` — a link whose visible text is the very
+    // URL it was meant to replace, nested inside an outer anchor. That is the
+    // same defect the caret path was fixed for, so both answer it the same way.
     for ([_]TwigFormat{ .djot, .markdown }) |fmt| {
         var fx = try EditorFixture.initFmt("see <https://x.dev> ok\n", fmt);
         defer fx.deinit();
         try std.testing.expectEqual(TwigStatus.ok, insertLink(&fx, 4, 19, "https://y.dev"));
-        try fx.expectSource("see [<https://x.dev>](https://y.dev) ok\n");
+        try fx.expectSource("see <https://y.dev> ok\n");
+    }
+}
+
+test "insert_link: a SELECTION over HALF an autolink's URL re-points it, never splices into it" {
+    // The repro: selecting the back half of the URL used to splice a link into
+    // the middle of it — `see <https://x[.dev](https://y.dev)> ok`. The `<…>`
+    // still closes, so that reparsed as ONE `url` whose destination was the
+    // garbage in between: the caller's link silently gone, replaced by a URL
+    // pointing somewhere nobody asked for, with the autolink intact to hide it.
+    for ([_]TwigFormat{ .djot, .markdown }) |fmt| {
+        // `see <https://x.dev> ok` — bytes 14..18 are `.dev`, inside the URL.
+        var back = try EditorFixture.initFmt("see <https://x.dev> ok\n", fmt);
+        defer back.deinit();
+        try std.testing.expectEqual(TwigStatus.ok, insertLink(&back, 14, 18, "https://y.dev"));
+        try back.expectSource("see <https://y.dev> ok\n");
+
+        // …and the front half (`https://x`, 5..14), which mangled the autolink
+        // into literal text instead.
+        var front = try EditorFixture.initFmt("see <https://x.dev> ok\n", fmt);
+        defer front.deinit();
+        try std.testing.expectEqual(TwigStatus.ok, insertLink(&front, 5, 14, "https://y.dev"));
+        try front.expectSource("see <https://y.dev> ok\n");
+    }
+}
+
+test "insert_link: a SELECTION running from text into the middle of a URL is refused" {
+    // Not contained, so there is nothing to re-point — half the selection is
+    // real text — and no spelling that leaves the URL intact. Refuse rather
+    // than corrupt it. Both ends are checked: the offset landing inside can be
+    // either one, and only `start` is on the caller's own ancestor chain.
+    for ([_]TwigFormat{ .djot, .markdown }) |fmt| {
+        // `[see <https` — ends strictly inside the URL.
+        var left = try EditorFixture.initFmt("see <https://x.dev> ok\n", fmt);
+        defer left.deinit();
+        try std.testing.expectEqual(TwigStatus.not_editable, insertLink(&left, 0, 10, "https://y.dev"));
+        try left.expectSource("see <https://x.dev> ok\n");
+
+        // `.dev> ok` — starts strictly inside the URL.
+        var right = try EditorFixture.initFmt("see <https://x.dev> ok\n", fmt);
+        defer right.deinit();
+        try std.testing.expectEqual(TwigStatus.not_editable, insertLink(&right, 14, 22, "https://y.dev"));
+        try right.expectSource("see <https://x.dev> ok\n");
+    }
+}
+
+test "insert_link: a SELECTION containing an autolink whole still wraps" {
+    // The boundary case of the refusal above: this splices at the autolink's
+    // EDGES, so nothing is corrupted and the autolink stays as the link's text.
+    // Unchanged behavior — the fix must not swallow ordinary selections that
+    // happen to contain a URL.
+    for ([_]TwigFormat{ .djot, .markdown }) |fmt| {
+        var fx = try EditorFixture.initFmt("see <https://x.dev> ok\n", fmt);
+        defer fx.deinit();
+        try std.testing.expectEqual(TwigStatus.ok, insertLink(&fx, 0, 22, "https://y.dev"));
+        try fx.expectSource("[see <https://x.dev> ok](https://y.dev)\n");
     }
 }
 

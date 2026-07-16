@@ -699,14 +699,22 @@ impl Editor {
     /// its text kept, so re-linking fixes a URL instead of nesting
     /// `[[t](a)](b)`; to unlink, use [`Editor::unwrap_node`].
     ///
-    /// A **caret in an existing autolink** (`<https://x.dev>`) re-points it the
-    /// same way, but there is no text to keep — an autolink's text *is* its
+    /// A **range inside an existing autolink** (`<https://x.dev>`) re-points it
+    /// the same way, but there is no text to keep — an autolink's text *is* its
     /// destination — so the node is replaced whole, respelled canonically for the
-    /// new destination. Only a caret: a selection carries text of its own to
-    /// link, and one straddling the autolink's edges has no re-point to mean, so
-    /// it wraps as usual. A caret inside both an autolink and a link
+    /// new destination. This covers a caret and any selection the autolink
+    /// contains, including one covering it exactly: an autolink's URL is not
+    /// editable text, so no part of it can host a `[`, and "link half this URL"
+    /// has no spelling. A caret inside both an autolink and a link
     /// (`[<https://x.dev>](d)`) re-points the link, whose text is separable from
     /// its destination and so survives.
+    ///
+    /// A selection starting or ending strictly **inside** an autolink without
+    /// being contained by it — running from ordinary text into the middle of a
+    /// URL — is refused with [`Status::NotEditable`]: half of it is real text,
+    /// so there is nothing to re-point, and any splice would rewrite the URL.
+    /// A selection that *contains* an autolink whole is unaffected — it splices
+    /// at the edges and wraps as usual.
     ///
     /// A link with **no text** — an empty range, or re-pointing an existing
     /// `[](old)` — is spelled canonically for the destination given, never as
