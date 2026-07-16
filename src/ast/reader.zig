@@ -81,6 +81,31 @@ pub fn pathOf(self: *const AST, gpa: std.mem.Allocator, target: Node.Id) std.mem
     return null;
 }
 
+/// The ids of the subtree rooted at `root`, `root` first — the traversal a
+/// caller uses to copy or re-marshal one subtree in isolation (the C ABI's
+/// `twig_editor_subtree` re-indexes this into a local id space; a future
+/// `twig` selector could reuse it). A breadth-first walk over an explicit
+/// worklist, so a deep document can't overflow the stack. Caller frees the
+/// slice. Ids are valid only against the `AST` they were read from.
+///
+/// `root` landing at index 0 is part of the contract: a consumer assigning
+/// dense local ids by position (`local[ids[i]] = i`) needs the subtree root to
+/// be local id 0 so a walker started there stays inside the subtree.
+pub fn subtreeIds(self: *const AST, gpa: std.mem.Allocator, root: Node.Id) std.mem.Allocator.Error![]Node.Id {
+    var order: std.ArrayList(Node.Id) = .empty;
+    errdefer order.deinit(gpa);
+    try order.append(gpa, root);
+    var i: usize = 0;
+    while (i < order.items.len) : (i += 1) {
+        var c = self.nodes[order.items[i]].first_child;
+        while (c) |cid| {
+            try order.append(gpa, cid);
+            c = self.nodes[cid].next_sibling;
+        }
+    }
+    return order.toOwnedSlice(gpa);
+}
+
 fn findPath(self: *const AST, gpa: std.mem.Allocator, id: Node.Id, target: Node.Id, acc: *std.ArrayList(usize)) std.mem.Allocator.Error!bool {
     if (id == target) return true;
     var idx: usize = 0;
@@ -93,6 +118,46 @@ fn findPath(self: *const AST, gpa: std.mem.Allocator, id: Node.Id, target: Node.
         idx += 1;
     }
     return false;
+}
+
+test "subtreeIds returns the root first, then every descendant" {
+    const testing = std.testing;
+    var b = AST.Builder.init(testing.allocator);
+    defer b.deinit();
+
+    // doc → [ para(a, b), heading(c) ] — subtree of `para` is {para, a, b}, and
+    // the subtree of `doc` is the whole tree.
+    const a = try b.addLeaf(.{ .str = "a" });
+    const bb = try b.addLeaf(.{ .str = "b" });
+    const para = try b.addContainer(.para, &.{ a, bb });
+    const c = try b.addLeaf(.{ .str = "c" });
+    const heading = try b.addContainer(.{ .heading = .{ .level = 1 } }, &.{c});
+    const doc = try b.addContainer(.doc, &.{ para, heading });
+
+    var ast = try b.finish(doc);
+    defer ast.deinit();
+
+    // A container subtree: root first, then its children. Order past the root is
+    // unspecified beyond "every descendant once", so compare as a set.
+    const sub = try ast.subtreeIds(testing.allocator, para);
+    defer testing.allocator.free(sub);
+    try testing.expectEqual(para, sub[0]); // root is always index 0
+    try testing.expectEqual(@as(usize, 3), sub.len);
+    for ([_]AST.Node.Id{ para, a, bb }) |want| {
+        try testing.expect(std.mem.indexOfScalar(AST.Node.Id, sub, want) != null);
+    }
+    // A node outside this subtree is absent.
+    try testing.expect(std.mem.indexOfScalar(AST.Node.Id, sub, heading) == null);
+
+    // A leaf's subtree is just itself.
+    const leaf = try ast.subtreeIds(testing.allocator, a);
+    defer testing.allocator.free(leaf);
+    try testing.expectEqualSlices(AST.Node.Id, &.{a}, leaf);
+
+    // The whole tree from the doc root.
+    const all = try ast.subtreeIds(testing.allocator, doc);
+    defer testing.allocator.free(all);
+    try testing.expectEqual(ast.nodes.len, all.len);
 }
 
 test "children walks first_child/next_sibling in order" {

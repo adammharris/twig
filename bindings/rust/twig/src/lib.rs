@@ -648,6 +648,46 @@ impl Editor {
         raw.iter().map(flat_node_from_ffi).collect()
     }
 
+    /// The direct children of `node` as [`QueryMatch`]es (id, span, kind) —
+    /// `None` enumerates the document root's children (the top-level blocks). The
+    /// cheap top-level enumeration an incremental renderer walks to decide which
+    /// blocks changed, without marshalling the whole arena; pair it with
+    /// [`Editor::subtree`] to then re-marshal only those that did. A childless
+    /// node yields an empty vec.
+    pub fn child_spans(&mut self, node: Option<NodeId>) -> Result<Vec<QueryMatch>, Error> {
+        let id = node.map_or(ffi::TWIG_NO_NODE, |n| n.0);
+        let mut ptr: *const ffi::TwigQueryMatch = std::ptr::null();
+        let mut len = 0usize;
+        let status =
+            unsafe { ffi::twig_editor_child_spans(self.raw.as_ptr(), id, &mut ptr, &mut len) };
+        Error::from_status(status)?;
+        if len == 0 || ptr.is_null() {
+            return Ok(Vec::new());
+        }
+        let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
+        raw.iter().map(query_match_from_ffi).collect()
+    }
+
+    /// Snapshot the subtree rooted at `node` as a self-contained [`FlatNode`]
+    /// array with *local* ids: `array[0]` is the root, every link is an index
+    /// into the returned vec (or `None`), and spans stay absolute. The
+    /// incremental-render companion to [`Editor::nodes`] — re-marshal one edited
+    /// block's subtree instead of the whole document. The root's `parent` and
+    /// `next_sibling` are `None`, so a walk from index 0 stays inside the
+    /// subtree. [`Error::InvalidArgument`] if `node` is out of range.
+    pub fn subtree(&mut self, node: NodeId) -> Result<Vec<FlatNode>, Error> {
+        let mut ptr: *const ffi::TwigFlatNode = std::ptr::null();
+        let mut len = 0usize;
+        let status =
+            unsafe { ffi::twig_editor_subtree(self.raw.as_ptr(), node.0, &mut ptr, &mut len) };
+        Error::from_status(status)?;
+        if len == 0 || ptr.is_null() {
+            return Ok(Vec::new());
+        }
+        let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
+        raw.iter().map(flat_node_from_ffi).collect()
+    }
+
     /// The deepest node whose span contains byte `offset` (with `offset` equal
     /// to the source length treated as inside the root) — mouse hit-testing and
     /// cursor context. `Ok(None)` if no node covers the offset;
@@ -1662,6 +1702,81 @@ mod tests {
             }
             assert!(seen, "node {:?} not found among its parent's children", n.id);
         }
+    }
+
+    #[test]
+    fn editor_child_spans_and_subtree_agree_with_nodes() {
+        let src = "# Title\n\nHello **world** and more.\n\n- one\n- two\n";
+        let mut ed = Editor::new_str(src, Format::Markdown).expect("editor");
+        let all = ed.nodes().expect("nodes");
+        let doc = all.iter().find(|n| n.kind == "doc").expect("doc");
+
+        // child_spans(None) == the doc root's children, same ids/kinds/spans and
+        // in the same order.
+        let top = ed.child_spans(None).expect("child_spans");
+        let mut want = Vec::new();
+        let mut c = doc.first_child;
+        while let Some(id) = c {
+            want.push(id);
+            c = all[id.0 as usize].next_sibling;
+        }
+        assert_eq!(top.len(), want.len(), "top-level count");
+        for (m, id) in top.iter().zip(&want) {
+            assert_eq!(m.node_id, id.0, "child id");
+            assert_eq!(m.kind, all[id.0 as usize].kind, "child kind");
+            assert_eq!(m.span, all[id.0 as usize].span, "child span");
+        }
+        // The span addresses the block as written (absolute offsets).
+        assert!(src[top[0].span.clone()].starts_with('#'), "first block is the heading");
+
+        // child_spans works below the top level too.
+        let list = top.iter().find(|m| m.kind.ends_with("list")).expect("a list");
+        let items = ed.child_spans(Some(NodeId(list.node_id))).expect("items");
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|m| m.kind == "list_item"), "items: {items:?}");
+
+        // subtree(para) is self-contained, local-indexed, and spans stay absolute.
+        let para = top.iter().find(|m| m.kind == "para").expect("a para").node_id;
+        let sub = ed.subtree(NodeId(para)).expect("subtree");
+        assert_eq!(sub[0].id, NodeId(0), "root is local id 0");
+        assert_eq!(sub[0].parent, None, "root has no parent inside the subtree");
+        assert_eq!(sub[0].next_sibling, None, "root's sibling is severed");
+        assert_eq!(sub[0].kind, "para");
+        for (i, n) in sub.iter().enumerate() {
+            assert_eq!(n.id, NodeId(i as u32), "dense local ids");
+            for link in [n.parent, n.first_child, n.next_sibling].into_iter().flatten() {
+                assert!((link.0 as usize) < sub.len(), "link {link:?} escapes the subtree");
+            }
+        }
+        assert!(
+            src[sub[0].span.clone()].starts_with("Hello"),
+            "absolute span: {:?}",
+            &src[sub[0].span.clone()]
+        );
+
+        // Same multiset of node kinds as the paragraph's arena subtree.
+        fn arena_kinds(all: &[FlatNode], root: NodeId) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut stack = vec![root];
+            while let Some(id) = stack.pop() {
+                let n = &all[id.0 as usize];
+                out.push(n.kind.clone());
+                let mut c = n.first_child;
+                while let Some(cid) = c {
+                    stack.push(cid);
+                    c = all[cid.0 as usize].next_sibling;
+                }
+            }
+            out
+        }
+        let mut want_kinds = arena_kinds(&all, NodeId(para));
+        let mut got_kinds: Vec<String> = sub.iter().map(|n| n.kind.clone()).collect();
+        want_kinds.sort();
+        got_kinds.sort();
+        assert_eq!(got_kinds, want_kinds, "subtree kinds match the arena");
+
+        // Out-of-range id is rejected.
+        assert!(matches!(ed.subtree(NodeId(9999)), Err(Error::InvalidArgument)));
     }
 
     #[test]

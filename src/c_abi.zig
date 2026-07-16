@@ -538,6 +538,11 @@ const EditorHandle = struct {
     /// The last `twig_editor_nodes_at` ancestor chain. Independent of
     /// `query_matches` so a hit-test doesn't invalidate a prior query.
     ancestor_matches: []TwigQueryMatch = &.{},
+    /// The last `twig_editor_subtree` snapshot. Independent of `flat_nodes` so a
+    /// per-block re-marshal doesn't invalidate a prior whole-tree read.
+    subtree_nodes: []TwigFlatNode = &.{},
+    /// The last `twig_editor_child_spans` result (direct-children enumeration).
+    child_spans: []TwigQueryMatch = &.{},
 };
 
 fn asEditor(ed: *TwigEditor) *EditorHandle {
@@ -664,6 +669,8 @@ pub export fn twig_editor_destroy(ed: ?*TwigEditor) void {
     if (handle.query_matches.len != 0) allocator.free(handle.query_matches);
     if (handle.flat_nodes.len != 0) allocator.free(handle.flat_nodes);
     if (handle.ancestor_matches.len != 0) allocator.free(handle.ancestor_matches);
+    if (handle.subtree_nodes.len != 0) allocator.free(handle.subtree_nodes);
+    if (handle.child_spans.len != 0) allocator.free(handle.child_spans);
     handle.editor.deinit();
     allocator.destroy(handle);
 }
@@ -1198,26 +1205,14 @@ pub export fn twig_editor_nodes(
     const nodes = ast.nodes;
 
     const buf = allocator.alloc(TwigFlatNode, nodes.len) catch return .out_of_memory;
-    for (nodes, 0..) |node, i| {
-        const text = kindText(&node);
-        const dest = kindDestination(&node);
-        buf[i] = .{
-            .id = @intCast(i),
-            .parent = TWIG_NO_NODE, // filled in the parent pass below
-            .first_child = node.first_child orelse TWIG_NO_NODE,
-            .next_sibling = node.next_sibling orelse TWIG_NO_NODE,
-            .span = spanC(node.span),
-            .content_span = if (node.content_span) |cs| spanC(cs) else .{ .start = 0, .end = 0 },
-            .has_content_span = if (node.content_span != null) 1 else 0,
-            .level = kindLevel(&node),
-            .kind = kindName(&node),
-            .text_ptr = if (text) |t| t.ptr else null,
-            .text_len = if (text) |t| t.len else 0,
-            .destination_ptr = if (dest) |d| d.ptr else null,
-            .destination_len = if (dest) |d| d.len else 0,
-            .head = kindHead(&node),
-            .alignment = kindAlignment(&node),
-        };
+    for (nodes, 0..) |*node, i| {
+        buf[i] = flatNodeOf(
+            node,
+            @intCast(i),
+            TWIG_NO_NODE, // parent filled in the pass below
+            node.first_child orelse TWIG_NO_NODE,
+            node.next_sibling orelse TWIG_NO_NODE,
+        );
     }
     // Parent pass: a `Node` stores children, not its parent, so derive it by
     // stamping each node's children with its own id (one linear walk).
@@ -1232,6 +1227,117 @@ pub export fn twig_editor_nodes(
     if (handle.flat_nodes.len != 0) allocator.free(handle.flat_nodes);
     handle.flat_nodes = buf;
 
+    ptr_out.* = if (buf.len == 0) null else buf.ptr;
+    len_out.* = buf.len;
+    return .ok;
+}
+
+/// The direct children of `node_id` as `TwigQueryMatch` (id, span, kind) — the
+/// cheap top-level enumeration an incremental renderer uses to find the blocks
+/// it must consider without marshalling the whole arena. Pair it with
+/// `twig_editor_subtree` to then re-marshal only the block(s) that changed. Pass
+/// `TWIG_NO_NODE` for `node_id` to enumerate the DOCUMENT ROOT's children (the
+/// top-level blocks), so a caller needn't first look the root up.
+///
+/// Same borrow contract as `twig_editor_query`, on its own buffer (replaced on
+/// the next `twig_editor_child_spans` call, freed on destroy). A childless node
+/// yields a zero-length result and `.ok`. A `node_id` that is neither in range
+/// nor the sentinel is `invalid_argument`.
+pub export fn twig_editor_child_spans(
+    ed: ?*TwigEditor,
+    node_id: u32,
+    out_ptr: ?*?[*]const TwigQueryMatch,
+    out_len: ?*usize,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const ptr_out = out_ptr orelse return .invalid_argument;
+    const len_out = out_len orelse return .invalid_argument;
+    const allocator = activeAllocator();
+    const handle = asEditor(raw);
+    const ast = handle.editor.astView();
+
+    const parent: twig.AST.Node.Id = if (node_id == TWIG_NO_NODE)
+        ast.root
+    else if (node_id < ast.nodes.len)
+        node_id
+    else
+        return .invalid_argument;
+
+    var list: std.ArrayList(TwigQueryMatch) = .empty;
+    defer list.deinit(allocator);
+    var it = ast.children(parent);
+    while (it.next()) |child| {
+        list.append(allocator, flatMatch(ast, child.id)) catch return .out_of_memory;
+    }
+
+    if (handle.child_spans.len != 0) allocator.free(handle.child_spans);
+    handle.child_spans = list.toOwnedSlice(allocator) catch return .out_of_memory;
+    ptr_out.* = if (handle.child_spans.len == 0) null else handle.child_spans.ptr;
+    len_out.* = handle.child_spans.len;
+    return .ok;
+}
+
+/// Snapshot the subtree rooted at `node_id` as a self-contained flat array with
+/// LOCAL ids: `array[0]` is the root, every `id`/`parent`/`first_child`/
+/// `next_sibling` is an index into THIS array (or `TWIG_NO_NODE`), and spans
+/// stay ABSOLUTE (byte offsets into the whole document). The incremental-render
+/// companion to `twig_editor_nodes`: a consumer that has localized an edit to
+/// one block re-marshals only that block's subtree instead of the whole arena.
+///
+/// Because the array stops at the subtree, the root's `parent` and
+/// `next_sibling` are `TWIG_NO_NODE` — a walker started at index 0 never
+/// escapes it. Same borrow contract as `twig_editor_nodes` but on its own buffer
+/// (replaced on the next `twig_editor_subtree` call): the `text`/`destination`
+/// pointers additionally require no successful edit since. `node_id` out of
+/// range is `invalid_argument`.
+pub export fn twig_editor_subtree(
+    ed: ?*TwigEditor,
+    node_id: u32,
+    out_ptr: ?*?[*]const TwigFlatNode,
+    out_len: ?*usize,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const ptr_out = out_ptr orelse return .invalid_argument;
+    const len_out = out_len orelse return .invalid_argument;
+    const allocator = activeAllocator();
+    const handle = asEditor(raw);
+    const ast = handle.editor.astView();
+    if (node_id >= ast.nodes.len) return .invalid_argument;
+
+    // The traversal is `AST.subtreeIds`; everything below is the wire remap into
+    // a dense local id space (`local[old] = new`), which is genuinely the ABI's.
+    const ids = ast.subtreeIds(allocator, node_id) catch return .out_of_memory;
+    defer allocator.free(ids);
+
+    const local = allocator.alloc(u32, ast.nodes.len) catch return .out_of_memory;
+    defer allocator.free(local);
+    @memset(local, TWIG_NO_NODE);
+    for (ids, 0..) |old_id, i| local[old_id] = @intCast(i);
+
+    const buf = allocator.alloc(TwigFlatNode, ids.len) catch return .out_of_memory;
+    for (ids, 0..) |old_id, i| {
+        const node = &ast.nodes[old_id];
+        buf[i] = flatNodeOf(
+            node,
+            @intCast(i),
+            TWIG_NO_NODE, // parent filled in the pass below
+            mapLocal(local, node.first_child),
+            // The root's next_sibling leaves the subtree, so `local` maps it to
+            // NO_NODE; a descendant's sibling is always inside.
+            mapLocal(local, node.next_sibling),
+        );
+    }
+    // Parent pass in local space (a `Node` stores children, not its parent).
+    for (ids, 0..) |old_id, i| {
+        var child = ast.nodes[old_id].first_child;
+        while (child) |cid| {
+            buf[local[cid]].parent = @intCast(i);
+            child = ast.nodes[cid].next_sibling;
+        }
+    }
+
+    if (handle.subtree_nodes.len != 0) allocator.free(handle.subtree_nodes);
+    handle.subtree_nodes = buf;
     ptr_out.* = if (buf.len == 0) null else buf.ptr;
     len_out.* = buf.len;
     return .ok;
@@ -1318,6 +1424,42 @@ fn flatMatch(ast: *const twig.AST, id: twig.AST.Node.Id) TwigQueryMatch {
         .has_content_span = if (node.content_span != null) 1 else 0,
         .kind = kindName(node),
     };
+}
+
+/// Fill one `TwigFlatNode` for `node`, given its (already-resolved) id and link
+/// ids in whatever id space the caller is building — arena ids for
+/// `twig_editor_nodes`, local ids for `twig_editor_subtree`. Spans are always
+/// absolute; only the links differ between the two callers.
+fn flatNodeOf(node: *const twig.AST.Node, id: u32, parent: u32, first_child: u32, next_sibling: u32) TwigFlatNode {
+    const text = kindText(node);
+    const dest = kindDestination(node);
+    return .{
+        .id = id,
+        .parent = parent,
+        .first_child = first_child,
+        .next_sibling = next_sibling,
+        .span = spanC(node.span),
+        .content_span = if (node.content_span) |cs| spanC(cs) else .{ .start = 0, .end = 0 },
+        .has_content_span = if (node.content_span != null) 1 else 0,
+        .level = kindLevel(node),
+        .kind = kindName(node),
+        .text_ptr = if (text) |t| t.ptr else null,
+        .text_len = if (text) |t| t.len else 0,
+        .destination_ptr = if (dest) |d| d.ptr else null,
+        .destination_len = if (dest) |d| d.len else 0,
+        .head = kindHead(node),
+        .alignment = kindAlignment(node),
+    };
+}
+
+/// Map an optional arena id into the local id space of a `twig_editor_subtree`
+/// snapshot: `local[old]` for an id inside the subtree, `TWIG_NO_NODE` for
+/// `null` or for a link that leaves the subtree (the root's `next_sibling`).
+/// The one piece of `subtree` that is genuinely a wire concern — the traversal
+/// itself is `AST.subtreeIds` in `ast/reader.zig`.
+fn mapLocal(local: []const u32, maybe: ?twig.AST.Node.Id) u32 {
+    const id = maybe orelse return TWIG_NO_NODE;
+    return local[id];
 }
 
 // ── Range-oriented rich-text ops (the toolbar) ───────────────────────────────

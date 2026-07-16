@@ -524,6 +524,36 @@ TwigStatus twig_editor_nodes(
     size_t *out_len
 );
 
+// The direct children of `node_id` as TwigQueryMatch (id, span, kind) — the
+// cheap top-level enumeration an incremental renderer uses to find the blocks it
+// must consider without marshalling the whole arena; pair with
+// twig_editor_subtree to re-marshal only the block(s) that changed. Pass
+// TWIG_NO_NODE for node_id to enumerate the DOCUMENT ROOT's children (the
+// top-level blocks). Same borrow contract as twig_editor_query, on its own
+// buffer. A childless node yields a zero-length result and TWIG_STATUS_OK; a
+// node_id neither in range nor the sentinel is TWIG_STATUS_INVALID_ARGUMENT.
+TwigStatus twig_editor_child_spans(
+    TwigEditor *editor,
+    uint32_t node_id,
+    const TwigQueryMatch **out_ptr,
+    size_t *out_len
+);
+
+// Snapshot the subtree rooted at `node_id` as a self-contained TwigFlatNode
+// array with LOCAL ids: array[0] is the root, every id / parent / first_child /
+// next_sibling indexes into THIS array (or TWIG_NO_NODE), and spans stay
+// ABSOLUTE. The incremental-render companion to twig_editor_nodes: re-marshal
+// one edited block's subtree instead of the whole arena. The root's parent and
+// next_sibling are TWIG_NO_NODE, so a walk from index 0 never leaves the
+// subtree. Same borrow contract as twig_editor_nodes, on its own buffer; node_id
+// out of range is TWIG_STATUS_INVALID_ARGUMENT.
+TwigStatus twig_editor_subtree(
+    TwigEditor *editor,
+    uint32_t node_id,
+    const TwigFlatNode **out_ptr,
+    size_t *out_len
+);
+
 // The deepest node whose span contains byte `offset` (half-open [start, end),
 // with offset == source length treated as inside the root) — mouse hit-testing
 // and cursor context. Fills out_match and returns TWIG_STATUS_OK, or

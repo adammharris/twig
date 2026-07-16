@@ -338,6 +338,18 @@ unsafe extern "C" {
         out_ptr: *mut *const TwigFlatNode,
         out_len: *mut usize,
     ) -> TwigStatus;
+    pub fn twig_editor_child_spans(
+        editor: *mut TwigEditor,
+        node_id: u32,
+        out_ptr: *mut *const TwigQueryMatch,
+        out_len: *mut usize,
+    ) -> TwigStatus;
+    pub fn twig_editor_subtree(
+        editor: *mut TwigEditor,
+        node_id: u32,
+        out_ptr: *mut *const TwigFlatNode,
+        out_len: *mut usize,
+    ) -> TwigStatus;
     pub fn twig_editor_node_at(
         editor: *mut TwigEditor,
         offset: usize,
