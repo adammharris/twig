@@ -1077,6 +1077,57 @@ pub export fn twig_editor_coalesce_last(ed: ?*TwigEditor) TwigStatus {
     return .ok;
 }
 
+/// A monotonic change token for `ed`, bumped once per successful mutation of the
+/// document (`edit_range`, the locator ops, and undo/redo alike). Never
+/// decreases and never repeats for the life of the editor; the initial parse is
+/// revision 0. Equal revision ⇒ byte-identical document, so a caller can key a
+/// cache on it instead of hand-tracking "did anything change?". Returns 0 for a
+/// NULL `ed` (which also matches a fresh editor — harmless as a cache key).
+pub export fn twig_editor_revision(ed: ?*TwigEditor) u64 {
+    const raw = ed orelse return 0;
+    return asEditor(raw).editor.splicer.revision;
+}
+
+/// Attach an opaque, caller-owned blob (e.g. a serialized caret/selection) to
+/// the editor's CURRENT document state. Twig copies the bytes and never
+/// interprets them; it only carries them through the undo history so undo/redo
+/// hand back the caret that matches the restored source (see
+/// `twig_editor_caret_blob`). Set it with the pre-edit caret BEFORE an edit so
+/// the retired undo step captures it. A zero-length blob clears the current
+/// caret. `blob_ptr` may be NULL only when `blob_len` is 0.
+pub export fn twig_editor_set_caret_blob(
+    ed: ?*TwigEditor,
+    blob_ptr: ?[*]const u8,
+    blob_len: usize,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const blob = sliceOf(blob_ptr, blob_len) orelse return .invalid_argument;
+    asEditor(raw).editor.splicer.setCaret(blob) catch return .out_of_memory;
+    return .ok;
+}
+
+/// Read back the opaque caret blob for the editor's CURRENT document state (see
+/// `twig_editor_set_caret_blob`). After `twig_editor_undo`/`_redo` this is the
+/// restored state's caret; after an edit it is empty until the caller sets one.
+///
+/// The bytes are borrowed directly from the editor and stay valid until the next
+/// `twig_editor_set_caret_blob`, successful edit, or undo/redo on this handle, or
+/// until it is destroyed. `out_ptr` is NULL when the blob is empty.
+pub export fn twig_editor_caret_blob(
+    ed: ?*TwigEditor,
+    out_ptr: ?*?[*]const u8,
+    out_len: ?*usize,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const ptr_out = out_ptr orelse return .invalid_argument;
+    const len_out = out_len orelse return .invalid_argument;
+
+    const bytes = asEditor(raw).editor.splicer.caretBlob();
+    ptr_out.* = if (bytes.len == 0) null else bytes.ptr;
+    len_out.* = bytes.len;
+    return .ok;
+}
+
 /// Snapshot the editor's current tree as a flat array of `TwigFlatNode`, one
 /// per arena node, indexed so `array[i].id == i`. The JSON-free read path for
 /// a renderer: one call, one buffer, walked via the `parent`/`first_child`/

@@ -561,6 +561,37 @@ impl Editor {
         Error::from_status(status)
     }
 
+    /// A monotonic change token, bumped once per successful mutation of the
+    /// document (every edit and every undo/redo). Never decreases and never
+    /// repeats for the life of the editor; the initial parse is revision 0.
+    /// Equal revision means a byte-identical document, so it can key a cache
+    /// instead of hand-tracking "did anything change?".
+    pub fn revision(&mut self) -> u64 {
+        unsafe { ffi::twig_editor_revision(self.raw.as_ptr()) }
+    }
+
+    /// Attach an opaque, caller-owned blob (e.g. a serialized caret/selection)
+    /// to the editor's current document state. Twig copies the bytes and never
+    /// interprets them; it only carries them through the undo history so
+    /// [`Editor::undo`]/[`Editor::redo`] hand back the caret matching the
+    /// restored source (via [`Editor::caret_blob`]). Set it with the pre-edit
+    /// caret *before* an edit so the retired undo step captures it. An empty
+    /// blob clears the current caret.
+    pub fn set_caret_blob(&mut self, blob: &[u8]) -> Result<(), Error> {
+        let status =
+            unsafe { ffi::twig_editor_set_caret_blob(self.raw.as_ptr(), blob.as_ptr(), blob.len()) };
+        Error::from_status(status)
+    }
+
+    /// The opaque caret blob for the editor's current document state (see
+    /// [`Editor::set_caret_blob`]). After [`Editor::undo`]/[`Editor::redo`] this
+    /// is the restored state's caret; after an edit it is empty until set again.
+    /// Returns an owned copy, so it outlives the next edit.
+    pub fn caret_blob(&mut self) -> Result<Vec<u8>, Error> {
+        let raw = self.raw.as_ptr();
+        collect_bytes(|ptr, len| unsafe { ffi::twig_editor_caret_blob(raw, ptr, len) })
+    }
+
     /// Snapshot the current tree as a flat [`FlatNode`] array (the JSON-free
     /// read path for a renderer), indexed so `nodes[i].id == NodeId(i)`. Walk it
     /// via the `parent`/`first_child`/`next_sibling` links; the root is the node
@@ -1857,6 +1888,65 @@ mod tests {
         ed.undo().expect("undo ok").expect("something to undo");
         assert_eq!(ed.source_str().unwrap(), "\n");
         assert!(ed.undo().expect("undo ok").is_none());
+    }
+
+    #[test]
+    fn editor_revision_bumps_per_successful_mutation() {
+        let mut ed = Editor::new_str("x\n", Format::Markdown).expect("editor");
+        assert_eq!(ed.revision(), 0);
+        ed.edit_range(1, 1, "y").expect("edit");
+        assert_eq!(ed.revision(), 1);
+
+        // A reparse-breaking edit is rolled back and must not bump the revision.
+        let mut xml = Editor::new_str("<a>ok</a>", Format::Xml).expect("editor");
+        assert_eq!(xml.revision(), 0);
+        assert!(xml.replace_content("0", "<b>").is_err());
+        assert_eq!(xml.revision(), 0);
+
+        // undo and redo are mutations too.
+        ed.undo().expect("undo ok").expect("something to undo");
+        assert_eq!(ed.revision(), 2);
+        ed.redo().expect("redo ok").expect("something to redo");
+        assert_eq!(ed.revision(), 3);
+    }
+
+    #[test]
+    fn editor_caret_blob_follows_undo_and_redo() {
+        let mut ed = Editor::new_str("hello\n", Format::Markdown).expect("editor");
+        assert!(ed.caret_blob().unwrap().is_empty());
+
+        // Set the pre-edit caret, then edit: the retired undo step captures it.
+        ed.set_caret_blob(b"before").expect("set caret");
+        ed.edit_range(5, 5, "!").expect("edit");
+        // A fresh state starts caret-less until the host sets one.
+        assert!(ed.caret_blob().unwrap().is_empty());
+        ed.set_caret_blob(b"after").expect("set caret");
+
+        // Undo restores the pre-edit source AND the pre-edit caret.
+        ed.undo().expect("undo ok").expect("something to undo");
+        assert_eq!(ed.source_str().unwrap(), "hello\n");
+        assert_eq!(ed.caret_blob().unwrap(), b"before");
+
+        // Redo restores the post-edit source AND the post-edit caret.
+        ed.redo().expect("redo ok").expect("something to redo");
+        assert_eq!(ed.source_str().unwrap(), "hello!\n");
+        assert_eq!(ed.caret_blob().unwrap(), b"after");
+    }
+
+    #[test]
+    fn editor_coalesced_run_keeps_the_pre_run_caret() {
+        let mut ed = Editor::new_str("\n", Format::Markdown).expect("editor");
+        ed.set_caret_blob(b"c0").expect("set caret");
+        ed.edit_range(0, 0, "a").expect("edit");
+        ed.set_caret_blob(b"c1").expect("set caret");
+        ed.edit_range(1, 1, "b").expect("edit");
+        ed.coalesce_last_undo().expect("coalesce");
+        ed.set_caret_blob(b"c2").expect("set caret");
+
+        // One undo folds the run and restores the caret from before it began.
+        ed.undo().expect("undo ok").expect("something to undo");
+        assert_eq!(ed.source_str().unwrap(), "\n");
+        assert_eq!(ed.caret_blob().unwrap(), b"c0");
     }
 
     #[test]

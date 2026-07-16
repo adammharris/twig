@@ -71,6 +71,21 @@ pub const Splicer = struct {
     /// ignores it). It must outlive the editor.
     pub const ParseFn = *const fn (ctx: *const anyopaque, Allocator, []const u8) anyerror!AST;
 
+    /// One history step: a whole source snapshot plus the opaque `caret` blob
+    /// the host associated with THAT document state (see `current_caret`). The
+    /// blob travels with the buffer it belongs to, so undo/redo hand back the
+    /// caret that matches the restored source with no parallel bookkeeping on
+    /// the host side. `caret` may be empty (the host set nothing).
+    pub const HistoryEntry = struct {
+        source: std.ArrayList(u8),
+        caret: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *HistoryEntry, allocator: Allocator) void {
+            self.source.deinit(allocator);
+            self.caret.deinit(allocator);
+        }
+    };
+
     allocator: Allocator,
     /// The current (edited) document bytes. Owns its memory.
     source: std.ArrayList(u8),
@@ -86,12 +101,26 @@ pub const Splicer = struct {
     /// before the first edit. A failed edit leaves it untouched. Note: a
     /// multi-splice op (e.g. `Filter`) leaves only its *final* splice here.
     last_change: ?Change = null,
-    /// Undo/redo history as whole source buffers. `replaceAtSpan` retires the
-    /// pre-edit source onto `undo_stack` instead of freeing it; `undo`/`redo`
-    /// swap a buffer between the stacks and reparse. Each single-splice op is
-    /// one step; `coalesceLastUndo` folds a keystroke run into one.
-    undo_stack: std.ArrayList(std.ArrayList(u8)) = .empty,
-    redo_stack: std.ArrayList(std.ArrayList(u8)) = .empty,
+    /// Undo/redo history as whole source snapshots, each tagged with a caret
+    /// blob. `replaceAtSpan` retires the pre-edit source (and its `current_caret`)
+    /// onto `undo_stack` instead of freeing it; `undo`/`redo` swap an entry
+    /// between the stacks and reparse. Each single-splice op is one step;
+    /// `coalesceLastUndo` folds a keystroke run into one.
+    undo_stack: std.ArrayList(HistoryEntry) = .empty,
+    redo_stack: std.ArrayList(HistoryEntry) = .empty,
+    /// An opaque, host-owned blob describing the caret/selection for the CURRENT
+    /// source state — twig never reads it, only stores and hands it back. The
+    /// host sets it (via `setCaret`) BEFORE an edit so the pre-edit caret is what
+    /// gets retired onto the undo stack; after undo/redo it holds the restored
+    /// state's caret. Owns its bytes; reset to empty on every edit so a fresh
+    /// state starts caret-less until the host sets one.
+    current_caret: std.ArrayList(u8) = .empty,
+    /// Monotonic change token, bumped once per successful mutation of `source`
+    /// (`replaceAtSpan` and undo/redo alike). Never decreases, never repeats a
+    /// value for the life of the editor. The host keys caches on it instead of
+    /// hand-maintaining its own "did something change?" flag: equal revision ⇒
+    /// identical document. Starts at 0 for the initial parse.
+    revision: u64 = 0,
 
     /// Parse `source_bytes` and build an editor over a private copy of them.
     /// `parse_ctx` is forwarded verbatim to `parse_fn` on the initial parse
@@ -107,9 +136,10 @@ pub const Splicer = struct {
     pub fn deinit(self: *Splicer) void {
         self.ast.deinit();
         self.source.deinit(self.allocator);
-        for (self.undo_stack.items) |*b| b.deinit(self.allocator);
+        self.current_caret.deinit(self.allocator);
+        for (self.undo_stack.items) |*e| e.deinit(self.allocator);
         self.undo_stack.deinit(self.allocator);
-        for (self.redo_stack.items) |*b| b.deinit(self.allocator);
+        for (self.redo_stack.items) |*e| e.deinit(self.allocator);
         self.redo_stack.deinit(self.allocator);
     }
 
@@ -121,6 +151,23 @@ pub const Splicer = struct {
     /// The current parse (valid until the next successful edit).
     pub fn astView(self: *const Splicer) *const AST {
         return &self.ast;
+    }
+
+    /// Associate an opaque `blob` with the current document state — twig stores
+    /// a private copy and never interprets it. Call this with the pre-edit caret
+    /// BEFORE an edit so the retired undo step carries it; after undo/redo the
+    /// current blob is the restored state's, retrievable via `caretBlob`.
+    /// A zero-length `blob` clears the current caret.
+    pub fn setCaret(self: *Splicer, blob: []const u8) !void {
+        self.current_caret.clearRetainingCapacity();
+        try self.current_caret.appendSlice(self.allocator, blob);
+    }
+
+    /// The opaque caret blob for the CURRENT document state (see `setCaret`),
+    /// empty if none is set. Borrowed from the editor; valid until the next
+    /// `setCaret`, successful edit, or undo/redo on this editor.
+    pub fn caretBlob(self: *const Splicer) []const u8 {
+        return self.current_caret.items;
     }
 
     // ── the primitive ──────────────────────────────────────────────────────
@@ -156,23 +203,29 @@ pub const Splicer = struct {
         // now that a fresh edit has diverged the timeline.
         self.ast.deinit();
         self.ast = new_ast;
-        self.recordUndo(self.source);
+        // Retire the pre-edit source together with the caret the host had set
+        // for it, then reset `current_caret` — the new state is caret-less until
+        // the host sets one for it.
+        self.recordUndo(self.source, self.current_caret);
+        self.current_caret = .empty;
         self.clearRedo();
         self.source = new_src;
         self.last_change = .{
             .old = span,
             .new = Span.init(span.start, span.start + replacement.len),
         };
+        self.revision += 1;
     }
 
     // ── undo / redo ─────────────────────────────────────────────────────────
 
-    /// Retire a pre-edit source buffer onto the undo stack, evicting the oldest
-    /// entry once past the cap. Takes ownership of `buf`.
-    fn recordUndo(self: *Splicer, buf: std.ArrayList(u8)) void {
-        self.undo_stack.append(self.allocator, buf) catch {
-            var b = buf;
-            b.deinit(self.allocator);
+    /// Retire a pre-edit source buffer (with its caret blob) onto the undo
+    /// stack, evicting the oldest entry once past the cap. Takes ownership of
+    /// both `buf` and `caret`.
+    fn recordUndo(self: *Splicer, buf: std.ArrayList(u8), caret: std.ArrayList(u8)) void {
+        self.undo_stack.append(self.allocator, .{ .source = buf, .caret = caret }) catch {
+            var entry: HistoryEntry = .{ .source = buf, .caret = caret };
+            entry.deinit(self.allocator);
             return;
         };
         if (self.undo_stack.items.len > MAX_UNDO) {
@@ -182,13 +235,15 @@ pub const Splicer = struct {
     }
 
     fn clearRedo(self: *Splicer) void {
-        for (self.redo_stack.items) |*b| b.deinit(self.allocator);
+        for (self.redo_stack.items) |*e| e.deinit(self.allocator);
         self.redo_stack.clearRetainingCapacity();
     }
 
     /// Merge the most recent edit into the step before it, so a run of
-    /// keystrokes undoes as one. Drops the latest "before" snapshot, leaving the
-    /// run's earlier one; a no-op unless there are at least two steps to merge.
+    /// keystrokes undoes as one. Drops the latest "before" snapshot (and its
+    /// caret blob), leaving the run's earlier one — so an undo of a coalesced
+    /// run restores the caret from before the run began. A no-op unless there
+    /// are at least two steps to merge.
     pub fn coalesceLastUndo(self: *Splicer) void {
         if (self.undo_stack.items.len < 2) return;
         var top = self.undo_stack.pop().?;
@@ -211,26 +266,32 @@ pub const Splicer = struct {
         return try self.swapTo(target, &self.undo_stack);
     }
 
-    /// Make `target` the current source (reparsing it) and push the outgoing
-    /// source onto `other`. Returns the `Change` describing current → target.
-    fn swapTo(self: *Splicer, target: std.ArrayList(u8), other: *std.ArrayList(std.ArrayList(u8))) !?Change {
+    /// Make `target` the current state (reparsing its source) and push the
+    /// outgoing state — source AND `current_caret` — onto `other`. The restored
+    /// entry's caret becomes `current_caret`, so after undo/redo `caretBlob`
+    /// reports the caret that matches the now-current source. Returns the
+    /// `Change` describing current → target.
+    fn swapTo(self: *Splicer, target: HistoryEntry, other: *std.ArrayList(HistoryEntry)) !?Change {
         var t = target;
-        const new_ast = self.parse_fn(self.parse_ctx, self.allocator, t.items) catch |err| {
+        const new_ast = self.parse_fn(self.parse_ctx, self.allocator, t.source.items) catch |err| {
             // A stored snapshot parsed when it was recorded, so this shouldn't
             // happen; if it does, drop the entry and surface the error rather
             // than leave the editor half-swapped.
             t.deinit(self.allocator);
             return err;
         };
-        const change = diffChange(self.source.items, t.items);
-        other.append(self.allocator, self.source) catch {
-            var cur = self.source;
-            cur.deinit(self.allocator); // OOM: lose this redo/undo entry, don't leak
+        const change = diffChange(self.source.items, t.source.items);
+        other.append(self.allocator, .{ .source = self.source, .caret = self.current_caret }) catch {
+            // OOM: lose this redo/undo entry, don't leak either buffer.
+            var lost: HistoryEntry = .{ .source = self.source, .caret = self.current_caret };
+            lost.deinit(self.allocator);
         };
         self.ast.deinit();
         self.ast = new_ast;
-        self.source = t;
+        self.source = t.source;
+        self.current_caret = t.caret;
         self.last_change = change;
+        self.revision += 1;
         return change;
     }
 
@@ -852,4 +913,116 @@ test "a fresh edit invalidates the redo stack" {
     try ed.replaceAtSpan(Span.init(0, 0), "b"); // diverge
     try testing.expect((try ed.redo()) == null);
     try testing.expectEqualStrings("b\n", ed.sourceBytes());
+}
+
+// ── revision token ────────────────────────────────────────────────────────────
+
+test "revision starts at 0 and bumps once per successful mutation" {
+    var ed = try Splicer.init(testing.allocator, "x\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    try testing.expectEqual(@as(u64, 0), ed.revision);
+
+    try ed.replaceAtSpan(Span.init(1, 1), "y");
+    try testing.expectEqual(@as(u64, 1), ed.revision);
+
+    // A failed (reparse-breaking) edit must NOT bump the revision.
+    var xml = try Splicer.init(testing.allocator, "<a>ok</a>", &test_ctx, parseXml);
+    defer xml.deinit();
+    try testing.expectEqual(@as(u64, 0), xml.revision);
+    try testing.expectError(error.MismatchedCloseTag, xml.replaceContent(&.{0}, "<b>"));
+    try testing.expectEqual(@as(u64, 0), xml.revision);
+
+    // undo and redo are mutations too, so they each bump.
+    _ = try ed.undo();
+    try testing.expectEqual(@as(u64, 2), ed.revision);
+    _ = try ed.redo();
+    try testing.expectEqual(@as(u64, 3), ed.revision);
+
+    // A no-op undo (nothing to undo) changes nothing.
+    _ = try ed.undo();
+    const r = ed.revision;
+    try testing.expect((try ed.undo()) == null);
+    try testing.expectEqual(r, ed.revision);
+}
+
+// ── opaque caret blob ─────────────────────────────────────────────────────────
+
+test "setCaret/caretBlob round-trips an opaque host blob" {
+    var ed = try Splicer.init(testing.allocator, "x\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    try testing.expectEqualStrings("", ed.caretBlob()); // none by default
+
+    try ed.setCaret("caret@3");
+    try testing.expectEqualStrings("caret@3", ed.caretBlob());
+
+    // twig owns its copy: mutating the caller's bytes doesn't disturb it.
+    var buf = [_]u8{ 'z', 'z' };
+    try ed.setCaret(&buf);
+    buf[0] = 'q';
+    try testing.expectEqualStrings("zz", ed.caretBlob());
+
+    try ed.setCaret(""); // clears
+    try testing.expectEqualStrings("", ed.caretBlob());
+}
+
+test "undo restores the pre-edit caret; redo restores the post-edit caret" {
+    var ed = try Splicer.init(testing.allocator, "hello\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+
+    // Host sets the caret for the current state BEFORE editing, so the retired
+    // undo step carries it.
+    try ed.setCaret("before");
+    try ed.replaceAtSpan(Span.init(5, 5), "!");
+    // The new state starts caret-less; the host sets the post-edit caret.
+    try testing.expectEqualStrings("", ed.caretBlob());
+    try ed.setCaret("after");
+
+    // Undo hands back the pre-edit caret with the pre-edit source.
+    _ = try ed.undo();
+    try testing.expectEqualStrings("hello\n", ed.sourceBytes());
+    try testing.expectEqualStrings("before", ed.caretBlob());
+
+    // Redo hands back the post-edit caret with the post-edit source.
+    _ = try ed.redo();
+    try testing.expectEqualStrings("hello!\n", ed.sourceBytes());
+    try testing.expectEqualStrings("after", ed.caretBlob());
+}
+
+test "coalesced run keeps the caret from before the run began" {
+    var ed = try Splicer.init(testing.allocator, "\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+
+    // Type "abc" as a coalesced run, each keystroke preceded by its caret.
+    try ed.setCaret("c0");
+    try ed.replaceAtSpan(Span.init(0, 0), "a");
+    try ed.setCaret("c1");
+    try ed.replaceAtSpan(Span.init(1, 1), "b");
+    ed.coalesceLastUndo();
+    try ed.setCaret("c2");
+    try ed.replaceAtSpan(Span.init(2, 2), "c");
+    ed.coalesceLastUndo();
+    try ed.setCaret("c3"); // caret after the whole run
+
+    // One undo removes the run and restores the caret from before it began.
+    _ = try ed.undo();
+    try testing.expectEqualStrings("\n", ed.sourceBytes());
+    try testing.expectEqualStrings("c0", ed.caretBlob());
+
+    // Redo restores the end-of-run caret.
+    _ = try ed.redo();
+    try testing.expectEqualStrings("abc\n", ed.sourceBytes());
+    try testing.expectEqualStrings("c3", ed.caretBlob());
+}
+
+test "caret blobs are evicted with their step past MAX_UNDO (no leak)" {
+    var ed = try Splicer.init(testing.allocator, "\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    // Push more than MAX_UNDO steps, each with a caret blob, so the oldest are
+    // evicted; the leak-checking allocator asserts nothing is dropped.
+    var i: usize = 0;
+    while (i < MAX_UNDO + 10) : (i += 1) {
+        try ed.setCaret("caret-blob-payload");
+        try ed.replaceAtSpan(Span.init(0, 0), "x");
+    }
+    try testing.expectEqual(MAX_UNDO, ed.undo_stack.items.len);
 }
