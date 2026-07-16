@@ -632,12 +632,20 @@ pub const Scanner = struct {
     tilde_delims: std.ArrayList(StrikeDelim) = .empty,
     brackets: std.ArrayList(Bracket) = .empty,
 
+    /// Every `email` node this block's EXTENDED autolink path
+    /// (`tryExtEmailAutolink`) created — the candidates `demoteExtEmails`
+    /// turns back into plain text if a link closes around them. Core
+    /// `<b@c.de>` autolinks are deliberately absent: they must survive inside
+    /// a link, nested. See `demoteExtEmails`.
+    ext_emails: std.ArrayList(Node.Id) = .empty,
+
     pub fn deinit(self: *Scanner) void {
         self.buf.deinit(self.b.allocator);
         self.items.deinit(self.b.allocator);
         self.delims.deinit(self.b.allocator);
         self.tilde_delims.deinit(self.b.allocator);
         self.brackets.deinit(self.b.allocator);
+        self.ext_emails.deinit(self.b.allocator);
     }
 
     /// Clear all per-block working state (retaining the buffers' capacity) and
@@ -650,6 +658,7 @@ pub const Scanner = struct {
         self.delims.clearRetainingCapacity();
         self.tilde_delims.clearRetainingCapacity();
         self.brackets.clearRetainingCapacity();
+        self.ext_emails.clearRetainingCapacity();
         self.buf_start = 0;
         self.buf_pure = true;
         self.head = null;
@@ -1043,12 +1052,63 @@ pub const Scanner = struct {
 
         _ = self.brackets.pop();
         if (!br.is_image) {
-            // Links may not contain other links: any outer, still-open
-            // plain `[` opener can never close into a link now (an outer
-            // `![` image opener is unaffected -- images may contain links).
+            // Links may not contain other links. Two halves, both scoped to
+            // `link` and not `image` (images may contain links):
+            //   - Looking OUTWARD: any outer, still-open plain `[` opener can
+            //     never close into a link now.
             for (self.brackets.items) |*outer| {
                 if (!outer.is_image) outer.active = false;
             }
+            //   - Looking INWARD: an extended email autolink already emitted
+            //     inside this link's text goes back to being text.
+            self.demoteExtEmails(node_id);
+        }
+    }
+
+    /// Turn every EXTENDED email autolink in `id`'s subtree back into plain
+    /// text — the last step of "links may not contain other links", for the
+    /// one autolink form that can still be sitting inside a freshly closed
+    /// link.
+    ///
+    /// It has to be undone here rather than prevented at the `@`, because
+    /// whether it was allowed depends on something the scanner cannot know
+    /// yet: cmark-gfm runs EMAIL autolinks as a POSTPROCESS that skips
+    /// resolved links (`extensions/autolink.c`'s `postprocess`), so an email
+    /// inside a bracket that never becomes a link DOES autolink
+    /// (`[a b@c.de]` links) while one inside a bracket that does DOESN'T
+    /// (`[a b@c.de](d)` is plain text). A single left-to-right pass reaches
+    /// the `@` before it knows which — so it emits, and this un-emits.
+    ///
+    /// That is also why the `www.`/url forms need nothing here: those are an
+    /// inline MATCHER in cmark, not a postprocess, and decline up front inside
+    /// any open bracket (see `Scanner.inBracket`) — so they can never be
+    /// present to demote. The two forms genuinely differ, and the difference
+    /// is observable: an unmatched `[` suppresses a url but not an email.
+    ///
+    /// Recurses, because the email need only be somewhere in the subtree
+    /// (`[*b@c.de*](d)` nests it under the emphasis), and matches by node id
+    /// against `ext_emails` rather than by kind, so a CORE `<b@c.de>` autolink
+    /// in the same text keeps its link — cmark leaves those nested.
+    fn demoteExtEmails(self: *Scanner, id: Node.Id) void {
+        if (self.ext_emails.items.len == 0) return;
+        var child = self.b.nodes.items[id].first_child;
+        while (child) |cid| {
+            self.demoteExtEmails(cid);
+            child = self.b.nodes.items[cid].next_sibling;
+        }
+        const node = &self.b.nodes.items[id];
+        if (std.meta.activeTag(node.kind) != .email) return;
+        for (self.ext_emails.items) |e| {
+            if (e != id) continue;
+            // Both kinds carry one string, so this rebinds the payload the
+            // builder already owns rather than duping it again; the span still
+            // covers exactly the source these bytes came from. Read the text
+            // out FIRST: assigning `.{ .str = node.kind.email }` would build
+            // the new union straight into `node.kind`, activating `.str`
+            // before the payload is read back out of `.email`.
+            const text = node.kind.email;
+            node.kind = .{ .str = text };
+            return;
         }
     }
 };
@@ -1746,6 +1806,11 @@ fn tryExtEmailAutolink(sc: *Scanner, text: []const u8, at: usize) Allocator.Erro
     }
     const email_id = try sc.b.addLeaf(.{ .email = email.items });
     if (local_part_src_start) |lps| sc.setSpanIfMapped(email_id, lps, final_end);
+    // Provisional: a link closing around this demotes it back to text (see
+    // `demoteExtEmails`). Recorded here because this is the ONE site the
+    // extension creates an `email` from bare text -- the core `<b@c.de>` form
+    // (the `'<'` case in `runScan`) must never be demoted.
+    try sc.ext_emails.append(sc.b.allocator, email_id);
     _ = try sc.appendItem(email_id);
     return final_end;
 }
@@ -2744,4 +2809,150 @@ test "extended autolinks: a word-internal http:// (preceded by a letter) does no
     defer ast.deinit();
     const child = ast.nodes[ast.root].first_child.?;
     try testing.expectEqualStrings("xhttp://example.com", ast.nodes[child].kind.str);
+}
+
+// ── links vs extended autolinks ─────────────────────────────────────────
+// Every expectation below was taken from cmark-gfm itself, not read off the
+// spec prose: the two forms behave differently for reasons the prose never
+// states (a `www.`/url is an inline matcher that declines inside a bracket; an
+// email is a postprocess that skips only RESOLVED links), and getting it from
+// the reference is the only way to be sure. See `Scanner.inBracket` and
+// `Scanner.demoteExtEmails`.
+
+test "extended autolink: an open bracket suppresses a url — it does not swallow the `](dest)`" {
+    // The bug this guards: the body scan stops only at space/`<`, so without
+    // the bracket check the URL ate `](d)` and the link never closed —
+    // `[a <a href="https://x.dev%5D(d)">https://x.dev](d)</a>`.
+    var ast = try parseAndFinishWithOptions("[a https://x.dev](d)", .{ .autolinks = true });
+    defer ast.deinit();
+    const link = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[link].kind == .link);
+    try testing.expectEqualStrings("d", ast.nodes[link].kind.link.destination.?);
+    // The URL survives as ordinary text inside the link, never as a nested one.
+    var it = ast.children(link);
+    try testing.expectEqualStrings("a https://x.dev", it.next().?.kind.str);
+    try testing.expectEqual(@as(?*const Node, null), it.next());
+}
+
+test "extended autolink: an UNMATCHED `[` suppresses a url for the rest of the block" {
+    // Surprising but load-bearing: cmark pops its bracket on every `]` path, so
+    // only a `[` with no `]` at all stays open — and while it is, the url form
+    // declines. `[a https://x.dev` is `<p>[a https://x.dev</p>`, no link.
+    var ast = try parseAndFinishWithOptions("[a https://x.dev", .{ .autolinks = true });
+    defer ast.deinit();
+    var it = ast.children(ast.root);
+    while (it.next()) |n| try testing.expect(n.kind != .url and n.kind != .link);
+}
+
+test "extended autolink: a bracket that closes WITHOUT a link releases the suppression" {
+    // The other half of the rule above — `[a]` pops, so the url fires again.
+    var ast = try parseAndFinishWithOptions("[a] https://x.dev", .{ .autolinks = true });
+    defer ast.deinit();
+    var found = false;
+    var it = ast.children(ast.root);
+    while (it.next()) |n| {
+        if (n.kind == .url) {
+            try testing.expectEqualStrings("https://x.dev", n.kind.url);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "extended autolink: a `]` is an ordinary URL byte when no bracket is open" {
+    // Why the fix can't just stop the body at `]`: per the spec a url runs to
+    // the next space or `<`, so this links WHOLE. The bracket context decides,
+    // not the byte.
+    var ast = try parseAndFinishWithOptions("www.example.com/a]b", .{ .autolinks = true });
+    defer ast.deinit();
+    const link = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[link].kind == .link);
+    try testing.expectEqualStrings("http://www.example.com/a]b", ast.nodes[link].kind.link.destination.?);
+}
+
+test "extended autolink: an email inside a link that RESOLVES is demoted back to text" {
+    var ast = try parseAndFinishWithOptions("[a b@c.de](d)", .{ .autolinks = true });
+    defer ast.deinit();
+    const link = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[link].kind == .link);
+    var it = ast.children(link);
+    try testing.expectEqualStrings("a ", it.next().?.kind.str);
+    // Demoted in place: same bytes, now a `str`, and no second `email` node.
+    const demoted = it.next().?;
+    try testing.expect(demoted.kind == .str);
+    try testing.expectEqualStrings("b@c.de", demoted.kind.str);
+}
+
+test "extended autolink: an email inside a bracket that does NOT resolve still links" {
+    // The pair to the test above, and why this can't be prevented at the `@`:
+    // whether it was allowed depends on something the scanner learns later.
+    var ast = try parseAndFinishWithOptions("[a b@c.de]", .{ .autolinks = true });
+    defer ast.deinit();
+    var found = false;
+    var it = ast.children(ast.root);
+    while (it.next()) |n| {
+        if (n.kind == .email) {
+            try testing.expectEqualStrings("b@c.de", n.kind.email);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "extended autolink: demotion reaches an email nested deeper inside the link" {
+    // cmark's postprocess skips the whole link SUBTREE, not just its direct
+    // children, so the emphasis is no hiding place.
+    var ast = try parseAndFinishWithOptions("[a *b@c.de*](d)", .{ .autolinks = true });
+    defer ast.deinit();
+    const link = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[link].kind == .link);
+    var it = ast.children(link);
+    _ = it.next().?; // "a "
+    const em = it.next().?;
+    try testing.expect(em.kind == .emph);
+    const inner = ast.nodes[em.first_child.?];
+    try testing.expect(inner.kind == .str);
+    try testing.expectEqualStrings("b@c.de", inner.kind.str);
+}
+
+test "extended autolink: demotion is scoped to the link — an email after it still links" {
+    var ast = try parseAndFinishWithOptions("[a b@c.de](d) and e@f.gh", .{ .autolinks = true });
+    defer ast.deinit();
+    var emails: usize = 0;
+    var it = ast.children(ast.root);
+    while (it.next()) |n| {
+        if (n.kind == .email) {
+            try testing.expectEqualStrings("e@f.gh", n.kind.email);
+            emails += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), emails);
+}
+
+test "extended autolink: a CORE `<b@c.de>` inside a link is NOT demoted" {
+    // The reason `demoteExtEmails` matches by node id rather than by kind.
+    // cmark leaves this nested (invalid HTML, but it is what the reference
+    // emits), because only the EXTENSION's emails go through the postprocess.
+    var ast = try parseAndFinishWithOptions("[a <b@c.de>](d)", .{ .autolinks = true });
+    defer ast.deinit();
+    const link = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[link].kind == .link);
+    var it = ast.children(link);
+    _ = it.next().?; // "a "
+    const inner = it.next().?;
+    try testing.expect(inner.kind == .email);
+    try testing.expectEqualStrings("b@c.de", inner.kind.email);
+}
+
+test "extended autolink: an email inside an IMAGE is not demoted (images are not links)" {
+    // cmark's postprocess keys on the LINK node type; an image is a different
+    // one, so nothing suppresses there. Invisible in HTML (alt text renders the
+    // same either way), which is exactly why it is pinned on the AST here.
+    var ast = try parseAndFinishWithOptions("![a b@c.de](i)", .{ .autolinks = true });
+    defer ast.deinit();
+    const img = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[img].kind == .image);
+    var it = ast.children(img);
+    _ = it.next().?; // "a "
+    try testing.expect(it.next().?.kind == .email);
 }
