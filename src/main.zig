@@ -8,7 +8,8 @@
 //!
 //! Unlike fig's `cli/main.zig`, there is no `std.log`/terminal-color/`NO_COLOR`
 //! machinery here: Twig's CLI is plain `stdout`/`stderr` writers throughout
-//! (per the mission's "keep Twig's CLI modest and clean"), and diagnostics
+//! (Twig keeps its CLI modest and clean — see DESIGN.md's design principles),
+//! and diagnostics
 //! are printed directly by whichever `cli/` module detects the problem
 //! (`args.zig` for bad flags/undetectable formats, `actions.zig` for
 //! read/parse/render/serialize failures — see their module doc comments for

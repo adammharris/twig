@@ -1,3 +1,6 @@
+---
+part_of: '[Twig](/twig.md)'
+---
 # Twig Cookbook — `jq`/`sed` for documents
 
 Twig treats a document the way `jq` treats JSON: locate a node, then act on it.

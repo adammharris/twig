@@ -564,6 +564,7 @@ pub const Parser = struct {
         self.pos = if (end < self.source.len) end + 3 else end;
         const id = try self.builder.addLeaf(.{ .comment = self.source[content_start..end] });
         self.builder.setSpan(id, Span.init(start, self.pos));
+        self.builder.setContentSpan(id, Span.init(content_start, end));
         return id;
     }
 
@@ -576,6 +577,7 @@ pub const Parser = struct {
         if (self.pos < self.source.len) self.pos += 1;
         const id = try self.builder.addLeaf(.{ .comment = self.source[content_start..end] });
         self.builder.setSpan(id, Span.init(start, self.pos));
+        self.builder.setContentSpan(id, Span.init(content_start, end));
         return id;
     }
 
@@ -588,6 +590,7 @@ pub const Parser = struct {
         if (self.pos < self.source.len) self.pos += 1;
         const id = try self.builder.addLeaf(.{ .doctype = self.source[content_start..end] });
         self.builder.setSpan(id, Span.init(start, self.pos));
+        self.builder.setContentSpan(id, Span.init(content_start, end));
         return id;
     }
 
@@ -603,6 +606,9 @@ pub const Parser = struct {
         self.pos = if (end < self.source.len) end + 2 else end;
         const id = try self.builder.addLeaf(.{ .processing_instruction = .{ .target = target, .data = self.source[data_start..end] } });
         self.builder.setSpan(id, Span.init(start, self.pos));
+        // `content_span` stays `null`: a PI's payload is split across two
+        // fields (target + data), so there is no single unambiguous interior
+        // between `<?` and `?>` to point at (see the XML parser's PI note).
         return id;
     }
 };
@@ -817,4 +823,50 @@ test "HTML soft-wrapped list-item paragraph keeps continuation indent in djot/ma
     const md = try @import("../markdown/serializer.zig").serializeAstAlloc(testing.allocator, &ast);
     defer testing.allocator.free(md);
     try testing.expectEqualStrings("- one\n  two\n", md);
+}
+
+test "HTML framed leaves carry an interior content_span" {
+    const source = "<!doctype html><!-- hi --><!bogus><?pi go?>";
+    var parser = Parser.init(testing.allocator, source);
+    defer parser.deinit();
+    var ast = try parser.parse();
+    defer ast.deinit();
+
+    const doctype = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    const comment = ast.nodes[doctype].next_sibling orelse return error.TestExpectedNonNull;
+    const bogus = ast.nodes[comment].next_sibling orelse return error.TestExpectedNonNull;
+    const pi = ast.nodes[bogus].next_sibling orelse return error.TestExpectedNonNull;
+
+    // doctype: interior between `<!doctype` and `>`.
+    try testing.expect(ast.nodes[doctype].kind == .doctype);
+    try testing.expectEqualStrings("<!doctype html>", Span.of(u8, ast.nodes[doctype].span, source));
+    try testing.expectEqualStrings(" html", Span.of(u8, ast.nodes[doctype].content_span.?, source));
+
+    // proper comment: interior between `<!--` and `-->`.
+    try testing.expect(ast.nodes[comment].kind == .comment);
+    try testing.expectEqualStrings("<!-- hi -->", Span.of(u8, ast.nodes[comment].span, source));
+    try testing.expectEqualStrings(" hi ", Span.of(u8, ast.nodes[comment].content_span.?, source));
+
+    // bogus comment (`<!`…`>`) is emitted as a comment kind and also framed.
+    try testing.expect(ast.nodes[bogus].kind == .comment);
+    try testing.expectEqualStrings("<!bogus>", Span.of(u8, ast.nodes[bogus].span, source));
+    try testing.expectEqualStrings("bogus", Span.of(u8, ast.nodes[bogus].content_span.?, source));
+
+    // processing instruction: two payload fields, so content_span stays null.
+    try testing.expect(ast.nodes[pi].kind == .processing_instruction);
+    try testing.expectEqual(@as(?Span, null), ast.nodes[pi].content_span);
+}
+
+test "HTML empty comment interior gets an empty content_span at the boundary" {
+    const source = "<!---->";
+    var parser = Parser.init(testing.allocator, source);
+    defer parser.deinit();
+    var ast = try parser.parse();
+    defer ast.deinit();
+
+    const comment = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[comment].kind == .comment);
+    const cs = ast.nodes[comment].content_span.?;
+    try testing.expectEqual(@as(usize, 0), cs.len());
+    try testing.expectEqual(ast.nodes[comment].span.start + "<!--".len, cs.start);
 }

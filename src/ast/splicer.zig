@@ -1,7 +1,7 @@
 //! The span-splice editor — Twig's reason for existing: precise, LOSSLESS
 //! in-place edits to a document, driven by the AST's byte spans. The document
-//! analogue of how `fig` edits config files (see `~/Documents/fig/src/editor
-//! .zig`), reduced to its essence.
+//! analogue of how sister project `fig` edits config files (see DESIGN.md's
+//! "Relationship to fig"), reduced to its essence.
 //!
 //! ── The one primitive ──────────────────────────────────────────────────────
 //! Everything reduces to `replaceAtSpan(span, replacement)`: build a new source
@@ -337,9 +337,12 @@ pub const Splicer = struct {
         try self.replaceAtSpan(try self.nodeSpan(id), text);
     }
 
-    /// Replace the interior (between-delimiters `content_span`) of the
-    /// container. `error.NoContentSpan` if it has none (a leaf, or a djot
-    /// container the parser left with a null interior — see the module doc).
+    /// Replace the interior (between-delimiters `content_span`) of the node.
+    /// Usually a container (its children), but also a text leaf that carries a
+    /// `content_span`: on a `code_block` this replaces the code body, fences
+    /// left intact. `error.NoContentSpan` if the node has no interior (most
+    /// leaves, or a djot container the parser left with a null interior — see
+    /// the module doc).
     pub fn replaceContent(self: *Splicer, path: []const usize, text: []const u8) !void {
         try self.replaceContentById(try self.ast.getIdByPath(path), text);
     }
@@ -370,12 +373,21 @@ pub const Splicer = struct {
     /// `index == 0` -> before the current first child; an index at or past the
     /// child count -> after the current last child; otherwise -> before the
     /// index-th child. An *empty* container is anchored at its `content_span`
-    /// start (`error.NoContentSpan` if it has none).
+    /// start (`error.NoContentSpan` if it has none). `error.NotAContainer` for
+    /// a text leaf like `code_block`: it has a `content_span` (its body) but no
+    /// child sequence, so there is nothing to insert a *child* into (use
+    /// `replaceContent` to edit the body instead).
     pub fn insertChild(self: *Splicer, path: []const usize, index: usize, text: []const u8) !void {
         try self.insertChildById(try self.ast.getIdByPath(path), index, text);
     }
     pub fn insertChildById(self: *Splicer, id: Node.Id, index: usize, text: []const u8) !void {
         const first = self.ast.nodes[id].first_child orelse {
+            // A childless node with a `content_span` is either an EMPTY
+            // container (anchor the first child at its interior start) or a
+            // text leaf like `code_block`, whose `content_span` is opaque body
+            // text, not a child region. Refuse the latter — it has no children
+            // to index — even though it does carry a `content_span`.
+            if (AST.holdsOpaqueText(self.ast.nodes[id].kind)) return error.NotAContainer;
             const cs = self.ast.nodes[id].content_span orelse return error.NoContentSpan;
             return self.replaceAtSpan(Span.init(cs.start, cs.start), text);
         };
@@ -478,7 +490,7 @@ pub const Splicer = struct {
         try self.replaceAtSpan(span, interior);
     }
 
-    // ── range-oriented rich-text ops (the "toolbar", P5) ─────────────────────
+    // ── range-oriented rich-text ops (the "toolbar") ────────────────────────
     // These stay language-agnostic: the caller (which knows the format) supplies
     // the delimiter bytes and the target `Node.Kind` tag, so this engine never
     // imports a language module. The format→delimiter table lives at the C-ABI
@@ -515,11 +527,12 @@ pub const Splicer = struct {
             return self.wrapRange(span, open, close);
 
         const node = self.ast.nodes[id];
-        // Prefer the parser's interior (correct regardless of delimiter width);
-        // fall back to stripping the supplied delimiters for a kind the parser
-        // leaves without a `content_span` (e.g. `verbatim`). Both replacement
-        // slices alias `self.source`, which `replaceAtSpan` copies before
-        // retiring the old buffer — safe.
+        // Prefer the parser's interior (correct regardless of delimiter width —
+        // e.g. a multi-backtick `verbatim` whose interior the fixed-width
+        // delimiters below can't strip); fall back to stripping the supplied
+        // delimiters for a kind the parser leaves without a `content_span`. Both
+        // replacement slices alias `self.source`, which `replaceAtSpan` copies
+        // before retiring the old buffer — safe.
         if (node.content_span) |cs| {
             try self.replaceAtSpan(node.span, self.source.items[cs.start..cs.end]);
             return;
@@ -779,13 +792,25 @@ test "toggleInline wraps when the range isn't already marked" {
     try testing.expectEqualStrings("a *word* b\n", ed.sourceBytes());
 }
 
-test "toggleInline strips a verbatim run by delimiter (no content_span)" {
+test "toggleInline strips a verbatim run via its content_span" {
     var ed = try Splicer.init(testing.allocator, "a `code` b\n", &test_ctx, parseMarkdown);
     defer ed.deinit();
-    // The verbatim node is [2,8) "`code`" with no content_span; matched by whole
-    // span, its interior recovered by peeling the backticks.
+    // The verbatim node is [2,8) "`code`" with content_span [3,7) "code"; toggle
+    // replaces the whole node with its interior.
     try ed.toggleInline(Span.init(2, 8), .verbatim, "`", "`");
     try testing.expectEqualStrings("a code b\n", ed.sourceBytes());
+}
+
+test "toggleInline strips a MULTI-backtick verbatim (content_span, not delimiter width)" {
+    var ed = try Splicer.init(testing.allocator, "a ``x`` b\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    // The verbatim node is [2,7) "``x``" with content_span [4,5) "x". Toggling
+    // with single-backtick delimiters must still peel BOTH backtick runs — the
+    // interior comes from content_span, not from stripping `open`/`close`. (The
+    // old delimiter-strip fallback stripped one backtick per side, leaving the
+    // corrupt "`x`".)
+    try ed.toggleInline(Span.init(2, 7), .verbatim, "`", "`");
+    try testing.expectEqualStrings("a x b\n", ed.sourceBytes());
 }
 
 test "replaceContent on a leaf yields NoContentSpan" {
@@ -793,6 +818,23 @@ test "replaceContent on a leaf yields NoContentSpan" {
     defer ed.deinit();
     // [0,0] = the "hi" text node, a leaf: no interior to splice.
     try testing.expectError(error.NoContentSpan, ed.replaceContent(&.{ 0, 0 }, "x"));
+}
+
+test "replaceContent on a code_block replaces the body, fences intact" {
+    var ed = try Splicer.init(testing.allocator, "```\nold\n```\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    // [0] = the code_block (root's first child). A code_block is a text leaf,
+    // but it carries a content_span (its body), so replaceContent works.
+    try ed.replaceContent(&.{0}, "new");
+    try testing.expectEqualStrings("```\nnew\n```\n", ed.sourceBytes());
+}
+
+test "insertChild on a code_block is rejected (NotAContainer)" {
+    var ed = try Splicer.init(testing.allocator, "```\ncode\n```\n", &test_ctx, parseMarkdown);
+    defer ed.deinit();
+    // A code_block has a content_span but no child sequence: inserting a
+    // *child* is meaningless, so it's refused (unlike an empty container).
+    try testing.expectError(error.NotAContainer, ed.insertChild(&.{0}, 0, "x"));
 }
 
 test "path navigation reports out-of-bounds" {

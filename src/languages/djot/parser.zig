@@ -269,6 +269,19 @@ const TreeContainer = struct {
     attrs: PendingAttrs = .{},
     data: ContainerData = .{},
     start: usize = 0,
+    /// For a framed *leaf* built from an `_open`/`_close` pair (inline
+    /// `verbatim`/math, `<...>` url/email autolink): the byte offset just
+    /// past the opening delimiter — i.e. where the raw interior begins. The
+    /// interior ends at the closing event's `start`. `null` when the
+    /// container isn't such a leaf. See `leafInteriorSpan`.
+    content_start: ?usize = null,
+    /// For a `code_block`/`raw_block`: the byte range of its body — the first
+    /// body line's start to the last body line's end, both fence lines
+    /// excluded — accumulated from the `.str` events between the fences.
+    /// `body_start` stays `null` for an empty (bodyless) fenced block, so it
+    /// correctly gets no `content_span`.
+    body_start: ?usize = null,
+    body_end: usize = 0,
 
     fn deinit(self: *TreeContainer, allocator: Allocator) void {
         self.attrs.deinit(allocator);
@@ -430,6 +443,20 @@ pub const TreeBuilder = struct {
         return Span.init(self.nodes.items[first].span.start, self.nodes.items[last].span.end);
     }
 
+    /// The `content_span` of a framed *leaf* (inline `verbatim`/math, `<...>`
+    /// url/email autolink): the raw source interior `[content_start, close)`,
+    /// where `content_start` was recorded just past the opening delimiter and
+    /// `close` is the closing event's start. `null` for an empty interior
+    /// (`content_start == close`) — an empty frame carries no `content_span`,
+    /// matching the `code_block`/container conventions. Note this is the RAW
+    /// source between the delimiters and need NOT byte-equal the node's
+    /// (space-trimmed) text payload — see `ast.zig`'s `content_span` doc.
+    fn leafInteriorSpan(content_start: ?usize, close: usize) ?Span {
+        const cs = content_start orelse return null;
+        if (cs >= close) return null;
+        return Span.init(cs, close);
+    }
+
     fn textOf(self: *const TreeBuilder, ev: Event) []const u8 {
         return self.source[ev.start .. ev.end + 1];
     }
@@ -528,6 +555,14 @@ pub const TreeBuilder = struct {
                     const id = try self.addNode(.{ .str = txt }, Span.init(ev.start, ev.end + 1));
                     self.addChildToTip(id);
                 } else {
+                    // Record the raw body extent so a `code_block`/`raw_block`
+                    // can report it as `content_span`. Harmless for other
+                    // opaque-text containers (verbatim/math/url/email), which
+                    // derive their interior from delimiters instead and never
+                    // read `body_*`.
+                    const top = self.topContainer();
+                    if (top.body_start == null) top.body_start = ev.start;
+                    top.body_end = ev.end + 1;
                     try self.accumulated_text.appendSlice(self.allocator, txt);
                 }
             },
@@ -562,6 +597,8 @@ pub const TreeBuilder = struct {
                 if (self.context == .normal) {
                     const alias = self.source[ev.start + 1 .. ev.end];
                     const id = try self.addNode(.{ .symb = alias }, Span.init(ev.start, ev.end + 1));
+                    // Interior between the framing colons (`:name:` → `name`).
+                    self.nodes.items[id].content_span = leafInteriorSpan(ev.start + 1, ev.end);
                     self.addChildToTip(id);
                 } else {
                     try self.accumulated_text.appendSlice(self.allocator, self.textOf(ev));
@@ -571,6 +608,9 @@ pub const TreeBuilder = struct {
                 const raw = self.source[ev.start + 2 .. ev.end];
                 const lab = try normalizeLabel(self.allocator, raw);
                 const id = try self.addNode(.{ .footnote_reference = lab }, Span.init(ev.start, ev.end + 1));
+                // Interior between the `[^` and `]` framing (raw label, which
+                // need not equal the normalized `.footnote_reference` payload).
+                self.nodes.items[id].content_span = leafInteriorSpan(ev.start + 2, ev.end);
                 self.allocator.free(lab);
                 self.addChildToTip(id);
             },
@@ -693,6 +733,7 @@ pub const TreeBuilder = struct {
             .verbatim_open => {
                 self.context = .verbatim;
                 try self.pushContainer(ev.start);
+                self.topContainer().content_start = ev.end + 1;
             },
             .verbatim_close => {
                 var c = self.popContainer();
@@ -700,6 +741,10 @@ pub const TreeBuilder = struct {
                 const text = try trimVerbatim(self.allocator, self.accumulated_text.items);
                 defer self.allocator.free(text);
                 const id = try self.addNode(.{ .verbatim = text }, Span.init(c.start, ev.end + 1));
+                // Raw interior between the backticks (a later `raw_format`
+                // event may retype this node to `raw_inline`, keeping the same
+                // interior). `source[content_span]` is the raw, untrimmed text.
+                self.nodes.items[id].content_span = leafInteriorSpan(c.content_start, ev.start);
                 try self.commitAttrs(id, &c.attrs);
                 self.addChildToTip(id);
                 self.context = .normal;
@@ -710,6 +755,7 @@ pub const TreeBuilder = struct {
             .display_math_open, .inline_math_open => {
                 self.context = .verbatim;
                 try self.pushContainer(ev.start);
+                self.topContainer().content_start = ev.end + 1;
             },
             .display_math_close => try self.closeMath(ev, true),
             .inline_math_close => try self.closeMath(ev, false),
@@ -717,6 +763,7 @@ pub const TreeBuilder = struct {
             .url_open => {
                 self.context = .literal;
                 try self.pushContainer(ev.start);
+                self.topContainer().content_start = ev.end + 1;
             },
             .url_close => {
                 var c = self.popContainer();
@@ -724,6 +771,8 @@ pub const TreeBuilder = struct {
                 const text = try stripNewlines(self.allocator, self.accumulated_text.items);
                 defer self.allocator.free(text);
                 const id = try self.addNode(.{ .url = text }, Span.init(c.start, ev.end + 1));
+                // Interior between the `<` and `>` autolink delimiters.
+                self.nodes.items[id].content_span = leafInteriorSpan(c.content_start, ev.start);
                 try self.commitAttrs(id, &c.attrs);
                 self.addChildToTip(id);
                 self.context = .normal;
@@ -732,6 +781,7 @@ pub const TreeBuilder = struct {
             .email_open => {
                 self.context = .literal;
                 try self.pushContainer(ev.start);
+                self.topContainer().content_start = ev.end + 1;
             },
             .email_close => {
                 var c = self.popContainer();
@@ -739,6 +789,8 @@ pub const TreeBuilder = struct {
                 const text = try stripNewlines(self.allocator, self.accumulated_text.items);
                 defer self.allocator.free(text);
                 const id = try self.addNode(.{ .email = text }, Span.init(c.start, ev.end + 1));
+                // Interior between the `<` and `>` autolink delimiters.
+                self.nodes.items[id].content_span = leafInteriorSpan(c.content_start, ev.start);
                 try self.commitAttrs(id, &c.attrs);
                 self.addChildToTip(id);
                 self.context = .normal;
@@ -951,6 +1003,9 @@ pub const TreeBuilder = struct {
         defer self.allocator.free(text);
         const kind: Node.Kind = if (display) .{ .display_math = text } else .{ .inline_math = text };
         const id = try self.addNode(kind, Span.init(c.start, ev.end + 1));
+        // Raw interior between the `$`/`$$` + backtick opener and the closing
+        // backticks; `source[content_span]` is untrimmed, unlike `text`.
+        self.nodes.items[id].content_span = leafInteriorSpan(c.content_start, ev.start);
         try self.commitAttrs(id, &c.attrs);
         self.addChildToTip(id);
         self.context = .normal;
@@ -1257,6 +1312,11 @@ pub const TreeBuilder = struct {
             try self.addNode(.{ .raw_block = .{ .format = fmt, .text = self.accumulated_text.items } }, s)
         else
             try self.addNode(.{ .code_block = .{ .lang = c.data.lang, .text = self.accumulated_text.items } }, s);
+        // Body interior with both fence lines excluded (see `body_*` on
+        // `TreeContainer`). `null` for an empty fenced block (no body line
+        // seen). `source[content_span]` is the raw body, whereas `.text` is
+        // dedented/newline-normalized — they need not byte-match.
+        if (c.body_start) |bs| self.nodes.items[id].content_span = Span.init(bs, c.body_end);
         try self.commitAttrs(id, &c.attrs);
         self.addChildToTip(id);
         self.context = .normal;
@@ -1519,4 +1579,184 @@ test "span: a bullet list and its items carry byte-accurate spans (sourcepos par
     const str1 = ast.nodes[para1].first_child orelse return error.TestExpectedNonNull;
     try testing.expect(ast.nodes[str1].kind == .str);
     try testing.expectEqualStrings("a", src[ast.nodes[str1].span.start..ast.nodes[str1].span.end]);
+}
+
+// ── content_span on framed *leaves* ─────────────────────────────────────
+// Beyond containers, the opaque-text leaves that carry syntactic framing
+// (delimiters/fences/markers) report their raw source *interior* as
+// `content_span`, mirroring the Markdown parser. Each test asserts (a) the
+// node kind, (b) that `span` covers the framing, (c) that `content_span` is
+// the exact interior, and — where the payload is normalized/trimmed and so
+// differs from the raw interior — asserts BOTH to document the distinction.
+
+/// Reach the first inline leaf: root → first paragraph → its first child.
+fn firstInlineLeaf(ast: AST) ?Node.Id {
+    const para = ast.nodes[ast.root].first_child orelse return null;
+    return ast.nodes[para].first_child;
+}
+
+test "content_span: inline verbatim is the interior between the backticks" {
+    const src = "`code`\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const id = firstInlineLeaf(ast) orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[id].kind == .verbatim);
+    const sp = ast.nodes[id].span;
+    try testing.expectEqualStrings("`code`", src[sp.start..sp.end]);
+    const cs = ast.nodes[id].content_span orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("code", src[cs.start..cs.end]);
+}
+
+test "content_span: verbatim raw interior differs from the space-trimmed text" {
+    // `` `x` `` -> the payload trims one adjacent space at each end, but the
+    // raw interior (content_span) keeps those spaces.
+    const src = "`` `x` ``\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const id = firstInlineLeaf(ast) orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[id].kind == .verbatim);
+    try testing.expectEqualStrings("`x`", ast.nodes[id].kind.verbatim);
+    const cs = ast.nodes[id].content_span orelse return error.TestExpectedNonNull;
+    // Raw interior INCLUDES the framing spaces: content_span != text.
+    try testing.expectEqualStrings(" `x` ", src[cs.start..cs.end]);
+}
+
+test "content_span: inline and display math interiors exclude their delimiters" {
+    {
+        const src = "$`x+y`\n";
+        var doc = try parseDoc(testing.allocator, src);
+        defer doc.deinit();
+        const ast = doc.ast;
+        const id = firstInlineLeaf(ast) orelse return error.TestExpectedNonNull;
+        try testing.expect(ast.nodes[id].kind == .inline_math);
+        const sp = ast.nodes[id].span;
+        try testing.expectEqualStrings("$`x+y`", src[sp.start..sp.end]);
+        const cs = ast.nodes[id].content_span orelse return error.TestExpectedNonNull;
+        try testing.expectEqualStrings("x+y", src[cs.start..cs.end]);
+    }
+    {
+        const src = "$$`x+y`\n";
+        var doc = try parseDoc(testing.allocator, src);
+        defer doc.deinit();
+        const ast = doc.ast;
+        const id = firstInlineLeaf(ast) orelse return error.TestExpectedNonNull;
+        try testing.expect(ast.nodes[id].kind == .display_math);
+        const sp = ast.nodes[id].span;
+        try testing.expectEqualStrings("$$`x+y`", src[sp.start..sp.end]);
+        const cs = ast.nodes[id].content_span orelse return error.TestExpectedNonNull;
+        try testing.expectEqualStrings("x+y", src[cs.start..cs.end]);
+    }
+}
+
+test "content_span: raw inline keeps the backtick interior (not the {=fmt})" {
+    const src = "`raw`{=html}\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const id = firstInlineLeaf(ast) orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[id].kind == .raw_inline);
+    const cs = ast.nodes[id].content_span orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("raw", src[cs.start..cs.end]);
+}
+
+test "content_span: url autolink interior excludes the angle brackets" {
+    const src = "<https://x.dev>\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const id = firstInlineLeaf(ast) orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[id].kind == .url);
+    const sp = ast.nodes[id].span;
+    try testing.expectEqualStrings("<https://x.dev>", src[sp.start..sp.end]);
+    const cs = ast.nodes[id].content_span orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("https://x.dev", src[cs.start..cs.end]);
+}
+
+test "content_span: email autolink interior excludes the angle brackets" {
+    const src = "<a@b.dev>\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const id = firstInlineLeaf(ast) orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[id].kind == .email);
+    const cs = ast.nodes[id].content_span orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("a@b.dev", src[cs.start..cs.end]);
+}
+
+test "content_span: symbol interior excludes the framing colons" {
+    const src = ":smile:\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const id = firstInlineLeaf(ast) orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[id].kind == .symb);
+    const sp = ast.nodes[id].span;
+    try testing.expectEqualStrings(":smile:", src[sp.start..sp.end]);
+    const cs = ast.nodes[id].content_span orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("smile", src[cs.start..cs.end]);
+}
+
+test "content_span: footnote reference interior excludes the [^ and ]" {
+    const src = "x[^note]\n\n[^note]: body\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const para = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    // Skip the leading `x` str to reach the footnote_reference.
+    const str_x = ast.nodes[para].first_child orelse return error.TestExpectedNonNull;
+    const id = ast.nodes[str_x].next_sibling orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[id].kind == .footnote_reference);
+    const sp = ast.nodes[id].span;
+    try testing.expectEqualStrings("[^note]", src[sp.start..sp.end]);
+    const cs = ast.nodes[id].content_span orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("note", src[cs.start..cs.end]);
+}
+
+test "content_span: fenced code block body excludes both fence lines" {
+    const src = "```lua\nx=1\ny=2\n```\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const id = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[id].kind == .code_block);
+    const cs = ast.nodes[id].content_span orelse return error.TestExpectedNonNull;
+    // Raw source body — the fence lines (```lua and ```) are excluded.
+    try testing.expectEqualStrings("x=1\ny=2\n", src[cs.start..cs.end]);
+    // The payload matches here, but the guarantee is only that the span
+    // addresses the raw body — see the space-trim/verbatim test for a case
+    // where source[content_span] deliberately differs from the payload.
+    try testing.expectEqualStrings("x=1\ny=2\n", ast.nodes[id].kind.code_block.text);
+}
+
+test "content_span: raw block body excludes both fence lines" {
+    const src = "```=html\n<b>hi</b>\n```\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const id = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[id].kind == .raw_block);
+    const cs = ast.nodes[id].content_span orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("<b>hi</b>\n", src[cs.start..cs.end]);
+}
+
+test "content_span: an empty fenced code block (no body) stays null" {
+    const src = "```\n```\n";
+    var doc = try parseDoc(testing.allocator, src);
+    defer doc.deinit();
+    const ast = doc.ast;
+
+    const id = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    try testing.expect(ast.nodes[id].kind == .code_block);
+    try testing.expectEqual(@as(?Span, null), ast.nodes[id].content_span);
 }

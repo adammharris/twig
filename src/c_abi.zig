@@ -49,9 +49,12 @@ pub const TwigSpan = extern struct {
 
 /// One node matched by `twig_document_query`, the C-ABI shape of
 /// `Select.Match` plus the node's kind name. `content_span` is only
-/// meaningful when `has_content_span` is non-zero (a leaf, or a container the
-/// parser left without a known interior, reports `has_content_span == 0` and
-/// a zeroed `content_span`). `kind` is a NUL-terminated `Node.Kind` tag name
+/// meaningful when `has_content_span` is non-zero; a node with no interior
+/// (most leaves, or a container the parser left without a known interior)
+/// reports `has_content_span == 0` and a zeroed `content_span`. Note that a
+/// text leaf CAN report `has_content_span == 1`: a `code_block` carries the
+/// span of its body (fences excluded), so "has a content_span" does not imply
+/// "is a container." `kind` is a NUL-terminated `Node.Kind` tag name
 /// (e.g. `"heading"`, `"code_block"`) in static, library-owned storage — it
 /// is never freed and stays valid for the process lifetime.
 pub const TwigQueryMatch = extern struct {
@@ -529,9 +532,10 @@ const EditorHandle = struct {
     /// Caller-borrowed output buffers, same contract as `DocumentHandle`'s.
     ast_json: []u8 = &.{},
     query_matches: []TwigQueryMatch = &.{},
-    /// The last `twig_editor_nodes` snapshot (P2).
+    /// The last `twig_editor_nodes` snapshot (editor tree read-back; see
+    /// DESIGN.md's "Editor surface" tiers).
     flat_nodes: []TwigFlatNode = &.{},
-    /// The last `twig_editor_nodes_at` ancestor chain (P3). Independent of
+    /// The last `twig_editor_nodes_at` ancestor chain. Independent of
     /// `query_matches` so a hit-test doesn't invalidate a prior query.
     ancestor_matches: []TwigQueryMatch = &.{},
 };
@@ -588,7 +592,7 @@ fn statusOfLocatorError(err: twig.locator.Error) TwigStatus {
 fn statusOfSplicerError(err: anyerror) TwigStatus {
     return switch (err) {
         error.OutOfMemory => .out_of_memory,
-        error.NoNodeSpan, error.NoContentSpan => .not_editable,
+        error.NoNodeSpan, error.NoContentSpan, error.NotAContainer => .not_editable,
         else => .edit_conflict,
     };
 }
@@ -906,8 +910,9 @@ pub export fn twig_editor_query(
     return .ok;
 }
 
-// ── Offset-addressed editing & read-back (P0–P3) ─────────────────────────────
-// The rich-text-editor surface: a caret speaks byte offsets, not locator
+// ── Offset-addressed editing & read-back ─────────────────────────────────────
+// The embeddable rich-text-editor surface (DESIGN.md's "Editor surface" tiers
+// P0–P3): a caret speaks byte offsets, not locator
 // strings. `edit_range` is the raw splice (`Editor.replaceAtSpan`) a keystroke
 // maps onto; `node_at`/`nodes_at` hit-test an offset back to nodes; `nodes`
 // hands out the whole tree as a flat array so a renderer needn't parse JSON.
@@ -1275,7 +1280,8 @@ fn flatMatch(ast: *const twig.AST, id: twig.AST.Node.Id) TwigQueryMatch {
     };
 }
 
-// ── Range-oriented rich-text ops (the toolbar, P5) ───────────────────────────
+// ── Range-oriented rich-text ops (the toolbar) ───────────────────────────────
+// DESIGN.md's "Editor surface" tier P5.
 // wrap_range / toggle_inline / set_block: a caret editor's Bold / Italic / Code
 // buttons and its H1 / Body switch.
 //

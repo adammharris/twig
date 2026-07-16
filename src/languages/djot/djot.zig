@@ -1,7 +1,8 @@
 //! Djot: the entry point for this language module. Wires the block scanner,
 //! inline scanner, and event-stream-to-AST builder together into one
 //! `parse` call, and aggregates every sibling file's `test {}` blocks (the
-//! fig convention — see `~/Documents/fig/src/languages/json/json.zig`).
+//! per-language-module convention shared with sister project `fig`; see
+//! DESIGN.md's "Relationship to fig").
 //!
 //! Block/inline scanning is naturally two cooperating files rather than
 //! fig's usual single `tokenizer.zig`, since Djot's block and inline levels

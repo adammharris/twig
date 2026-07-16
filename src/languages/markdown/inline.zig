@@ -188,6 +188,13 @@ fn runScan(sc: *Scanner, text: []const u8) Allocator.Error![]Node.Id {
                     defer b.allocator.free(content);
                     const id = try b.addLeaf(.{ .verbatim = content });
                     sc.setSpanIfMapped(id, i, span.end);
+                    // The interior between the backtick runs, as written in the
+                    // source. Note this is the RAW interior: `content` above is
+                    // the CommonMark-normalized payload (newlines->spaces, one
+                    // symmetric space stripped), so these bytes may differ from
+                    // it — `content_span` is "where the interior lives," not "a
+                    // range equal to the payload."
+                    sc.setContentSpanIfMapped(id, span.content_start, span.content_end);
                     _ = try sc.appendItem(id);
                     i = span.end;
                 } else {
@@ -217,12 +224,17 @@ fn runScan(sc: *Scanner, text: []const u8) Allocator.Error![]Node.Id {
                     try sc.flushBuf(i);
                     const id = try b.addLeaf(.{ .url = text[i + 1 .. end - 1] });
                     sc.setSpanIfMapped(id, i, end);
+                    // Interior between the `<` and `>` of a core autolink. (The
+                    // GFM *extended* autolinks below are frameless — bare
+                    // `http://…`/`www.…`, span == content — so they get none.)
+                    sc.setContentSpanIfMapped(id, i + 1, end - 1);
                     _ = try sc.appendItem(id);
                     i = end;
                 } else if (scanAutolinkEmail(text, i)) |end| {
                     try sc.flushBuf(i);
                     const id = try b.addLeaf(.{ .email = text[i + 1 .. end - 1] });
                     sc.setSpanIfMapped(id, i, end);
+                    sc.setContentSpanIfMapped(id, i + 1, end - 1);
                     _ = try sc.appendItem(id);
                     i = end;
                 } else if (scanHtmlTag(text, i)) |end| {
@@ -282,6 +294,9 @@ fn runScan(sc: *Scanner, text: []const u8) Allocator.Error![]Node.Id {
                         defer b.allocator.free(norm);
                         const id = try b.addLeaf(.{ .footnote_reference = norm });
                         sc.setSpanIfMapped(id, i, fr.end);
+                        // The label between `[^` and the closing `]`, as written
+                        // — raw, so it can differ from the normalized `norm`.
+                        sc.setContentSpanIfMapped(id, i + 2, fr.end - 1);
                         _ = try sc.appendItem(id);
                         i = fr.end;
                         continue;
@@ -370,20 +385,24 @@ fn runScan(sc: *Scanner, text: []const u8) Allocator.Error![]Node.Id {
                 // by whitespace at its inner edge (mirrors common `$...$`
                 // math conventions, e.g. Pandoc's), which keeps stray prose
                 // dollar signs ("$5 and $10") from being misread.
-                var matched: ?struct { kind: Node.Kind, end: usize } = null;
+                var matched: ?struct { kind: Node.Kind, end: usize, content_start: usize, content_end: usize } = null;
                 if (sc.options.math) {
                     if (i + 1 < text.len and text[i + 1] == '$') {
                         if (scanDisplayMath(text, i)) |m| {
-                            matched = .{ .kind = .{ .display_math = text[i + 2 .. m.content_end] }, .end = m.end };
+                            matched = .{ .kind = .{ .display_math = text[i + 2 .. m.content_end] }, .end = m.end, .content_start = i + 2, .content_end = m.content_end };
                         }
                     } else if (scanInlineMath(text, i)) |m| {
-                        matched = .{ .kind = .{ .inline_math = text[i + 1 .. m.content_end] }, .end = m.end };
+                        matched = .{ .kind = .{ .inline_math = text[i + 1 .. m.content_end] }, .end = m.end, .content_start = i + 1, .content_end = m.content_end };
                     }
                 }
                 if (matched) |m| {
                     try sc.flushBuf(i);
                     const id = try b.addLeaf(m.kind);
                     sc.setSpanIfMapped(id, i, m.end);
+                    // The interior between the `$`/`$$` delimiters. Unlike
+                    // verbatim, the math payload is the interior verbatim, so
+                    // these bytes equal the payload.
+                    sc.setContentSpanIfMapped(id, m.content_start, m.content_end);
                     _ = try sc.appendItem(id);
                     i = m.end;
                 } else {
@@ -1515,9 +1534,10 @@ pub fn scanAutolinkEmail(text: []const u8, at: usize) ?usize {
 }
 
 // ── Phase 3: inline/display math (`self.options.math`) ─────────────────
-// A twig extension, not part of CommonMark or GFM (mission: "off by default,
-// render is whatever the shared printer already does for `inline_math`/
-// `display_math`"). Follows the common `$...$`/`$$...$$` convention (e.g.
+// A twig extension, not part of CommonMark or GFM: off by default (like all
+// extensions — see DESIGN.md), and render is whatever the shared printer
+// already does for `inline_math`/`display_math`. Follows the common
+// `$...$`/`$$...$$` convention (e.g.
 // Pandoc's): a delimiter's INNER edge (the character right after an opener /
 // right before a closer) may not be whitespace, which is what keeps stray
 // prose dollar signs ("costs $5 and $10") from being misread as math.
@@ -1689,8 +1709,9 @@ fn tryExtUrlAutolink(sc: *Scanner, text: []const u8, i: usize) Allocator.Error!?
 /// `text[at] == 'w'`. `www.` not preceded by a word character. Unlike the
 /// `http(s)://` form, the DISPLAYED text (`www.example.com`) isn't itself a
 /// valid href, so this maps to a `link` node instead of `url` -- destination
-/// gets an `http://` prefix (per the mission: "`www.` gets `http://`
-/// prefixed"), while the child `str` keeps the original, unprefixed text.
+/// gets an `http://` prefix (a bare `www.` autolink's destination is
+/// `http://`-prefixed), while the child `str` keeps the original, unprefixed
+/// text.
 fn tryExtWwwAutolink(sc: *Scanner, text: []const u8, i: usize) Allocator.Error!?usize {
     if (i > 0 and isWordChar(text[i - 1])) return null;
     if (!std.mem.startsWith(u8, text[i..], "www.")) return null;
@@ -2550,6 +2571,93 @@ test "span: strong emphasis covers its own delimiters" {
     try testing.expect(ast.nodes[strong].kind == .strong);
     try testing.expectEqualStrings("**abc**", Span.of(u8, ast.nodes[strong].span, s));
     try testing.expectEqualStrings("abc", Span.of(u8, ast.nodes[strong].content_span.?, s));
+}
+
+test "span: verbatim covers the backticks, content_span covers just the interior" {
+    var ast = try parseAndFinishMapped("`code`", .{});
+    defer ast.deinit();
+    const s = "`code`";
+    const v = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[v].kind == .verbatim);
+    try testing.expectEqualStrings("`code`", Span.of(u8, ast.nodes[v].span, s));
+    try testing.expectEqualStrings("code", Span.of(u8, ast.nodes[v].content_span.?, s));
+}
+
+test "span: a multi-backtick verbatim's content_span excludes BOTH backtick runs" {
+    var ast = try parseAndFinishMapped("``x``", .{});
+    defer ast.deinit();
+    const s = "``x``";
+    const v = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[v].kind == .verbatim);
+    try testing.expectEqualStrings("x", Span.of(u8, ast.nodes[v].content_span.?, s));
+}
+
+test "span: verbatim content_span is the RAW interior, not the normalized payload" {
+    // "`` `foo` ``": the payload strips one symmetric space (-> "`foo`"), but
+    // content_span points at the interior AS WRITTEN, spaces included.
+    var ast = try parseAndFinishMapped("`` `foo` ``", .{});
+    defer ast.deinit();
+    const s = "`` `foo` ``";
+    const v = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[v].kind == .verbatim);
+    try testing.expectEqualStrings("`foo`", ast.nodes[v].kind.verbatim); // payload
+    try testing.expectEqualStrings(" `foo` ", Span.of(u8, ast.nodes[v].content_span.?, s)); // raw
+}
+
+test "span: inline_math and display_math report their interior as content_span" {
+    var im = try parseAndFinishMapped("$x$", .{ .math = true });
+    defer im.deinit();
+    const s1 = "$x$";
+    const inline_node = im.nodes[im.root].first_child.?;
+    try testing.expect(im.nodes[inline_node].kind == .inline_math);
+    try testing.expectEqualStrings("$x$", Span.of(u8, im.nodes[inline_node].span, s1));
+    try testing.expectEqualStrings("x", Span.of(u8, im.nodes[inline_node].content_span.?, s1));
+
+    var dm = try parseAndFinishMapped("$$x$$", .{ .math = true });
+    defer dm.deinit();
+    const s2 = "$$x$$";
+    const display_node = dm.nodes[dm.root].first_child.?;
+    try testing.expect(dm.nodes[display_node].kind == .display_math);
+    try testing.expectEqualStrings("$$x$$", Span.of(u8, dm.nodes[display_node].span, s2));
+    try testing.expectEqualStrings("x", Span.of(u8, dm.nodes[display_node].content_span.?, s2));
+}
+
+test "span: footnote_reference content_span is the RAW label between [^ and ]" {
+    var ast = try parseAndFinishMapped("see[^ A B ]", .{ .footnotes = true });
+    defer ast.deinit();
+    const s = "see[^ A B ]";
+    const ref = ast.nodes[ast.nodes[ast.root].first_child.?].next_sibling.?; // after "see"
+    try testing.expect(ast.nodes[ref].kind == .footnote_reference);
+    try testing.expectEqualStrings("[^ A B ]", Span.of(u8, ast.nodes[ref].span, s));
+    // The payload is the normalized label; content_span points at the source
+    // interior as written, spaces and case preserved.
+    try testing.expectEqualStrings("a b", ast.nodes[ref].kind.footnote_reference);
+    try testing.expectEqualStrings(" A B ", Span.of(u8, ast.nodes[ref].content_span.?, s));
+}
+
+test "span: a core <...> autolink's content_span is the interior; a bare GFM autolink has none" {
+    // Core autolink: framed by `<`/`>`, so content_span excludes them.
+    var uri = try parseAndFinishMapped("<http://x.dev>", .{});
+    defer uri.deinit();
+    const s1 = "<http://x.dev>";
+    const url = uri.nodes[uri.root].first_child.?;
+    try testing.expect(uri.nodes[url].kind == .url);
+    try testing.expectEqualStrings("<http://x.dev>", Span.of(u8, uri.nodes[url].span, s1));
+    try testing.expectEqualStrings("http://x.dev", Span.of(u8, uri.nodes[url].content_span.?, s1));
+
+    var email = try parseAndFinishMapped("<a@b.com>", .{});
+    defer email.deinit();
+    const s2 = "<a@b.com>";
+    const mail = email.nodes[email.root].first_child.?;
+    try testing.expect(email.nodes[mail].kind == .email);
+    try testing.expectEqualStrings("a@b.com", Span.of(u8, email.nodes[mail].content_span.?, s2));
+
+    // GFM extended (bare) autolink: frameless, so NO content_span.
+    var bare = try parseAndFinishMapped("https://x.dev", .{ .autolinks = true });
+    defer bare.deinit();
+    const url2 = bare.nodes[bare.root].first_child.?;
+    try testing.expect(bare.nodes[url2].kind == .url);
+    try testing.expect(bare.nodes[url2].content_span == null);
 }
 
 test "span: a partially-consumed delimiter run pairs its leftover with an outer opener" {

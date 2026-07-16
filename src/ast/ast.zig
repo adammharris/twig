@@ -79,14 +79,31 @@ pub const Node = struct {
     next_sibling: ?Id = null,
     /// Byte range `[start, end)` into the source this node was parsed from.
     span: Span = Span.init(0, 0),
-    /// For container nodes: the byte range of the node's *interior* — the
-    /// region between its opening and closing delimiters where its children
-    /// live, and where an editor may splice new children (for
-    /// `<div class=x>abc</div>`, the span of `abc`; for a djot `::: div`,
-    /// the lines between the fences). `null` = unknown or not meaningful
-    /// (leaves; synthesized nodes). Parsers should populate it when it is
-    /// cheap to compute; a parser that leaves it `null` is still correct,
-    /// just less useful to editors.
+    /// The byte range of the node's *interior* — the region an editor may
+    /// splice, sitting inside the node's own delimiters. For a container this
+    /// is where its children live (for `<div class=x>abc</div>`, the span of
+    /// `abc`; for a djot `::: div`, the lines between the fences). A *framed
+    /// text leaf* carries one too — its payload interior with the delimiters,
+    /// fences, or markers peeled off: a `code_block`'s / `metadata`'s body
+    /// between its fences, an inline `verbatim`'s or math node's interior
+    /// between its `` ` ``/`$`, a `symb`'s name between its colons, a `<…>`
+    /// autolink's URL, an XML `comment`'s or `cdata`'s text. See
+    /// `holdsOpaqueText` for the leaf kinds that can hold such interior text.
+    ///
+    /// `source[content_span]` is the raw source interior and need NOT equal a
+    /// normalized text field: an `emph`'s interior is the raw bytes between
+    /// its `*`s, not "rendered" emphasis, and a `code_block`'s interior is the
+    /// original indented source, whereas its `.text` payload is dedented and
+    /// newline-normalized — `source[content_span] != code_block.text` by
+    /// design. `content_span` is *where the body is*, not *a copy of it*.
+    ///
+    /// `null` = unknown or not meaningful: a FRAMELESS node whose span already
+    /// IS its content (a bare `str`; a bare `http://…` GFM autolink); a
+    /// synthesized node; an EMPTY container or frame with no interior. Parsers
+    /// should populate it when it is cheap to compute; a parser that leaves it
+    /// `null` is still correct, just less useful to editors. Because a framed
+    /// text leaf can carry one, "has a `content_span`" no longer implies
+    /// "accepts child nodes" — see `holdsOpaqueText`.
     content_span: ?Span = null,
     /// Index into `AST.attrs`, or `null` if this node has no `{...}`
     /// attributes attached.
@@ -221,6 +238,37 @@ pub const Node = struct {
         cdata: []const u8,
     };
 };
+
+/// True for kinds that carry a TEXT/opaque payload rather than child nodes —
+/// a code block's body, an inline `verbatim`'s or math node's interior, a raw
+/// block, a bare `str`, etc. (the same set `c_abi.zig`'s `kindText` extracts).
+/// When such a leaf has a `content_span`, that span addresses opaque text, not
+/// a child region: there is no child sequence to index into, so `insertChild`
+/// must refuse it even though it has a `content_span` (`replaceContent`, which
+/// replaces the whole interior, still works). This is the flip side of
+/// `content_span` no longer implying "container" — see its doc on `Node`.
+pub fn holdsOpaqueText(kind: Node.Kind) bool {
+    return switch (kind) {
+        .str,
+        .symb,
+        .verbatim,
+        .raw_inline,
+        .inline_math,
+        .display_math,
+        .url,
+        .email,
+        .footnote_reference,
+        .smart_punctuation,
+        .code_block,
+        .raw_block,
+        .metadata,
+        .comment,
+        .doctype,
+        .cdata,
+        => true,
+        else => false,
+    };
+}
 
 /// A single attribute pair (`AttributeParser`'s `keyval`). A `null` value
 /// means a *bare* attribute — HTML `disabled`, which must round-trip

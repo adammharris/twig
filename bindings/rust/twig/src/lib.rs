@@ -1711,11 +1711,17 @@ mod tests {
     }
 
     #[test]
-    fn editor_toggle_strips_verbatim_without_content_span() {
+    fn editor_toggle_strips_verbatim_via_content_span() {
         let mut ed = Editor::new_str("a `code` b\n", Format::Markdown).expect("editor");
-        // The verbatim node [2,8) has no content_span; toggle peels the backticks.
+        // The verbatim node [2,8) reports content_span [3,7); toggle peels it.
         ed.toggle_inline(2, 8, InlineKind::Verbatim).expect("toggle code off");
         assert_eq!(ed.source_str().unwrap(), "a code b\n");
+
+        // A multi-backtick span peels BOTH runs via content_span, not by
+        // stripping a single delimiter (which would corrupt it to "`x`").
+        let mut ed2 = Editor::new_str("a ``x`` b\n", Format::Markdown).expect("editor");
+        ed2.toggle_inline(2, 7, InlineKind::Verbatim).expect("toggle multi off");
+        assert_eq!(ed2.source_str().unwrap(), "a x b\n");
     }
 
     #[test]

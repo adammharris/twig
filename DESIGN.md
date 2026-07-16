@@ -1,0 +1,103 @@
+---
+part_of: '[Twig](/twig.md)'
+---
+# Twig — design notes
+
+This document is the home for the design rationale, scope roadmap, and
+vocabulary that Twig's source comments refer to. If you are reading a comment in
+`src/` that mentions a *principle*, a *phase*, or a *priority tier*, this is
+where those terms are defined.
+
+Twig is published independently ([crates.io](https://crates.io/crates/twig-doc),
+[docs.rs](https://docs.rs/twig-doc)), so everything a reader needs travels
+with the repo. This file is deliberately self-contained.
+
+---
+
+## Relationship to `fig`
+
+Twig is a sister project to [`fig`](https://github.com/adammharris/fig).
+`fig` parses **configuration** files (JSON, YAML, TOML) and edits them in
+place; Twig applies the same architecture to **document** files (Djot,
+Markdown, HTML, XML). Twig was built by carrying `fig`'s module layout and
+conventions over to documents, so many source comments note where a Twig
+module mirrors its `fig` counterpart (e.g. `cli/args.zig`, `ast/reader.zig`,
+`span.zig`).
+
+Those "mirrors `fig`'s …" notes are lineage/rationale, not required reading:
+`fig` is a public repository, and the comparison is there for anyone curious
+why a module is shaped the way it is. Shared conventions worth naming once:
+
+- **Per-language modules.** Each format lives under `src/languages/<name>/`
+  with the same internal shape (a scanner/parser, a serializer, an
+  `<name>.zig` entry point that aggregates every sibling file's `test {}`
+  blocks). Comments call this "the fig/djot/xml convention."
+- **Thin CLI.** `main.zig` turns argv into a config and dispatches; the verb
+  implementations live in `cli/`. Diagnostics are printed at the site that
+  detects the problem, then a sentinel error unwinds to `main`.
+- **Byte-span AST.** Every node carries a `Span` into the original source, and
+  edits are byte-span splices, never re-serialization of the whole tree.
+
+---
+
+## Design principles ("the mission")
+
+Some comments cite "the mission" — Twig's design charter. The principles it
+refers to are:
+
+- **Lossless by default.** An edit rewrites only the bytes inside the target
+  span; everything outside it is copied verbatim and never reflows. Twig
+  never reformats what it didn't edit. (See `ast/splicer.zig`.)
+- **Modest, clean CLI.** The CLI is plain `stdout`/`stderr` writers — no
+  `std.log`, no terminal-color / `NO_COLOR` machinery. Keep it small.
+  (See `main.zig`.)
+- **`convert` is the workhorse.** `twig convert file.dj` with no other
+  arguments renders HTML; HTML is the default output mode. (See `cli/args.zig`.)
+- **Extensions off by default.** Non-CommonMark / non-GFM features (math,
+  and other `ParseOptions` toggles) are opt-in; with everything off, output
+  matches strict CommonMark. (See `languages/markdown/options.zig`.)
+- **The correctness bar is the real source.** Span tests slice the *original*
+  source with a resolved node's span and check the bytes — parsing must
+  produce spans that address the true input, not a re-emitted approximation.
+  (See `languages/markdown/block.zig`'s span tests.)
+
+---
+
+## Markdown scope: the three phases
+
+Twig's Markdown support targets CommonMark 0.31.2 and was built in three
+phases. This roadmap is documented in full in
+`src/languages/markdown/markdown.zig`'s module doc comment; the short version:
+
+- **Phase 1** — block structure (headings, lists, block quotes, code blocks,
+  HTML blocks, thematic breaks, link reference definitions) plus a minimal
+  inline subset.
+- **Phase 2** — the rest of CommonMark's inline grammar (emphasis/strong,
+  links, images, autolinks, raw inline HTML), resolved at parse time.
+- **Phase 3** — GFM and other `ParseOptions` extensions (tables,
+  strikethrough, task lists, footnotes, definition lists, frontmatter, math)
+  plus GFM's extended autolinks.
+
+Comments across `languages/markdown/` reference these phase numbers; they are
+all anchored by the `markdown.zig` doc comment above.
+
+---
+
+## Editor surface: priority tiers (P0, P1, …)
+
+The C-ABI `twig_editor_*` functions expose an **embeddable rich-text editor**
+where a caret speaks byte offsets rather than selector strings. The tiers
+(P-numbers in `c_abi.zig`) order the build-out of that surface by priority:
+
+| Tier | Capability        | C-ABI entry points                          |
+|------|-------------------|---------------------------------------------|
+| P0   | Raw offset splice | `twig_editor_edit_range` (the keystroke primitive: insert, backspace, selection-replace) |
+| P1   | Hit-test          | `twig_editor_node_at` (offset → deepest containing node) |
+| P2   | Tree read-back    | `twig_editor_nodes` (whole tree as a flat array, so a renderer needn't parse JSON) |
+| P3   | Ancestor chain    | `twig_editor_nodes_at` (root→deepest path, for breadcrumbs / context-scoped edits) |
+| P5   | Toolbar           | `twig_editor_wrap_range` / `_toggle_inline` / `_set_block` (Bold / Italic / Code buttons, H1 / Body switch) |
+
+Intermediate/edit-history capabilities (undo, redo, coalescing, caret
+persistence) fill in around these — see the individual `twig_editor_*` doc
+comments in `c_abi.zig`. The tier numbers are only a priority label; they
+don't imply anything beyond "what got built in what order."

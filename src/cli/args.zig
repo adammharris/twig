@@ -52,8 +52,8 @@ pub const ConvertOptions = struct {
     /// definite `InputFormat` by the time a `ConvertOptions` exists, never
     /// re-resolved by `actions.zig`.
     input: InputFormat = .djot,
-    /// Defaults to `.html` — `convert file.dj` alone renders HTML, per the
-    /// mission's "the workhorse" framing of this command.
+    /// Defaults to `.html` — `convert file.dj` alone renders HTML; `convert`
+    /// is Twig's workhorse verb (see DESIGN.md's design principles).
     output: OutputMode = .html,
     /// Set only when `-o` named a specific TARGET format directly (e.g.
     /// `-o djot`) rather than the literal `canonical`/`html`/`ast` mode

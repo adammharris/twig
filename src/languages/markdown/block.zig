@@ -20,7 +20,8 @@
 //! recursive-over-tags).
 //!
 //! ── Scope (Phase 1) ─────────────────────────────────────────────────────
-//! Implements CommonMark block structure per the mission: blank lines, ATX
+//! Implements CommonMark block structure (Phase 1 — see `markdown.zig`'s
+//! roadmap and DESIGN.md): blank lines, ATX
 //! and setext headings, thematic breaks, indented and fenced code blocks,
 //! block quotes (with lazy continuation), bullet/ordered lists (marker
 //! parsing, start number, tight/loose detection), paragraphs, the 7 HTML
@@ -729,10 +730,9 @@ const Container = struct {
     blank_pending: bool = false,
     /// Set when ANY child item pushed this list turned out to be a task
     /// item (see `is_task` above); `popContainer` emits `task_list` instead
-    /// of `bullet_list` when set (task lists are unordered-only, per the
-    /// mission -- an ordered list marker is never eligible for task-item
-    /// detection in the first place, so this only ever fires for a bullet
-    /// list).
+    /// of `bullet_list` when set (task lists are unordered-only -- an ordered
+    /// list marker is never eligible for task-item detection in the first
+    /// place, so this only ever fires for a bullet list).
     any_task: bool = false,
 
     // .directive (container directives, `self.options.directives`): the
@@ -786,6 +786,15 @@ const Leaf = struct {
     // .indented_code: trailing blank lines tentatively buffered, trimmed if
     // the block turns out to end there.
     trailing_blanks: usize = 0,
+
+    // .fenced_code: source offsets of the first and last BODY (content) line,
+    // used to set the code block's `content_span` — its interior, both fence
+    // lines excluded. `body_start == null` means no body line was seen (an
+    // empty fenced block), so the block gets no `content_span`. Captured in
+    // `continueFencedCode`. (Indented code has no fences: its `content_span`
+    // is set from the whole span in `finishIndentedCode`, not from these.)
+    body_start: ?usize = null,
+    body_end: usize = 0,
 
     fn deinit(self: *Leaf, allocator: Allocator) void {
         self.text.deinit(allocator);
@@ -1274,7 +1283,13 @@ pub const Parser = struct {
         lf.text.items.len = text.len;
         if (lf.text.items.len > 0 and lf.text.items[lf.text.items.len - 1] != '\n') try lf.text.append(self.allocator, '\n');
         const id = try self.builder.addLeaf(.{ .code_block = .{ .lang = null, .text = lf.text.items } });
-        self.builder.setSpan(id, Span.init(self.lineStart(lf.start_line), self.lineEnd(lf.end_line)));
+        const span = Span.init(self.lineStart(lf.start_line), self.lineEnd(lf.end_line));
+        self.builder.setSpan(id, span);
+        // Indented code has no fences to strip, so its interior IS the whole
+        // block; `content_span` equals `span` (trailing blanks are already
+        // excluded above via `end_line`). This keeps every `code_block`
+        // uniformly carrying a `content_span` — see `ast.zig`'s doc comment.
+        self.builder.setContentSpan(id, span);
         try self.appendToTop(id);
     }
 
@@ -1284,6 +1299,12 @@ pub const Parser = struct {
         if (lf.text.items.len > 0) try lf.text.append(self.allocator, '\n');
         const id = try self.builder.addLeaf(.{ .code_block = .{ .lang = lf.lang, .text = lf.text.items } });
         self.builder.setSpan(id, Span.init(self.lineStart(lf.start_line), self.lineEnd(lf.end_line)));
+        // `content_span` is the interior with BOTH fence lines excluded (an
+        // opening/closing ``` line is never part of the body). An empty fenced
+        // block saw no body line (`body_start == null`) and correctly gets no
+        // `content_span`. Note `source[content_span] != code_block.text`: the
+        // text is dedented/newline-normalized, the span is the raw source.
+        if (lf.body_start) |bs| self.builder.setContentSpan(id, Span.init(bs, lf.body_end));
         try self.appendToTop(id);
     }
 
@@ -1626,6 +1647,12 @@ pub const Parser = struct {
         try lf.text.appendSlice(self.allocator, line[stripped.pos..]);
         lf.line_count += 1;
         lf.end_line = idx;
+        // Record the body's source extent for `content_span` — the WHOLE
+        // content line (from column 0, indentation included), since a single
+        // range can't strip the per-line indent the way `text` does. The
+        // closing-fence line returns above, so it never reaches here.
+        if (lf.body_start == null) lf.body_start = self.lineStart(idx);
+        lf.body_end = self.lineEnd(idx);
     }
 
     // ── html block ───────────────────────────────────────────────────────
@@ -1971,8 +1998,8 @@ pub const Parser = struct {
                         const after_marker_cursor: Cursor = .{ .pos = cur.pos + indent_bytes + mk.marker_len, .col = after_marker_col };
                         cur = skipWsToTarget(line, after_marker_cursor, content_col);
                         // GFM task list items (`self.options.task_lists`,
-                        // shadowing core bullet-list-item parsing per the
-                        // mission): only tried for a bullet item (never
+                        // shadowing core bullet-list-item parsing): only tried
+                        // for a bullet item (never
                         // ordered) whose content begins with a `[ ]`/`[x]`
                         // checkbox marker -- see `tryTaskListMarker`. The
                         // marker text itself is consumed here (advancing
@@ -2159,6 +2186,11 @@ pub const Parser = struct {
             }
             const id = try self.builder.addLeaf(.{ .metadata = .{ .lang = lang, .text = text.items } });
             self.builder.setSpan(id, Span.init(self.lineStart(0), self.lineEnd(i)));
+            // Interior between the fences, both delimiter lines excluded (like a
+            // fenced code block's `content_span`). It's the RAW body, so its
+            // bytes differ from `text`, which appends a `\n` per line. Empty
+            // frontmatter (`i == 1`, no body lines) stays null.
+            if (i > 1) self.builder.setContentSpan(id, Span.init(self.lineStart(1), self.lineEnd(i - 1)));
             try self.appendToTop(id);
             self.skip_until_line = i + 1;
             return;
@@ -2217,6 +2249,9 @@ pub const Parser = struct {
             }
             const id = try self.builder.addLeaf(.{ .metadata = .{ .lang = rest, .text = text.items } });
             self.builder.setSpan(id, Span.init(self.lineStart(open), self.lineEnd(last)));
+            // Interior between the fence lines; see `tryConsumeFrontmatter`. An
+            // empty endmatter body (`last == open + 1`) stays null.
+            if (last > open + 1) self.builder.setContentSpan(id, Span.init(self.lineStart(open + 1), self.lineEnd(last - 1)));
             self.endmatter_id = id;
             self.stop_at_line = open;
             return;
@@ -2918,8 +2953,8 @@ test "ATX heading" {
 // `inline.zig`'s own span tests (which fabricate a `Segment` mapping a bare
 // string onto itself), these run the FULL pipeline -- real source, real
 // `lineStart`/`lineEnd`-derived offsets, real indentation/marker stripping
-// -- and slice the ORIGINAL source with a resolved node's span, which is the
-// mission's actual correctness bar.
+// -- and slice the ORIGINAL source with a resolved node's span, which is
+// Twig's actual correctness bar (see DESIGN.md's design principles).
 
 test "span: a link in a single-line paragraph covers '[x](url)', content_span the link text" {
     const src = "see [x](http://a.co) now\n";
@@ -3018,6 +3053,104 @@ test "fenced code block with a language" {
     const cb = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expectEqualStrings("zig", r.ast.nodes[cb].kind.code_block.lang.?);
     try testing.expectEqualStrings("const x = 1;\n", r.ast.nodes[cb].kind.code_block.text);
+}
+
+test "content_span: fenced code interior excludes both fence lines" {
+    const src = "```zig\nconst x = 1;\n```\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const cb = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[cb].kind == .code_block);
+    // span covers the fences; content_span is the body only.
+    try testing.expectEqualStrings("```zig\nconst x = 1;\n```", Span.of(u8, r.ast.nodes[cb].span, src));
+    const cs = r.ast.nodes[cb].content_span.?;
+    try testing.expectEqualStrings("const x = 1;", Span.of(u8, cs, src));
+    // And `source[content_span]` is NOT the (newline-normalized) `.text`.
+    try testing.expectEqualStrings("const x = 1;\n", r.ast.nodes[cb].kind.code_block.text);
+}
+
+test "content_span: multi-line fenced body spans first to last body line" {
+    const src = "```\nline1\nline2\n```\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const cb = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expectEqualStrings("line1\nline2", Span.of(u8, r.ast.nodes[cb].content_span.?, src));
+}
+
+test "content_span: empty fenced block has no interior" {
+    const src = "```\n```\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const cb = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[cb].kind == .code_block);
+    try testing.expect(r.ast.nodes[cb].content_span == null);
+}
+
+test "content_span: frontmatter interior excludes both fence lines (raw body, not payload)" {
+    const src = "---\ntitle: Hi\nx: 1\n---\n\nbody\n";
+    var r = try parse(testing.allocator, src, .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const fm = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[fm].kind == .metadata);
+    // content_span is the raw body between the `---` fences, both excluded.
+    try testing.expectEqualStrings("title: Hi\nx: 1", Span.of(u8, r.ast.nodes[fm].content_span.?, src));
+    // The payload appends a '\n' per line, so it is NOT the same bytes.
+    try testing.expectEqualStrings("title: Hi\nx: 1\n", r.ast.nodes[fm].kind.metadata.text);
+}
+
+test "content_span: empty frontmatter has no interior" {
+    const src = "---\n---\nbody\n";
+    var r = try parse(testing.allocator, src, .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const fm = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[fm].kind == .metadata);
+    try testing.expect(r.ast.nodes[fm].content_span == null);
+}
+
+test "content_span: endmatter interior excludes both fence lines" {
+    const src = "body\n\n---toml\nx = 1\n---\n";
+    var r = try parse(testing.allocator, src, .{ .frontmatter = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    // Endmatter is appended as the doc's LAST child.
+    var last = r.ast.nodes[r.ast.root].first_child.?;
+    while (r.ast.nodes[last].next_sibling) |n| last = n;
+    try testing.expect(r.ast.nodes[last].kind == .metadata);
+    try testing.expectEqualStrings("x = 1", Span.of(u8, r.ast.nodes[last].content_span.?, src));
+}
+
+test "content_span: unterminated fence (EOF) ends at the last body line" {
+    const src = "```\ncode\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const cb = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expectEqualStrings("code", Span.of(u8, r.ast.nodes[cb].content_span.?, src));
+}
+
+test "content_span: indented code interior is the whole block (indent included)" {
+    const src = "    abc\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const cb = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[cb].kind == .code_block);
+    // No fences to strip: content_span == span, indentation and all.
+    try testing.expectEqualStrings("    abc", Span.of(u8, r.ast.nodes[cb].content_span.?, src));
+    try testing.expectEqualStrings("abc\n", r.ast.nodes[cb].kind.code_block.text);
 }
 
 test "tight bullet list with two items" {

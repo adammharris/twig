@@ -277,6 +277,7 @@ pub const Parser = struct {
         self.pos = dash + 3;
         const id = try self.builder.addLeaf(.{ .comment = text });
         self.builder.setSpan(id, Span.init(start, self.pos));
+        self.builder.setContentSpan(id, Span.init(text_start, dash));
         return id;
     }
 
@@ -289,6 +290,7 @@ pub const Parser = struct {
         self.pos = end + 3;
         const id = try self.builder.addLeaf(.{ .cdata = self.source[text_start..end] });
         self.builder.setSpan(id, Span.init(start, self.pos));
+        self.builder.setContentSpan(id, Span.init(text_start, end));
         return id;
     }
 
@@ -310,6 +312,12 @@ pub const Parser = struct {
         self.pos = end + 2;
         const id = try self.builder.addLeaf(.{ .processing_instruction = .{ .target = target, .data = data } });
         self.builder.setSpan(id, Span.init(start, self.pos));
+        // `content_span` stays `null`: unlike the opaque-text leaves
+        // (comment/cdata/doctype), a PI's payload is split across two fields
+        // (target + data), so there is no single unambiguous "interior". The
+        // whole `<?`…`?>` interior would include the target (name-like, and
+        // excluded from an element's content_span), while the data-only range
+        // isn't "between the delimiters" — either choice misleads, so leave it.
         return id;
     }
 
@@ -348,10 +356,12 @@ pub const Parser = struct {
                 },
                 '>' => {
                     if (bracket_depth == 0) {
+                        const guts_end = self.pos;
                         const guts = self.source[guts_start..self.pos];
                         self.pos += 1;
                         const id = try self.builder.addLeaf(.{ .doctype = guts });
                         self.builder.setSpan(id, Span.init(start, self.pos));
+                        self.builder.setContentSpan(id, Span.init(guts_start, guts_end));
                         return id;
                     }
                     self.pos += 1;
@@ -510,6 +520,59 @@ test "parses a minimal document" {
     const root_el = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
     try testing.expectEqualStrings("a", ast.nodes[root_el].kind.element.name);
     try testing.expectEqual(@as(?Span, null), ast.nodes[root_el].content_span);
+}
+
+test "framed leaves carry an interior content_span" {
+    const source = "<!DOCTYPE html><root><!-- hi --><![CDATA[x<y]]><?pi go?></root>";
+    var p = Parser.init(testing.allocator, source);
+    defer p.deinit();
+    var ast = try p.parse();
+    defer ast.deinit();
+
+    const doctype = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    const root_el = ast.nodes[doctype].next_sibling orelse return error.TestExpectedNonNull;
+    const comment = ast.nodes[root_el].first_child orelse return error.TestExpectedNonNull;
+    const cdata = ast.nodes[comment].next_sibling orelse return error.TestExpectedNonNull;
+    const pi = ast.nodes[cdata].next_sibling orelse return error.TestExpectedNonNull;
+
+    // doctype: span covers the delimiters, content_span is the interior.
+    try testing.expect(ast.nodes[doctype].kind == .doctype);
+    try testing.expectEqualStrings("<!DOCTYPE html>", Span.of(u8, ast.nodes[doctype].span, source));
+    try testing.expectEqualStrings(" html", Span.of(u8, ast.nodes[doctype].content_span.?, source));
+
+    // comment
+    try testing.expect(ast.nodes[comment].kind == .comment);
+    try testing.expectEqualStrings("<!-- hi -->", Span.of(u8, ast.nodes[comment].span, source));
+    try testing.expectEqualStrings(" hi ", Span.of(u8, ast.nodes[comment].content_span.?, source));
+
+    // cdata
+    try testing.expect(ast.nodes[cdata].kind == .cdata);
+    try testing.expectEqualStrings("<![CDATA[x<y]]>", Span.of(u8, ast.nodes[cdata].span, source));
+    try testing.expectEqualStrings("x<y", Span.of(u8, ast.nodes[cdata].content_span.?, source));
+
+    // processing instruction: two payload fields, so content_span stays null.
+    try testing.expect(ast.nodes[pi].kind == .processing_instruction);
+    try testing.expectEqual(@as(?Span, null), ast.nodes[pi].content_span);
+}
+
+test "empty framed leaf interiors get an empty content_span at the boundary" {
+    const source = "<root><!----><![CDATA[]]></root>";
+    var p = Parser.init(testing.allocator, source);
+    defer p.deinit();
+    var ast = try p.parse();
+    defer ast.deinit();
+
+    const root_el = ast.nodes[ast.root].first_child orelse return error.TestExpectedNonNull;
+    const comment = ast.nodes[root_el].first_child orelse return error.TestExpectedNonNull;
+    const cdata = ast.nodes[comment].next_sibling orelse return error.TestExpectedNonNull;
+
+    const comment_cs = ast.nodes[comment].content_span.?;
+    try testing.expectEqual(@as(usize, 0), comment_cs.len());
+    try testing.expectEqual(ast.nodes[comment].span.start + "<!--".len, comment_cs.start);
+
+    const cdata_cs = ast.nodes[cdata].content_span.?;
+    try testing.expectEqual(@as(usize, 0), cdata_cs.len());
+    try testing.expectEqual(ast.nodes[cdata].span.start + "<![CDATA[".len, cdata_cs.start);
 }
 
 test "duplicate attribute is a parse error with a diagnostic" {
