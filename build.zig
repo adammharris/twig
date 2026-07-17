@@ -52,6 +52,30 @@ pub fn build(b: *std.Build) void {
     install_c_lib_step.dependOn(&install_c_lib.step);
     install_c_lib_step.dependOn(&install_c_header.step);
 
+    // WebAssembly build of the C ABI, for future JS/TS bindings: compile the
+    // same `src/c_abi.zig` to a freestanding `reactor` module (no `_start`;
+    // `rdynamic` keeps every exported `twig_*` symbol). `c_abi.zig` already
+    // selects `wasm_allocator` over `c_allocator` on wasm targets (see
+    // `activeAllocator`) and `c_lib`'s `link_libc` is already gated off for
+    // wasm above, so no libc is needed here. `zig build wasm` writes
+    // `twig.wasm` into the install prefix's `bin/`.
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const wasm = b.addExecutable(.{
+        .name = "twig",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/c_abi.zig"),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+            .strip = true,
+        }),
+    });
+    wasm.root_module.addImport("build_options", options_mod);
+    wasm.entry = .disabled;
+    wasm.rdynamic = true;
+    const install_wasm = b.addInstallArtifact(wasm, .{});
+    const wasm_step = b.step("wasm", "Build the WebAssembly module for future JS/TS bindings");
+    wasm_step.dependOn(&install_wasm.step);
+
     const run_step = b.step("run", "Run the app");
 
     const run_cmd = b.addRunArtifact(exe);
