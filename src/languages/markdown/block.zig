@@ -72,11 +72,14 @@
 //! records one; a synthetic separator byte, e.g. the line-join `\n`, is
 //! appended with `appendUnmappedByte` and simply isn't covered by any
 //! segment). `PendingInline.segments` carries these through to
-//! `parseInline`, which -- via `Scanner.mapSpan` -- can then give a node an
-//! exact absolute span whenever its whole local extent falls within ONE
-//! segment, and must leave it unset (`(0,0)`) otherwise (typically: a
-//! construct that straddles a multi-line block's line join). Single-line
-//! constructs (ATX headings, GFM table cells, most definition-list terms)
+//! `parseInline`, which -- via `Scanner.mapSpan` -- gives a node an exact
+//! absolute span. A node whose whole local extent is in ONE segment is mapped
+//! 1:1; a construct that straddles the synthetic line-join (a code span or
+//! emphasis run broken across two source lines) is mapped from its two
+//! endpoints -- both real source bytes -- to the source range spanning them
+//! (which includes the joined newline). Only a span whose own endpoint is a
+//! synthetic byte is left unset (`(0,0)`). Single-line constructs (ATX
+//! headings, GFM table cells, most definition-list terms)
 //! skip the segment-list machinery entirely and just hand `parseInline` one
 //! segment covering the whole (always-single-line, hence always-contiguous)
 //! text -- see `singleSegment`.
@@ -3022,15 +3025,15 @@ test "span: a str leaf's span is its own exact source bytes, even nested in a bl
     try testing.expectEqualStrings("hello world", Span.of(u8, r.ast.nodes[str].span, src));
 }
 
-test "span: a multi-line paragraph's inline nodes are left unset when they'd cross the line join" {
-    // See this file's module doc comment's "Inline spans" section: a
-    // paragraph joined from more than one source line is only mapped
-    // per-segment (one per source line); an inline construct entirely
-    // within ONE of those lines still gets an accurate span (checked
-    // below), but one that straddles the synthetic line-join `\n` (the
-    // emphasis run here opens on line 1 and closes on line 2) can't be
-    // mapped accurately, so it's deliberately left unset (`(0,0)`) rather
-    // than risk a wrong one.
+test "span: an inline node straddling a line-join gets the accurate source range" {
+    // See this file's module doc comment's "Inline spans" section and
+    // `Scanner.mapSpan`: a paragraph joined from more than one source line is
+    // mapped per-segment (one per source line). An inline construct that
+    // straddles the synthetic line-join `\n` — the emphasis run here opens on
+    // line 1 and closes on line 2 — still has real source bytes at both
+    // delimiters, so its span is the source range spanning them (which includes
+    // the newline the join stands in for). A node with a real span is editable;
+    // an unset `(0,0)` one is not.
     const src = "a *b\nc* d\n";
     var r = try parse(testing.allocator, src, .{});
     defer r.ast.deinit();
@@ -3041,8 +3044,26 @@ test "span: a multi-line paragraph's inline nodes are left unset when they'd cro
     try testing.expectEqualStrings("a ", Span.of(u8, r.ast.nodes[first].span, src));
     const em = r.ast.nodes[first].next_sibling.?;
     try testing.expect(r.ast.nodes[em].kind == .emph);
-    try testing.expectEqual(@as(usize, 0), r.ast.nodes[em].span.start);
-    try testing.expectEqual(@as(usize, 0), r.ast.nodes[em].span.end);
+    // The emphasis covers `*b\nc*` in the source, newline and all.
+    try testing.expectEqualStrings("*b\nc*", Span.of(u8, r.ast.nodes[em].span, src));
+}
+
+test "span/content_span: a verbatim code span broken across two lines is mapped" {
+    // The regression this guards: a multi-line inline code span used to be left
+    // unset `(0,0)`, so an editor rendering from `content_span` (or splicing at
+    // `span`) placed it at offset 0/1 instead of where it lives. Both spans now
+    // straddle the line-join accurately.
+    const src = "x `a\nb` y\n";
+    var r = try parse(testing.allocator, src, .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const para = r.ast.nodes[r.ast.root].first_child.?;
+    const first = r.ast.nodes[para].first_child.?; // "x "
+    const v = r.ast.nodes[first].next_sibling.?;
+    try testing.expect(r.ast.nodes[v].kind == .verbatim);
+    try testing.expectEqualStrings("`a\nb`", Span.of(u8, r.ast.nodes[v].span, src));
+    try testing.expectEqualStrings("a\nb", Span.of(u8, r.ast.nodes[v].content_span.?, src));
 }
 
 test "fenced code block with a language" {

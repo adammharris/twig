@@ -733,16 +733,16 @@ test "applyEditByLocator: a Markdown inline link node has an accurate span and e
     try testing.expectEqualStrings("see [y](http://b.co)\n", out);
 }
 
-test "applyEditByLocator: a Markdown inline node with no mapped span is still refused, not corrupted" {
-    var buf: [512]u8 = undefined;
-    var err: Writer = .fixed(&buf);
-    // A multi-line paragraph's inline nodes fall outside the single-segment
-    // mapping `block.zig` can build for them (see that file's module doc
-    // comment's "Inline spans" section) -- the emphasis run here straddles
-    // the line join, so it's left with no span, and the edit must error
-    // clearly rather than splice at offset 0.
-    try testing.expectError(error.ActionFailed, applyEditByLocator(testing.allocator, "a *b\nc* d\n", .markdown, .{}, .replace, "emph", 0, "*x*", &err));
-    try testing.expect(std.mem.indexOf(u8, err.buffered(), "no source span") != null);
+test "applyEditByLocator: a Markdown inline node straddling a line join edits in place" {
+    // A multi-line paragraph's inline construct straddles the synthetic line
+    // join, but its delimiters are real source bytes, so `mapSpan` now gives it
+    // the accurate source range (`*b\nc*` here, newline and all — see
+    // `languages/markdown/inline.zig`'s `mapSpan`). It splices at that extent
+    // instead of erroring with `NoNodeSpan`.
+    var err: Writer = .fixed(&.{});
+    const out = try applyEditByLocator(testing.allocator, "a *b\nc* d\n", .markdown, .{}, .replace, "emph", 0, "*x*", &err);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a *x* d\n", out);
 }
 
 test "applyEditByLocator: a leaf interior yields a clear NoContentSpan failure" {

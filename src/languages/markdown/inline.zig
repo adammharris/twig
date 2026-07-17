@@ -715,16 +715,56 @@ pub const Scanner = struct {
     }
 
     /// `text[local_start..local_end)`'s absolute source span, or `null` if
-    /// that range isn't fully covered by one mapped `Segment` -- see
-    /// `Segment`'s doc comment on why a request straddling two segments
-    /// (typically: a construct that crosses a multi-line block's synthetic
-    /// line-join) is refused rather than approximated.
+    /// either endpoint lands on a synthetic `text` byte that no `Segment` maps
+    /// (see `Segment`'s doc comment).
+    ///
+    /// When both endpoints sit in ONE segment the mapping is exact and 1:1.
+    /// When the range STRADDLES segments — a construct spanning a leaf block's
+    /// synthetic line-join, e.g. an inline code span or emphasis run broken
+    /// across two source lines — the endpoints are still real source bytes in
+    /// (different) segments, so each is mapped independently and the source
+    /// range between them is returned. That range is contiguous and correctly
+    /// bounds the construct: it necessarily includes the joined newline (and any
+    /// continuation indentation the block stripped), which is part of the
+    /// construct's true source footprint. Only a straddling range whose own
+    /// endpoint is a synthetic byte is refused — a real edge case, since a
+    /// construct's delimiters are real source characters. (A node given a
+    /// straddling span this way is still fully editable; the splicer reparses
+    /// and validates every edit, so a span that includes a line-join is
+    /// self-correcting rather than corrupting.)
     fn mapSpan(self: *const Scanner, local_start: usize, local_end: usize) ?Span {
         if (local_end < local_start) return null;
+        // Fast path: both endpoints in one segment — the exact 1:1 mapping.
         for (self.segments) |seg| {
             if (local_start >= seg.buf_offset and local_end <= seg.buf_offset + seg.len) {
                 const delta = local_start - seg.buf_offset;
                 return Span.init(seg.src_offset + delta, seg.src_offset + delta + (local_end - local_start));
+            }
+        }
+        // Straddling: map each endpoint on its own side of the join.
+        const src_start = self.mapPoint(local_start, false) orelse return null;
+        const src_end = self.mapPoint(local_end, true) orelse return null;
+        if (src_end < src_start) return null;
+        return Span.init(src_start, src_end);
+    }
+
+    /// Map one `text` offset back to source. `is_end` biases a point sitting on
+    /// a segment boundary: a range START belongs to the segment it opens, an END
+    /// to the segment it closes, so a delimiter at the very start/end of a
+    /// continuation line resolves to the correct side. `null` if the offset is a
+    /// synthetic byte no segment covers.
+    fn mapPoint(self: *const Scanner, local: usize, comptime is_end: bool) ?usize {
+        for (self.segments) |seg| {
+            const lo = seg.buf_offset;
+            const hi = seg.buf_offset + seg.len;
+            const hit = if (is_end) (local > lo and local <= hi) else (local >= lo and local < hi);
+            if (hit) return seg.src_offset + (local - lo);
+        }
+        // A boundary the biased test skipped (a zero-width segment, or the outer
+        // edge of the buffer): accept an inclusive touch rather than refuse.
+        for (self.segments) |seg| {
+            if (local >= seg.buf_offset and local <= seg.buf_offset + seg.len) {
+                return seg.src_offset + (local - seg.buf_offset);
             }
         }
         return null;
