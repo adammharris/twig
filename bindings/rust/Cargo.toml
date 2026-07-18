@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["twig", "twig-sys"]
+members = ["twig", "twig-sys", "twig-sys-*"]
 
 [workspace.package]
 version = "2.2.0"

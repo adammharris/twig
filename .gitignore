@@ -9,3 +9,7 @@ target/
 # Zig source vendored into the Rust crate at publish time (see
 # bindings/rust/twig-sys/vendor-zig.sh) — regenerated, never committed.
 bindings/rust/twig-sys/zig/
+
+# Prebuilt static libraries stamped into the per-target payload crates by
+# scripts/build-payload-lib.sh (or CI) before publish — regenerated, never committed.
+bindings/rust/twig-sys-*/lib/

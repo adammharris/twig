@@ -11,8 +11,66 @@ fn main() {
         return;
     }
 
+    println!("cargo:rerun-if-env-changed=TWIG_SYS_FORCE_SOURCE");
+
     let cargo_target = env::var("TARGET").expect("Cargo should set TARGET");
     let cargo_host = env::var("HOST").expect("Cargo should set HOST");
+
+    // Preferred path: link the prebuilt archive shipped by the `twig-sys-<target>`
+    // payload crate for this target — no Zig toolchain required. Cargo activates
+    // the matching payload as a target-gated dependency (see Cargo.toml); its
+    // build script hands us the archive directory via `links` metadata.
+    //
+    // Set TWIG_SYS_FORCE_SOURCE=1 to skip this and always compile from source.
+    // (twig has no native-affecting cargo features, so the prebuilt archive
+    // always matches the requested build; fig gates this additionally on its
+    // per-language features.)
+    if env::var_os("TWIG_SYS_FORCE_SOURCE").is_none() {
+        if let Some(libdir) = prebuilt_libdir(&cargo_target) {
+            println!("cargo:rustc-link-search=native={}", libdir.display());
+            println!("cargo:rustc-link-lib=static=twig");
+            println!("cargo:rerun-if-changed={}", libdir.display());
+            return;
+        }
+    }
+
+    build_from_source(&cargo_target, &cargo_host);
+}
+
+/// Directory holding the prebuilt `libtwig.a`/`twig.lib` for `target`, if a
+/// payload crate is providing one. The active `twig-sys-<target>` payload
+/// crate publishes its `lib/` directory as `DEP_TWIG_PREBUILT_<KEY>_LIBDIR`
+/// (via its `links` key); we resolve `<KEY>` from the target triple.
+fn prebuilt_libdir(target: &str) -> Option<PathBuf> {
+    let key = payload_env_key(target)?;
+    let dir = PathBuf::from(env::var_os(format!("DEP_TWIG_PREBUILT_{key}_LIBDIR"))?);
+    // Defensive: only take the prebuilt path if the archive is really present,
+    // so a payload crate with an empty `lib/` degrades to the source build
+    // rather than linking nothing.
+    let has_archive = ["libtwig.a", "twig.lib"]
+        .iter()
+        .any(|name| dir.join(name).is_file());
+    has_archive.then_some(dir)
+}
+
+/// Map a Rust target triple to its payload crate's env-var key, or `None` for
+/// targets with no prebuilt library (which use the source build). Mirror of
+/// `../prebuilt-targets.tsv` and the cfg-gated deps in `Cargo.toml`.
+fn payload_env_key(target: &str) -> Option<&'static str> {
+    Some(match target {
+        "aarch64-apple-darwin" => "MACOS_ARM64",
+        "x86_64-unknown-linux-gnu" => "LINUX_X64_GNU",
+        "aarch64-unknown-linux-gnu" => "LINUX_ARM64_GNU",
+        "x86_64-pc-windows-msvc" => "WINDOWS_X64_MSVC",
+        "wasm32-unknown-unknown" => "WASM32",
+        _ => return None,
+    })
+}
+
+/// Compile `libtwig.a` from the vendored/repo Zig source with the `zig`
+/// toolchain. The fallback for targets without a prebuilt payload crate (or
+/// when `TWIG_SYS_FORCE_SOURCE` is set).
+fn build_from_source(cargo_target: &str, cargo_host: &str) {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let source_root = zig_source_root(&manifest_dir);
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
@@ -33,7 +91,7 @@ fn main() {
         // everywhere; the parser is not vector-bound, so the cost is negligible.
         .arg("-Dcpu=baseline");
 
-    if let Some(zig_target) = zig_target_for_cargo_target(&cargo_target, &cargo_host) {
+    if let Some(zig_target) = zig_target_for_cargo_target(cargo_target, cargo_host) {
         command.arg(format!("-Dtarget={zig_target}"));
     }
 
@@ -42,7 +100,15 @@ fn main() {
         .arg(&prefix)
         .current_dir(&source_root)
         .status()
-        .expect("failed to run `zig build`");
+        .unwrap_or_else(|e| {
+            panic!(
+                "twig-sys: target `{cargo_target}` has no prebuilt library, and running \
+                 `zig` to build from source failed: {e}.\n\
+                 Prebuilt targets need no Zig: aarch64-apple-darwin, x86_64-unknown-linux-gnu, \
+                 aarch64-unknown-linux-gnu, x86_64-pc-windows-msvc, wasm32-unknown-unknown.\n\
+                 For any other target install Zig 0.16+ (https://ziglang.org/download/)."
+            )
+        });
 
     if !status.success() {
         panic!("`zig build` failed with status {status}");
