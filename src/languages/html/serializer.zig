@@ -199,7 +199,7 @@ const void_elements = std.StaticStringMap(void).initComptime(.{
     .{"param"}, .{"source"}, .{"track"}, .{"wbr"},
 });
 
-fn isVoidElement(name: []const u8) bool {
+pub fn isVoidElement(name: []const u8) bool {
     return void_elements.has(name);
 }
 

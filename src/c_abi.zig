@@ -280,15 +280,30 @@ pub export fn twig_parse(
     format: c_int,
     out_doc: ?*?*TwigDocument,
 ) TwigStatus {
+    return twig_parse_ext(input_ptr, input_len, format, 0, out_doc);
+}
+
+/// Like `twig_parse`, plus `md_flags` — a bitmask of `TWIG_MD_*` Markdown
+/// extensions (`TWIG_MD_DIRECTIVES`, `TWIG_MD_MATH`, `TWIG_MD_HTML_ELEMENTS`) to
+/// enable for a Markdown parse (ignored for other formats). Opens the read/query
+/// surface to the same opt-in extensions `twig_editor_create_ext` gives the edit
+/// surface — needed to, e.g., `twig_document_query` for `image` nodes that only
+/// exist once `TWIG_MD_HTML_ELEMENTS` promotes raw `<img>` tags. A `0` mask is
+/// exactly `twig_parse`.
+pub export fn twig_parse_ext(
+    input_ptr: ?[*]const u8,
+    input_len: usize,
+    format: c_int,
+    md_flags: u32,
+    out_doc: ?*?*TwigDocument,
+) TwigStatus {
     const out = out_doc orelse return .invalid_argument;
     out.* = null;
     const source = sliceOf(input_ptr, input_len) orelse return .invalid_argument;
     const target = intToFormat(format) orelse return .unsupported_format;
 
     const allocator = activeAllocator();
-    // Default parse options: `twig_parse` is the read-only surface, and the
-    // Markdown extension flags are an editor concern (`twig_editor_create_ext`).
-    const cfg: twig.format.ParseConfig = .{};
+    const cfg: twig.format.ParseConfig = .{ .markdown = markdownOptionsFromFlags(md_flags) };
     const parsed = twig.format.entryFor(target).parse(&cfg, allocator, source) catch |err| switch (err) {
         error.OutOfMemory => return .out_of_memory,
         // Only XML can reject its input; the others are infallible by design
@@ -553,16 +568,20 @@ fn asEditor(ed: *TwigEditor) *EditorHandle {
 /// by `applyEdit` onto the matching `twig.Splicer` method.
 const EditOp = enum { replace, replace_content, insert_before, insert_after, insert_child, delete, delete_smart, unwrap };
 
-/// Markdown extension bitmask accepted by `twig_editor_create_ext`
-/// (`TWIG_MD_*` in `twig.h`); other formats ignore it. The bit values are the
-/// wire contract, so they live here.
+/// Markdown extension bitmask accepted by `twig_parse_ext` and
+/// `twig_editor_create_ext` (`TWIG_MD_*` in `twig.h`); other formats ignore it.
+/// The bit values are the wire contract, so they live here. Every bit is an
+/// opt-in, default-off extension — the default-on ones (tables, strikethrough,
+/// …) need no flag, and a `0` mask reproduces `twig_parse`/`twig_editor_create`.
 const TWIG_MD_DIRECTIVES: u32 = 1 << 0;
 const TWIG_MD_MATH: u32 = 1 << 1;
+const TWIG_MD_HTML_ELEMENTS: u32 = 1 << 2;
 
 fn markdownOptionsFromFlags(flags: u32) twig.Markdown.ParseOptions {
     var opts: twig.Markdown.ParseOptions = .{};
     opts.directives = (flags & TWIG_MD_DIRECTIVES) != 0;
     opts.math = (flags & TWIG_MD_MATH) != 0;
+    opts.html_elements = (flags & TWIG_MD_HTML_ELEMENTS) != 0;
     return opts;
 }
 
@@ -615,8 +634,9 @@ pub export fn twig_editor_create(
 }
 
 /// Like `twig_editor_create`, plus `md_flags` — a bitmask of `TWIG_MD_*`
-/// Markdown extensions (`TWIG_MD_DIRECTIVES`, `TWIG_MD_MATH`) to enable for a
-/// Markdown parse (ignored for other formats). The editor reparses with the
+/// Markdown extensions (`TWIG_MD_DIRECTIVES`, `TWIG_MD_MATH`,
+/// `TWIG_MD_HTML_ELEMENTS`) to enable for a Markdown parse (ignored for other
+/// formats). The editor reparses with the
 /// same flags after every edit, so a directive-bearing document stays
 /// parseable — required before `twig_editor_filter` can match `directive[…]`
 /// selectors.
@@ -2440,6 +2460,30 @@ test "twig_parse accepts HTML input" {
     var len: usize = 0;
     try std.testing.expectEqual(TwigStatus.ok, twig_document_render_html(doc, &ptr, &len));
     try std.testing.expect(std.mem.indexOf(u8, ptr.?[0..len], "hi") != null);
+}
+
+test "twig_parse_ext with TWIG_MD_HTML_ELEMENTS makes an embedded <img> queryable" {
+    // The read-path payoff of the flag: without it the `<img>` is opaque raw
+    // HTML (no `image` node to match); with it, `twig_document_query` finds it.
+    const source = "text <img src=\"a.png\" alt=\"x\"> more\n";
+
+    inline for (.{ .{ @as(u32, 0), @as(usize, 0) }, .{ TWIG_MD_HTML_ELEMENTS, @as(usize, 1) } }) |case| {
+        var doc: ?*TwigDocument = null;
+        try std.testing.expectEqual(
+            TwigStatus.ok,
+            twig_parse_ext(source.ptr, source.len, @intFromEnum(TwigFormat.markdown), case[0], &doc),
+        );
+        defer twig_document_destroy(doc);
+
+        const selector = "image";
+        var ptr: ?[*]const TwigQueryMatch = null;
+        var len: usize = 0;
+        try std.testing.expectEqual(
+            TwigStatus.ok,
+            twig_document_query(doc, selector.ptr, selector.len, &ptr, &len),
+        );
+        try std.testing.expectEqual(case[1], len);
+    }
 }
 
 test "twig_parse rejects an unknown format code" {

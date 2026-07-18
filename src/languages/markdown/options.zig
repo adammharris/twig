@@ -28,6 +28,23 @@ math: bool = false,
 /// inline `:name[x]{attrs}`, leaf `::name[x]{attrs}`, container
 /// `:::name{attrs}` ... `:::`). Not part of GFM; off by default, like `math`.
 directives: bool = false,
+/// Parse recognized HTML into the shared AST vocabulary — an `<img>` becomes
+/// an `image` node, `<h1>` a `heading`, and anything without a semantic
+/// mapping (`<picture>`, `<source>`, ...) a generic `element` — instead of a
+/// single opaque `raw_block` / `raw_inline` holding the tag text verbatim.
+/// This routes the block/tag through `languages/html/parser.zig`'s
+/// `semanticKind` mapping, the same one the standalone HTML parser uses, so
+/// the tree becomes addressable (query/edit an embedded `<img>`'s `src`)
+/// rather than a black box.
+///
+/// Off by default: CommonMark 0.31.2 and GFM both specify raw HTML as
+/// pass-through, so promotion would change parsing, and it is opt-in like
+/// `math`/`directives`. A construct is only promoted when its accumulated
+/// block/tag text maps verbatim onto the source (so a promoted node's span
+/// still addresses the true input — the mission's correctness bar); anything
+/// that doesn't map 1:1 (container-nested HTML, CRLF, expanded tabs) falls
+/// back to the opaque `raw_block`/`raw_inline` it would have produced anyway.
+html_elements: bool = false,
 
 /// Which Markdown DIALECT this document is written in — the flavor whose
 /// HTML conventions its rendering should follow.
@@ -71,6 +88,7 @@ pub const commonmark: Options = .{
     .frontmatter = false,
     .math = false,
     .directives = false,
+    .html_elements = false,
     .dialect = .commonmark,
 };
 
@@ -89,5 +107,6 @@ pub const gfm: Options = .{
     .frontmatter = false,
     .math = false,
     .directives = false,
+    .html_elements = false,
     .dialect = .gfm,
 };

@@ -93,6 +93,7 @@ const Span = @import("../../span.zig");
 const Options = @import("options.zig");
 const inline_mod = @import("inline.zig");
 const attrs_mod = @import("attributes.zig");
+const html_lang = @import("../html/html.zig");
 
 /// Re-exported for readability at this file's own call sites -- see
 /// `inline_mod.Segment`'s doc comment for what it means and this file's
@@ -1312,10 +1313,63 @@ pub const Parser = struct {
     }
 
     fn finishHtmlBlock(self: *Parser, lf: *Leaf) Allocator.Error!void {
+        // `html_elements`: try to parse the block into semantic/generic nodes
+        // instead of one opaque `raw_block`. Only succeeds when the block text
+        // maps verbatim onto the source (so promoted spans address the true
+        // input); otherwise fall through to the raw_block below unchanged.
+        if (self.options.html_elements and try self.promoteHtmlBlock(lf)) return;
         if (lf.text.items.len > 0) try lf.text.append(self.allocator, '\n');
         const id = try self.builder.addLeaf(.{ .raw_block = .{ .format = "html", .text = lf.text.items } });
         self.builder.setSpan(id, Span.init(self.lineStart(lf.start_line), self.lineEnd(lf.end_line)));
         try self.appendToTop(id);
+    }
+
+    /// Parse an HTML block's accumulated text through the shared HTML parser
+    /// and splice its nodes into the current container, dropping the parse's
+    /// synthetic `doc` wrapper. Returns `false` (promoting nothing, leaving
+    /// `finishHtmlBlock` to emit its `raw_block`) when the text can't be
+    /// promoted safely:
+    ///
+    ///   - it isn't a verbatim slice of the source at the block's start, so a
+    ///     child's parse span couldn't be shifted onto the true source (see
+    ///     `options.html_elements`); or
+    ///   - the parse yields only layout whitespace (nothing worth promoting).
+    fn promoteHtmlBlock(self: *Parser, lf: *Leaf) Allocator.Error!bool {
+        const start = self.lineStart(lf.start_line);
+        const text = lf.text.items;
+        if (start + text.len > self.source.len) return false;
+        if (!std.mem.eql(u8, self.source[start..][0..text.len], text)) return false;
+
+        var html_ast = try html_lang.parse(self.allocator, text);
+        defer html_ast.deinit();
+
+        // Graft first (so ids/spans are remapped into `self.builder`), then walk
+        // the grafted `doc`'s children. A `doc` root always exists; its children
+        // are the block's top-level nodes.
+        const root = try self.builder.graftAst(&html_ast, start);
+        var child = self.builder.nodes.items[root].first_child;
+        var promoted_any = false;
+        while (child) |cid| {
+            const next = self.builder.nodes.items[cid].next_sibling;
+            // Drop layout-only text between top-level tags — the HTML parser
+            // keeps it, but as a Markdown child it would render as stray text.
+            if (!isBlankStrNode(self.builder.nodes.items[cid].kind)) {
+                self.builder.nodes.items[cid].next_sibling = null;
+                try self.appendToTop(cid);
+                promoted_any = true;
+            }
+            child = next;
+        }
+        return promoted_any;
+    }
+
+    /// A `str` node holding only ASCII whitespace — the HTML parser's layout
+    /// text between block tags, which must not become a Markdown text child.
+    fn isBlankStrNode(kind: Node.Kind) bool {
+        return switch (kind) {
+            .str => |t| std.mem.trim(u8, t, " \t\r\n\x0c").len == 0,
+            else => false,
+        };
     }
 
     // ── the per-line driver ──────────────────────────────────────────────
@@ -3205,6 +3259,114 @@ test "HTML block" {
     const rb = r.ast.nodes[r.ast.root].first_child.?;
     try testing.expect(r.ast.nodes[rb].kind == .raw_block);
     try testing.expectEqualStrings("html", r.ast.nodes[rb].kind.raw_block.format);
+}
+
+/// Depth-first search for the first node whose kind matches `tag`. Used by the
+/// `html_elements` tests to reach a promoted node without threading through the
+/// HTML parser's layout-whitespace `str` children.
+fn findFirstKind(ast: *const AST, id: Node.Id, tag: std.meta.Tag(Node.Kind)) ?Node.Id {
+    if (std.meta.activeTag(ast.nodes[id].kind) == tag) return id;
+    var it = ast.children(id);
+    while (it.next()) |child| {
+        if (findFirstKind(ast, child.id, tag)) |found| return found;
+    }
+    return null;
+}
+
+/// Like `findFirstKind` for `element`, but matching on the tag `name` — and
+/// skipping `id` itself, so it reaches a `<source>` nested inside a `<picture>`
+/// rather than stopping on the `<picture>` the search began from.
+fn findElementNamed(ast: *const AST, id: Node.Id, name: []const u8) ?Node.Id {
+    var it = ast.children(id);
+    while (it.next()) |child| {
+        if (std.meta.activeTag(child.kind) == .element and
+            std.mem.eql(u8, child.kind.element.name, name)) return child.id;
+        if (findElementNamed(ast, child.id, name)) |found| return found;
+    }
+    return null;
+}
+
+test "html_elements OFF: an HTML block stays one opaque raw_block (the default)" {
+    // Guards that promotion is genuinely opt-in: the same source the tests
+    // below promote must, by default, still be the single raw HTML node
+    // CommonMark specifies.
+    var r = try parse(testing.allocator, "<img src=\"a.svg\" alt=\"x\">\n", .{});
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const rb = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[rb].kind == .raw_block);
+}
+
+test "html_elements: an <img> block promotes to an image node, no raw_block" {
+    const src = "<img src=\"a.svg\" alt=\"x\">\n";
+    var r = try parse(testing.allocator, src, .{ .html_elements = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    // No opaque node survives.
+    try testing.expect(findFirstKind(&r.ast, r.ast.root, .raw_block) == null);
+    const img = findFirstKind(&r.ast, r.ast.root, .image).?;
+    try testing.expectEqualStrings("a.svg", r.ast.nodes[img].kind.image.destination.?);
+}
+
+test "html_elements: a promoted <img>'s span addresses the true source bytes" {
+    // The mission's correctness bar: slicing the ORIGINAL source with the
+    // promoted node's span must reproduce the tag as written, not a re-emitted
+    // approximation. The leading paragraph offsets the block so a naive 0-based
+    // span would be caught.
+    const src =
+        \\intro
+        \\
+        \\<img src="assets/fig-banner.svg" width="220" alt="fig">
+        \\
+    ;
+    var r = try parse(testing.allocator, src, .{ .html_elements = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+    const img = findFirstKind(&r.ast, r.ast.root, .image).?;
+    const span = r.ast.nodes[img].span;
+    try testing.expectEqualStrings(
+        "<img src=\"assets/fig-banner.svg\" width=\"220\" alt=\"fig\">",
+        src[span.start..span.end],
+    );
+}
+
+test "html_elements: the fig.md <picture> block parses into heading > picture > [source, image]" {
+    // The motivating example: a `<picture>` with a dark-mode `<source>` and an
+    // `<img>` fallback, inside a centered `<h1>`. `<h1>` upgrades to a heading,
+    // `<picture>`/`<source>` have no semantic mapping so stay generic elements,
+    // and the `<img>` becomes an addressable image.
+    const src =
+        \\<h1 align="center">
+        \\  <picture>
+        \\    <source media="(prefers-color-scheme: dark)" srcset="assets/fig-banner-dark.svg">
+        \\    <img src="assets/fig-banner.svg" width="220" alt="fig">
+        \\  </picture>
+        \\</h1>
+        \\
+    ;
+    var r = try parse(testing.allocator, src, .{ .html_elements = true });
+    defer r.ast.deinit();
+    defer r.link_references.deinit(testing.allocator);
+    defer r.footnotes.deinit(testing.allocator);
+
+    const heading = r.ast.nodes[r.ast.root].first_child.?;
+    try testing.expect(r.ast.nodes[heading].kind.heading.level == 1);
+
+    const picture = findFirstKind(&r.ast, r.ast.root, .element).?;
+    try testing.expectEqualStrings("picture", r.ast.nodes[picture].kind.element.name);
+
+    // The `<source>`'s srcset survives on the generic element's attributes.
+    const source = findElementNamed(&r.ast, picture, "source").?;
+    try testing.expectEqualStrings(
+        "assets/fig-banner-dark.svg",
+        r.ast.attrsOf(source).get("srcset").?,
+    );
+
+    const img = findFirstKind(&r.ast, picture, .image).?;
+    try testing.expectEqualStrings("assets/fig-banner.svg", r.ast.nodes[img].kind.image.destination.?);
 }
 
 test "paragraph with a code span and a hard break" {

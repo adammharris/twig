@@ -73,6 +73,7 @@ const Span = @import("../../span.zig");
 const entities = @import("entities.zig");
 const Options = @import("options.zig");
 const attrs_mod = @import("attributes.zig");
+const html_lang = @import("../html/html.zig");
 
 /// One contiguous run of a leaf block's assembled `text` that maps 1:1 onto
 /// real source bytes: `text[buf_offset..buf_offset+len]` is byte-for-byte
@@ -138,6 +139,27 @@ pub fn initScanner(b: *Builder, link_refs: *const std.StringHashMapUnmanaged(Nod
 pub fn scanReuse(sc: *Scanner, text: []const u8, segments: []const Segment) Allocator.Error![]Node.Id {
     sc.reset(segments);
     return runScan(sc, text);
+}
+
+/// A `str` node holding only ASCII whitespace — the HTML parser's layout text,
+/// which is not a meaningful promotion target.
+fn isBlankStrNode(kind: Node.Kind) bool {
+    return switch (kind) {
+        .str => |t| std.mem.trim(u8, t, " \t\r\n\x0c").len == 0,
+        else => false,
+    };
+}
+
+/// Kinds a *self-contained* inline tag may promote to (see `promoteInlineHtml`).
+/// A block-y upgrade like `<hr>`→`thematic_break` is deliberately excluded:
+/// only `<img>`/`<br>`'s semantic upgrades and the remaining void elements
+/// (which stay generic `element`s) belong inside inline content.
+fn inlineSafeKind(kind: Node.Kind) bool {
+    return switch (kind) {
+        .image, .hard_break => true,
+        .element => |e| html_lang.isVoidElement(e.name),
+        else => false,
+    };
 }
 
 fn runScan(sc: *Scanner, text: []const u8) Allocator.Error![]Node.Id {
@@ -239,9 +261,11 @@ fn runScan(sc: *Scanner, text: []const u8) Allocator.Error![]Node.Id {
                     i = end;
                 } else if (scanHtmlTag(text, i)) |end| {
                     try sc.flushBuf(i);
-                    const id = try b.addLeaf(.{ .raw_inline = .{ .format = "html", .text = text[i..end] } });
-                    sc.setSpanIfMapped(id, i, end);
-                    _ = try sc.appendItem(id);
+                    if (!(sc.options.html_elements and try sc.promoteInlineHtml(text, i, end))) {
+                        const id = try b.addLeaf(.{ .raw_inline = .{ .format = "html", .text = text[i..end] } });
+                        sc.setSpanIfMapped(id, i, end);
+                        _ = try sc.appendItem(id);
+                    }
                     i = end;
                 } else {
                     try sc.buf.append(b.allocator, '<');
@@ -776,6 +800,57 @@ pub const Scanner = struct {
 
     fn setContentSpanIfMapped(self: *Scanner, id: Node.Id, local_start: usize, local_end: usize) void {
         if (self.mapSpan(local_start, local_end)) |sp| self.b.setContentSpan(id, sp);
+    }
+
+    /// `options.html_elements`: try to promote a raw inline HTML tag
+    /// (`text[tag_start..tag_end]`, already validated by `scanHtmlTag`) into a
+    /// real AST node instead of a `raw_inline`. Appends the promoted node and
+    /// returns `true` on success; returns `false` (promoting nothing, leaving
+    /// the caller to emit its `raw_inline`) otherwise.
+    ///
+    /// Only *self-contained* tags promote: a void element (`<img>`→`image`,
+    /// `<br>`→`hard_break`, `<source>`/`<wbr>`/...→generic `element`). A paired
+    /// tag like `<span>` must stay raw — its `</span>` is a separate inline
+    /// token with Markdown content in between, which a childless promoted node
+    /// would silently drop. The flushing of pending literal text is the
+    /// caller's job (it happens for the raw_inline path too), so this only ever
+    /// appends the one promoted item.
+    fn promoteInlineHtml(self: *Scanner, text: []const u8, tag_start: usize, tag_end: usize) Allocator.Error!bool {
+        var tag_ast = try html_lang.parse(self.b.allocator, text[tag_start..tag_end]);
+        defer tag_ast.deinit();
+
+        // A self-contained tag parses to exactly one meaningful top-level node
+        // (layout whitespace aside). More than one, or none, means it wasn't
+        // self-contained — keep it raw.
+        var chosen: ?Node.Id = null;
+        var it = tag_ast.children(tag_ast.root);
+        while (it.next()) |child| {
+            if (isBlankStrNode(child.kind)) continue;
+            if (chosen != null) return false;
+            chosen = child.id;
+        }
+        const src_id = chosen orelse return false;
+        if (!inlineSafeKind(tag_ast.nodes[src_id].kind)) return false;
+
+        // Graft with a zero offset (spans stay tag-relative), then rewrite each
+        // grafted node's span/content_span from tag-relative onto the source via
+        // the inline segment map — the tag sits at `text[tag_start..]`, so a
+        // tag-relative offset `o` is buffer offset `tag_start + o`.
+        const base: Node.Id = @intCast(self.b.nodes.items.len);
+        _ = try self.b.graftAst(&tag_ast, 0);
+        var idx: usize = base;
+        while (idx < self.b.nodes.items.len) : (idx += 1) {
+            const n = &self.b.nodes.items[idx];
+            if (self.mapSpan(n.span.start + tag_start, n.span.end + tag_start)) |sp| n.span = sp;
+            if (n.content_span) |cs| {
+                if (self.mapSpan(cs.start + tag_start, cs.end + tag_start)) |sp| n.content_span = sp;
+            }
+        }
+
+        const grafted = base + src_id;
+        self.b.nodes.items[grafted].next_sibling = null;
+        _ = try self.appendItem(grafted);
+        return true;
     }
 
     /// Flush accumulated plain-text `buf` into a single `str` item, if any
@@ -2282,6 +2357,62 @@ test "plain text becomes a single str node" {
 }
 
 const directives_on: Options = .{ .directives = true };
+const html_on: Options = .{ .html_elements = true };
+
+test "html_elements OFF: an inline <img> stays a raw_inline (the default)" {
+    var ast = try parseAndFinish("a <img src=\"x.png\"> b");
+    defer ast.deinit();
+    var it = ast.children(ast.root);
+    _ = it.next(); // "a "
+    const tag = it.next().?;
+    try testing.expect(tag.kind == .raw_inline);
+    try testing.expectEqualStrings("html", tag.kind.raw_inline.format);
+}
+
+test "html_elements: an inline <img> promotes to an image node with the src as destination" {
+    var ast = try parseAndFinishWithOptions("a <img src=\"x.png\" alt=\"cat\"> b", html_on);
+    defer ast.deinit();
+    var it = ast.children(ast.root);
+    const first = it.next().?;
+    try testing.expectEqualStrings("a ", first.kind.str);
+    const img = it.next().?;
+    try testing.expectEqualStrings("x.png", img.kind.image.destination.?);
+    // Alt text rides along as the image's child content.
+    const alt = ast.nodes[img.id].first_child.?;
+    try testing.expectEqualStrings("cat", ast.nodes[alt].kind.str);
+    const last = it.next().?;
+    try testing.expectEqualStrings(" b", last.kind.str);
+}
+
+test "html_elements: a promoted inline <img>'s span addresses the true source bytes" {
+    const src = "a <img src=\"x.png\" alt=\"cat\"> b";
+    var ast = try parseAndFinishMapped(src, html_on);
+    defer ast.deinit();
+    var it = ast.children(ast.root);
+    _ = it.next(); // "a "
+    const img = it.next().?;
+    try testing.expectEqualStrings("<img src=\"x.png\" alt=\"cat\">", src[img.span.start..img.span.end]);
+}
+
+test "html_elements: an inline <br> promotes to a hard_break" {
+    var ast = try parseAndFinishWithOptions("a<br>b", html_on);
+    defer ast.deinit();
+    var it = ast.children(ast.root);
+    _ = it.next(); // "a"
+    const br = it.next().?;
+    try testing.expect(br.kind == .hard_break);
+}
+
+test "html_elements: a paired inline tag like <span> stays raw (its close tag is separate)" {
+    // Promoting `<span>` to a childless element would silently drop the "hi"
+    // that belongs between it and its separate `</span>` token, so a non-void
+    // tag must remain a raw_inline even with the option on.
+    var ast = try parseAndFinishWithOptions("<span>hi</span>", html_on);
+    defer ast.deinit();
+    const open = ast.nodes[ast.root].first_child.?;
+    try testing.expect(ast.nodes[open].kind == .raw_inline);
+    try testing.expectEqualStrings("<span>", ast.nodes[open].kind.raw_inline.text);
+}
 
 test "text directive with label and attrs" {
     var ast = try parseAndFinishWithOptions(":abbr[HTML]{title=\"HyperText\" .up}", directives_on);

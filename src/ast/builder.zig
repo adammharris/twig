@@ -115,6 +115,40 @@ pub fn setAttrs(self: *Builder, id: Node.Id, attrs: AST.Attrs) Allocator.Error!v
     self.nodes.items[id].attrs = idx;
 }
 
+/// Copy the entire tree of `src` into this builder, shifting every node's
+/// `span`/`content_span` right by `offset` source bytes, and return the
+/// builder id that now holds `src.root`. Strings and attributes are copied
+/// into the builder's owned storage, and the child/sibling linkage is rebuilt
+/// against the builder's own ids.
+///
+/// `offset` is where `src`'s source text sits inside the builder's document,
+/// so a subtree parsed from an *extracted slice* — e.g. a Markdown HTML block
+/// handed to `languages/html/parser.zig` — ends up addressing the true outer
+/// source rather than the slice. Pass `0` when `src` was parsed from the same
+/// buffer this builder is spanning.
+///
+/// The returned id is `src.root` remapped; a caller that wants to drop a
+/// synthetic wrapper (an HTML parse's `doc` root) walks its `first_child`
+/// chain instead of appending the returned id directly.
+pub fn graftAst(self: *Builder, src: *const AST, offset: usize) Allocator.Error!Node.Id {
+    // Nodes are cloned in id order, so `src` id `i` lands at `base + i`; every
+    // child/sibling reference is therefore just its old id plus `base`.
+    const base: Node.Id = @intCast(self.nodes.items.len);
+    for (src.nodes) |node| {
+        const id = try self.addNode(node.kind);
+        const dst = &self.nodes.items[id];
+        dst.first_child = if (node.first_child) |c| base + c else null;
+        dst.next_sibling = if (node.next_sibling) |s| base + s else null;
+        dst.span = .{ .start = node.span.start + offset, .end = node.span.end + offset };
+        if (node.content_span) |cs|
+            dst.content_span = .{ .start = cs.start + offset, .end = cs.end + offset };
+        // `setAttrs` copies the entries' strings; it touches only `attrs`, so
+        // the `dst` node pointer stays valid across it.
+        if (node.attrs) |ai| try self.setAttrs(id, src.attrs[ai]);
+    }
+    return base + src.root;
+}
+
 /// Freeze the builder into an owned `AST` rooted at `root`. The builder is
 /// left empty, so a subsequent `deinit` is harmless.
 pub fn finish(self: *Builder, root: Node.Id) Allocator.Error!AST {
@@ -303,6 +337,40 @@ test "dupeKind copies generic-markup string payloads into owned storage" {
     try testing.expectEqualStrings("a < b", ast.nodes[cd].kind.cdata);
     // Not aliasing the (now-mutated) inputs also means distinct pointers.
     try testing.expect(ast.nodes[el].kind.element.name.ptr != &name_buf);
+}
+
+test "graftAst copies a foreign tree, shifting spans and re-linking children" {
+    const testing = std.testing;
+
+    // A donor AST parsed from a slice that sits at offset 100 in some larger
+    // document — its spans are slice-relative (0-based).
+    var donor = Builder.init(testing.allocator);
+    const inner = try donor.addLeaf(.{ .str = "hi" });
+    donor.setSpan(inner, Span.init(3, 5));
+    const el = try donor.addContainer(.{ .element = .{ .name = "b" } }, &.{inner});
+    donor.setSpan(el, Span.init(0, 8));
+    try donor.setAttrs(el, .{ .entries = &.{.{ .key = "id", .value = "x" }} });
+    var donor_ast = try donor.finish(el);
+    defer donor_ast.deinit();
+
+    // Graft it into a host builder as a child of a paragraph, shifted by 100.
+    var host = Builder.init(testing.allocator);
+    defer host.deinit();
+    const grafted = try host.graftAst(&donor_ast, 100);
+    const para = try host.addContainer(.para, &.{grafted});
+
+    var ast = try host.finish(para);
+    defer ast.deinit();
+
+    // The grafted root is reachable, kept its kind/attrs, and its span shifted.
+    const b_el = ast.nodes[ast.root].first_child.?;
+    try testing.expectEqualStrings("b", ast.nodes[b_el].kind.element.name);
+    try testing.expectEqualStrings("x", ast.attrsOf(b_el).get("id").?);
+    try testing.expect(ast.nodes[b_el].span.eql(Span.init(100, 108)));
+    // Child linkage was rebuilt against host ids, and its span shifted too.
+    const str = ast.nodes[b_el].first_child.?;
+    try testing.expectEqualStrings("hi", ast.nodes[str].kind.str);
+    try testing.expect(ast.nodes[str].span.eql(Span.init(103, 105)));
 }
 
 test "view borrows the in-progress build without consuming it" {

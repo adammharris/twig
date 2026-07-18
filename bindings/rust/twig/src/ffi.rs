@@ -83,9 +83,11 @@ pub enum TwigFormat {
     Html = 4,
 }
 
-/// Markdown extension flags for `twig_editor_create_ext`'s `md_flags` bitmask.
+/// Markdown extension flags for the `md_flags` bitmask of `twig_parse_ext` and
+/// `twig_editor_create_ext`.
 pub const TWIG_MD_DIRECTIVES: u32 = 1 << 0;
 pub const TWIG_MD_MATH: u32 = 1 << 1;
+pub const TWIG_MD_HTML_ELEMENTS: u32 = 1 << 2;
 
 pub enum TwigDocument {}
 
@@ -187,6 +189,13 @@ unsafe extern "C" {
         input: *const u8,
         input_len: usize,
         format: c_int,
+        out_doc: *mut *mut TwigDocument,
+    ) -> TwigStatus;
+    pub fn twig_parse_ext(
+        input: *const u8,
+        input_len: usize,
+        format: c_int,
+        md_flags: u32,
         out_doc: *mut *mut TwigDocument,
     ) -> TwigStatus;
     pub fn twig_document_destroy(doc: *mut TwigDocument);

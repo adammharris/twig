@@ -208,6 +208,7 @@ fn argFail(
 /// only affect a Markdown parse; for any other input format they're inert.
 ///   --directives / --no-directives   the generic-directives extension
 ///   --math / --no-math                `$…$`/`$$…$$` math
+///   --html-elements / --no-…          parse raw HTML into semantic AST nodes
 ///   --commonmark                      strict CommonMark (every extension off)
 ///   --gfm                             the GFM dialect
 /// A preset (`--commonmark`/`--gfm`) followed by an individual flag composes
@@ -226,6 +227,10 @@ fn applyExtFlag(arg: []const u8, cfg: *format.ParseConfig) bool {
         cfg.markdown.math = true;
     } else if (std.mem.eql(u8, arg, "--no-math")) {
         cfg.markdown.math = false;
+    } else if (std.mem.eql(u8, arg, "--html-elements")) {
+        cfg.markdown.html_elements = true;
+    } else if (std.mem.eql(u8, arg, "--no-html-elements")) {
+        cfg.markdown.html_elements = false;
     } else if (std.mem.eql(u8, arg, "--commonmark")) {
         cfg.markdown = .commonmark;
     } else if (std.mem.eql(u8, arg, "--gfm")) {

@@ -219,16 +219,46 @@ pub struct Document {
 
 impl Document {
     pub fn parse(input: &[u8], format: Format) -> Result<Self, Error> {
+        Self::parse_with(input, format, MarkdownExtensions::default())
+    }
+
+    pub fn parse_str(input: &str, format: Format) -> Result<Self, Error> {
+        Self::parse(input.as_bytes(), format)
+    }
+
+    /// Like [`Document::parse`], plus Markdown `extensions` to enable (ignored
+    /// for other formats) — the read-path counterpart of [`Editor::new_ext`].
+    /// Enable [`MarkdownExtensions::html_elements`] here to make embedded HTML
+    /// (`<img>`, `<picture>`, …) queryable via [`Document::query`] instead of
+    /// arriving as opaque raw HTML.
+    pub fn parse_with(
+        input: &[u8],
+        format: Format,
+        extensions: MarkdownExtensions,
+    ) -> Result<Self, Error> {
         let mut raw = std::ptr::null_mut();
         let ffi_format: ffi::TwigFormat = format.into();
-        let status = unsafe { ffi::twig_parse(input.as_ptr(), input.len(), ffi_format as i32, &mut raw) };
+        let status = unsafe {
+            ffi::twig_parse_ext(
+                input.as_ptr(),
+                input.len(),
+                ffi_format as i32,
+                extensions.to_flags(),
+                &mut raw,
+            )
+        };
         Error::from_status(status)?;
         let raw = NonNull::new(raw).ok_or(Error::Internal)?;
         Ok(Self { raw })
     }
 
-    pub fn parse_str(input: &str, format: Format) -> Result<Self, Error> {
-        Self::parse(input.as_bytes(), format)
+    /// [`Document::parse_with`] for a `&str`.
+    pub fn parse_str_with(
+        input: &str,
+        format: Format,
+        extensions: MarkdownExtensions,
+    ) -> Result<Self, Error> {
+        Self::parse_with(input.as_bytes(), format, extensions)
     }
 
     /// Render the document to HTML. For Djot/Markdown this is the rich
@@ -280,15 +310,22 @@ impl Drop for Document {
     }
 }
 
-/// Markdown extensions to enable for an [`Editor`] parse (see
-/// [`Editor::new_ext`]). Ignored for non-Markdown formats. Both default off,
-/// matching the library.
+/// Opt-in Markdown extensions to enable for a parse — for either the read path
+/// ([`Document::parse_with`]) or the edit path ([`Editor::new_ext`]). Ignored
+/// for non-Markdown formats. Every field defaults off, matching the library; the
+/// default-on extensions (tables, strikethrough, task lists, …) are always on
+/// and need no flag here.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MarkdownExtensions {
     /// Generic directives: `:name`, `::name`, `:::name`.
     pub directives: bool,
     /// `$...$` / `$$...$$` math.
     pub math: bool,
+    /// Parse recognized raw HTML into semantic AST nodes — an `<img>` becomes an
+    /// [`image` node](FlatNode) instead of an opaque `raw_block`/`raw_inline`, so
+    /// it is addressable by [`Document::query`] and the tree read paths. Only
+    /// tags that map verbatim onto the source are promoted; the rest stay raw.
+    pub html_elements: bool,
 }
 
 impl MarkdownExtensions {
@@ -299,6 +336,9 @@ impl MarkdownExtensions {
         }
         if self.math {
             flags |= ffi::TWIG_MD_MATH;
+        }
+        if self.html_elements {
+            flags |= ffi::TWIG_MD_HTML_ELEMENTS;
         }
         flags
     }
@@ -2168,6 +2208,24 @@ mod tests {
         )
         .expect("editor");
         assert_eq!(ext.query("directive").expect("query").len(), 1);
+    }
+
+    #[test]
+    fn document_html_elements_make_embedded_img_queryable() {
+        let src = "text <img src=\"a.png\" alt=\"x\"> more\n";
+        // Without the flag, the `<img>` is opaque raw HTML — no `image` node.
+        let mut plain = Document::parse_str(src, Format::Markdown).expect("parse");
+        assert_eq!(plain.query("image").expect("query").len(), 0);
+        // With it enabled on the read path, the promoted image is queryable.
+        let mut ext = Document::parse_str_with(
+            src,
+            Format::Markdown,
+            MarkdownExtensions { html_elements: true, ..Default::default() },
+        )
+        .expect("parse");
+        let images = ext.query("image").expect("query");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].kind, "image");
     }
 
     #[test]

@@ -35,10 +35,12 @@ extern "C" {
 #define TWIG_FORMAT_XML 3
 #define TWIG_FORMAT_HTML 4
 
-// Markdown extension flags for twig_editor_create_ext's `md_flags` bitmask
-// (ignored for non-Markdown formats).
-#define TWIG_MD_DIRECTIVES (1u << 0)  // generic directives: :name, ::name, :::name
-#define TWIG_MD_MATH       (1u << 1)  // $...$ / $$...$$ math
+// Markdown extension flags for the `md_flags` bitmask of twig_parse_ext and
+// twig_editor_create_ext (ignored for non-Markdown formats). Each is an opt-in,
+// default-off extension; a 0 mask is the plain twig_parse/twig_editor_create.
+#define TWIG_MD_DIRECTIVES    (1u << 0)  // generic directives: :name, ::name, :::name
+#define TWIG_MD_MATH          (1u << 1)  // $...$ / $$...$$ math
+#define TWIG_MD_HTML_ELEMENTS (1u << 2)  // parse raw HTML into semantic AST nodes
 
 typedef enum TwigStatus {
     TWIG_STATUS_OK = 0,
@@ -161,6 +163,18 @@ TwigStatus twig_parse(
     const uint8_t *input,
     size_t input_len,
     int format,
+    TwigDocument **out_doc
+);
+
+// Like twig_parse, plus `md_flags` — a bitmask of TWIG_MD_* Markdown extensions
+// to enable (ignored for non-Markdown formats). Opens the read/query surface to
+// the same opt-in extensions twig_editor_create_ext gives the edit surface; a 0
+// mask is exactly twig_parse.
+TwigStatus twig_parse_ext(
+    const uint8_t *input,
+    size_t input_len,
+    int format,
+    uint32_t md_flags,
     TwigDocument **out_doc
 );
 

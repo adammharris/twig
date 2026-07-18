@@ -25,6 +25,13 @@ pub const Renderer = serializer_mod.Renderer;
 pub const Parser = parser_mod.Parser;
 pub const ParseError = parser_mod.ParseError;
 
+/// Whether `name` is an HTML5 void element (`br`, `img`, `source`, ...) —
+/// self-contained, no close tag. Used by the Markdown parser to decide which
+/// inline tags are safe to promote to AST nodes (a non-void `<span>` can't be,
+/// since its `</span>` is a separate inline token). Names match as stored on a
+/// node (lowercase, as the parser produces).
+pub const isVoidElement = serializer_mod.isVoidElement;
+
 pub const serialize = serializer_mod.serialize;
 pub const serializeOpts = serializer_mod.serializeOpts;
 pub const serializeNode = serializer_mod.serializeNode;
