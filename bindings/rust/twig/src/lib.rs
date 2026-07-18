@@ -1,5 +1,10 @@
 mod error;
-mod ffi;
+
+// The raw FFI layer moved to the `twig-sys` crate. Alias it as `ffi` so every
+// `ffi::…` / `crate::ffi::…` reference in this crate keeps resolving unchanged,
+// and so `twig-sys`'s build script (via its `links = "twig"`) links `libtwig.a`
+// into this crate.
+pub(crate) use twig_sys as ffi;
 
 use std::ops::Range;
 use std::os::raw::{c_char, c_int};

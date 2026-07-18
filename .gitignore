@@ -7,5 +7,5 @@ target/
 /result
 
 # Zig source vendored into the Rust crate at publish time (see
-# bindings/rust/twig/vendor-zig.sh) — regenerated, never committed.
-bindings/rust/twig/zig/
+# bindings/rust/twig-sys/vendor-zig.sh) — regenerated, never committed.
+bindings/rust/twig-sys/zig/

@@ -1,0 +1,36 @@
+[package]
+name = "twig-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FFI bindings and native library for Twig (the Djot/Markdown/HTML/XML document engine). Used by the `twig-doc` crate."
+repository = "https://github.com/adammharris/twig"
+homepage = "https://github.com/adammharris/twig"
+documentation = "https://docs.rs/twig-sys"
+readme = "README.md"
+keywords = ["djot", "markdown", "ffi", "sys", "bindings"]
+categories = ["external-ffi-bindings", "text-processing"]
+# `offset_of!` (1.77) + edition 2024 (1.85).
+rust-version = "1.85"
+# The `links` key belongs to the -sys crate: its build script emits the
+# `cargo:rustc-link-lib=static=twig` directive, which propagates to every
+# dependent (notably `twig-doc`). Only one crate in the graph may claim it.
+links = "twig"
+
+# `include` is an allowlist: only these files are packaged. It deliberately
+# carries the vendored `zig/` tree (synced by `vendor-zig.sh` before publish and
+# otherwise .gitignore'd) so the published crate builds standalone, without the
+# surrounding repo. Keep this in sync with what `build.rs` compiles.
+include = [
+    "src/**/*.rs",
+    "build.rs",
+    "README.md",
+    "zig/build.zig",
+    "zig/build.zig.zon",
+    "zig/src/**/*",
+    "zig/bindings/c/include/twig.h",
+]
+
+[lib]
+name = "twig_sys"
+path = "src/lib.rs"

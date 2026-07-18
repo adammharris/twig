@@ -1,3 +1,13 @@
+//! Low-level FFI bindings for Twig's C ABI, plus the build script that links
+//! the native `libtwig.a`.
+//!
+//! This crate is the `-sys` layer: it exposes the raw `extern "C"` functions,
+//! the `#[repr(C)]` type mirrors, and the status/format constants, and nothing
+//! else. The safe, ergonomic API lives in the `twig-doc` crate, which depends
+//! on this one. Direct use is `unsafe` and unstable across ABI-version bumps —
+//! see [`TWIG_ABI_VERSION`].
+#![allow(non_camel_case_types)]
+
 use std::os::raw::{c_char, c_int};
 
 /// The C ABI contract version this binding is written against; see

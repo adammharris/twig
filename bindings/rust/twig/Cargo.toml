@@ -16,21 +16,19 @@ keywords = ["djot", "markdown", "parser", "ast", "document"]
 categories = ["parser-implementations", "text-processing"]
 # `offset_of!` (1.77) + edition 2024 (1.85).
 rust-version = "1.85"
-links = "twig"
 
-# `include` is an allowlist: only these files are packaged. It deliberately
-# carries the vendored `zig/` tree (synced by `vendor-zig.sh` before publish and
-# otherwise .gitignore'd) so the published crate builds standalone, without the
-# surrounding repo. Keep this in sync with what `build.rs` compiles.
+# `include` is an allowlist: only these files are packaged. The native library
+# and its Zig source now live entirely in `twig-sys` (a dependency), so this
+# crate packages only its own Rust sources — no `build.rs`, no vendored `zig/`.
 include = [
     "src/**/*.rs",
-    "build.rs",
     "README.md",
-    "zig/build.zig",
-    "zig/build.zig.zon",
-    "zig/src/**/*",
-    "zig/bindings/c/include/twig.h",
 ]
+
+[dependencies]
+# The `-sys` layer: raw FFI + the `links = "twig"` build script that compiles
+# and links `libtwig.a`. Version-locked to this crate (shared workspace version).
+twig-sys = { path = "../twig-sys", version = "2.2.0" }
 
 [lib]
 name = "twig"
