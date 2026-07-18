@@ -116,6 +116,22 @@ pub const TwigFlatNode = extern struct {
     head: c_int,
     /// A `cell`'s column alignment (`TwigAlignment`), -1 for every other kind.
     alignment: c_int,
+    /// A generic `element`'s tag name (`"picture"`, `"source"`, …), NULL for
+    /// every other kind — the one piece of an element's identity `kind`
+    /// ("element") doesn't carry. Borrows the node payload, same lifetime as
+    /// `text`/`destination`.
+    name_ptr: ?[*]const u8,
+    name_len: usize,
+    /// The node's `{...}` / HTML attributes as `(key, value)` pairs in source
+    /// order, or NULL/0 when it has none. A bare attribute (HTML `disabled`,
+    /// or a source-picked `<source media=…>` with no value) has a NULL `value`
+    /// with `value_len == 0`. Borrows: the `TwigKeyVal` records live in a buffer
+    /// owned by the editor handle (replaced on the next snapshot call on the same
+    /// accessor, freed on destroy), and each key/value pointer within them
+    /// borrows the AST payload like `text`/`destination` — so a successful edit
+    /// invalidates them too.
+    attrs_ptr: ?[*]const TwigKeyVal,
+    attrs_len: usize,
 };
 
 /// `TwigFlatNode.head` for a node that is neither a `row` nor a `cell`.
@@ -213,7 +229,10 @@ pub export fn twig_version_string() [*:0]const u8 {
 /// 2: `TwigFlatNode` grew `head`/`alignment` (96 → 104 bytes). Appended, so
 /// every prior field kept its offset, but `@sizeOf` is part of the layout a
 /// consumer strides an array with — that's a bump.
-pub const TWIG_ABI_VERSION: u32 = 2;
+/// 3: `TwigFlatNode` grew `name`/`attrs` (104 → 136 bytes) — an `element`'s tag
+/// name and a node's `(key, value)` attributes on the read path. Same
+/// append-only shape, same reason it's still a bump.
+pub const TWIG_ABI_VERSION: u32 = 3;
 
 pub export fn twig_abi_version() u32 {
     return TWIG_ABI_VERSION;
@@ -249,7 +268,7 @@ comptime {
         assert(@offsetOf(TwigChange, "old") == 0);
         assert(@offsetOf(TwigChange, "new") == 16);
 
-        assert(@sizeOf(TwigFlatNode) == 104);
+        assert(@sizeOf(TwigFlatNode) == 136);
         assert(@offsetOf(TwigFlatNode, "id") == 0);
         assert(@offsetOf(TwigFlatNode, "parent") == 4);
         assert(@offsetOf(TwigFlatNode, "first_child") == 8);
@@ -265,6 +284,10 @@ comptime {
         assert(@offsetOf(TwigFlatNode, "destination_len") == 88);
         assert(@offsetOf(TwigFlatNode, "head") == 96);
         assert(@offsetOf(TwigFlatNode, "alignment") == 100);
+        assert(@offsetOf(TwigFlatNode, "name_ptr") == 104);
+        assert(@offsetOf(TwigFlatNode, "name_len") == 112);
+        assert(@offsetOf(TwigFlatNode, "attrs_ptr") == 120);
+        assert(@offsetOf(TwigFlatNode, "attrs_len") == 128);
 
         assert(@sizeOf(TwigKeyVal) == 32);
         assert(@offsetOf(TwigKeyVal, "key") == 0);
@@ -550,12 +573,19 @@ const EditorHandle = struct {
     /// The last `twig_editor_nodes` snapshot (editor tree read-back; see
     /// DESIGN.md's "Editor surface" tiers).
     flat_nodes: []TwigFlatNode = &.{},
+    /// The `TwigKeyVal` records the last `twig_editor_nodes` snapshot's
+    /// `attrs_ptr`s point into (see `fillAttrs`). Paired with `flat_nodes`:
+    /// replaced together, freed together.
+    flat_attrs: []TwigKeyVal = &.{},
     /// The last `twig_editor_nodes_at` ancestor chain. Independent of
     /// `query_matches` so a hit-test doesn't invalidate a prior query.
     ancestor_matches: []TwigQueryMatch = &.{},
     /// The last `twig_editor_subtree` snapshot. Independent of `flat_nodes` so a
     /// per-block re-marshal doesn't invalidate a prior whole-tree read.
     subtree_nodes: []TwigFlatNode = &.{},
+    /// The `TwigKeyVal` records the last `twig_editor_subtree` snapshot's
+    /// `attrs_ptr`s point into. Paired with `subtree_nodes`.
+    subtree_attrs: []TwigKeyVal = &.{},
     /// The last `twig_editor_child_spans` result (direct-children enumeration).
     child_spans: []TwigQueryMatch = &.{},
 };
@@ -688,8 +718,10 @@ pub export fn twig_editor_destroy(ed: ?*TwigEditor) void {
     if (handle.ast_json.len != 0) allocator.free(handle.ast_json);
     if (handle.query_matches.len != 0) allocator.free(handle.query_matches);
     if (handle.flat_nodes.len != 0) allocator.free(handle.flat_nodes);
+    if (handle.flat_attrs.len != 0) allocator.free(handle.flat_attrs);
     if (handle.ancestor_matches.len != 0) allocator.free(handle.ancestor_matches);
     if (handle.subtree_nodes.len != 0) allocator.free(handle.subtree_nodes);
+    if (handle.subtree_attrs.len != 0) allocator.free(handle.subtree_attrs);
     if (handle.child_spans.len != 0) allocator.free(handle.child_spans);
     handle.editor.deinit();
     allocator.destroy(handle);
@@ -955,6 +987,17 @@ fn changeC(c: twig.Splicer.Change) TwigChange {
 /// The node's static kind-tag name, matching `TwigQueryMatch.kind`.
 fn kindName(node: *const twig.AST.Node) [*:0]const u8 {
     return @tagName(std.meta.activeTag(node.kind)).ptr;
+}
+
+/// A generic `element`'s tag name (`"picture"`, `"source"`, `"div"`, …), or
+/// `null` for every semantic kind — the tag is the only thing distinguishing
+/// one `element` from another, and `kindName` reports them all as `"element"`.
+/// Borrows the AST-owned name payload.
+fn kindElementName(node: *const twig.AST.Node) ?[]const u8 {
+    return switch (node.kind) {
+        .element => |e| e.name,
+        else => null,
+    };
 }
 
 /// A heading's level, or 0 for any other kind.
@@ -1244,8 +1287,18 @@ pub export fn twig_editor_nodes(
         }
     }
 
+    // Attributes: marshal into a companion buffer the flat nodes point into.
+    // Built before publishing `buf` so a mid-way OOM leaves the old snapshot
+    // intact. Identity order — `buf[i]` is arena node `i` for the whole tree.
+    const attrs = fillAttrs(allocator, ast, buf, null) catch {
+        allocator.free(buf);
+        return .out_of_memory;
+    };
+
     if (handle.flat_nodes.len != 0) allocator.free(handle.flat_nodes);
+    if (handle.flat_attrs.len != 0) allocator.free(handle.flat_attrs);
     handle.flat_nodes = buf;
+    handle.flat_attrs = attrs orelse &.{};
 
     ptr_out.* = if (buf.len == 0) null else buf.ptr;
     len_out.* = buf.len;
@@ -1356,8 +1409,16 @@ pub export fn twig_editor_subtree(
         }
     }
 
+    // Attributes, keyed by the subtree's arena-id list (`buf[i]` is `ids[i]`).
+    const attrs = fillAttrs(allocator, ast, buf, ids) catch {
+        allocator.free(buf);
+        return .out_of_memory;
+    };
+
     if (handle.subtree_nodes.len != 0) allocator.free(handle.subtree_nodes);
+    if (handle.subtree_attrs.len != 0) allocator.free(handle.subtree_attrs);
     handle.subtree_nodes = buf;
+    handle.subtree_attrs = attrs orelse &.{};
     ptr_out.* = if (buf.len == 0) null else buf.ptr;
     len_out.* = buf.len;
     return .ok;
@@ -1453,6 +1514,7 @@ fn flatMatch(ast: *const twig.AST, id: twig.AST.Node.Id) TwigQueryMatch {
 fn flatNodeOf(node: *const twig.AST.Node, id: u32, parent: u32, first_child: u32, next_sibling: u32) TwigFlatNode {
     const text = kindText(node);
     const dest = kindDestination(node);
+    const name = kindElementName(node);
     return .{
         .id = id,
         .parent = parent,
@@ -1469,6 +1531,66 @@ fn flatNodeOf(node: *const twig.AST.Node, id: u32, parent: u32, first_child: u32
         .destination_len = if (dest) |d| d.len else 0,
         .head = kindHead(node),
         .alignment = kindAlignment(node),
+        .name_ptr = if (name) |n| n.ptr else null,
+        .name_len = if (name) |n| n.len else 0,
+        // Filled by `fillAttrs` after the array is built (attrs need a companion
+        // buffer the individual node struct can't own); NULL until then.
+        .attrs_ptr = null,
+        .attrs_len = 0,
+    };
+}
+
+/// Marshal every snapshot node's attributes into one `TwigKeyVal` buffer and
+/// point each flat node's `attrs_ptr`/`attrs_len` at its slice of it. `order[i]`
+/// is the ARENA id whose attributes land on `buf[i]`; `null` means identity
+/// (`buf[i]` is arena node `i`), which is the whole-tree snapshot — a subtree
+/// snapshot passes its id list. The returned buffer is owned by the caller (to
+/// cache on the handle and free on destroy); the key/value pointers inside it
+/// borrow the AST payload, so it shares the snapshot's "invalid after a
+/// successful edit" lifetime. `null` when no node carries any attribute (nothing
+/// to allocate).
+///
+/// The AST-side knowledge — which nodes have attributes and where they live —
+/// is `AST.attrsOf`'s (reader.zig); this is only the wire copy of its native
+/// `KeyVal` entries into the `TwigKeyVal` layout the ABI hands out.
+fn fillAttrs(
+    allocator: Allocator,
+    ast: *const twig.AST,
+    buf: []TwigFlatNode,
+    order: ?[]const u32,
+) Allocator.Error!?[]TwigKeyVal {
+    const arenaId = struct {
+        fn at(ord: ?[]const u32, i: usize) twig.AST.Node.Id {
+            return if (ord) |o| o[i] else @intCast(i);
+        }
+    }.at;
+
+    var total: usize = 0;
+    for (0..buf.len) |i| total += ast.attrsOf(arenaId(order, i)).entries.len;
+    if (total == 0) return null;
+
+    const store = try allocator.alloc(TwigKeyVal, total);
+    var cursor: usize = 0;
+    for (0..buf.len) |i| {
+        const entries = ast.attrsOf(arenaId(order, i)).entries;
+        for (entries, 0..) |kv, j| store[cursor + j] = keyValC(kv);
+        if (entries.len != 0) {
+            buf[i].attrs_ptr = store.ptr + cursor;
+            buf[i].attrs_len = entries.len;
+            cursor += entries.len;
+        }
+    }
+    return store;
+}
+
+/// One native `KeyVal` in the C-ABI `TwigKeyVal` layout. A bare attribute
+/// (`disabled`, `<source media …>` with no value) keeps a NULL `value`.
+fn keyValC(kv: twig.AST.KeyVal) TwigKeyVal {
+    return .{
+        .key = kv.key.ptr,
+        .key_len = kv.key.len,
+        .value = if (kv.value) |v| v.ptr else null,
+        .value_len = if (kv.value) |v| v.len else 0,
     };
 }
 
@@ -2483,6 +2605,47 @@ test "twig_parse_ext with TWIG_MD_HTML_ELEMENTS makes an embedded <img> queryabl
             twig_document_query(doc, selector.ptr, selector.len, &ptr, &len),
         );
         try std.testing.expectEqual(case[1], len);
+    }
+}
+
+test "twig_editor_nodes exposes an element's name and attributes" {
+    // The `<picture>` case: a `<source>` carries its theme selection entirely in
+    // attributes (`media`/`srcset`) the flat snapshot must now surface — `kind`
+    // is just "element" for both `<picture>` and `<source>`.
+    const source =
+        "<picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"d.svg\"><img src=\"l.svg\" alt=\"x\"></picture>\n";
+    var ed: ?*TwigEditor = null;
+    try std.testing.expectEqual(
+        TwigStatus.ok,
+        twig_editor_create_ext(source.ptr, source.len, @intFromEnum(TwigFormat.markdown), TWIG_MD_HTML_ELEMENTS, &ed),
+    );
+    defer twig_editor_destroy(ed);
+
+    var ptr: ?[*]const TwigFlatNode = null;
+    var len: usize = 0;
+    try std.testing.expectEqual(TwigStatus.ok, twig_editor_nodes(ed, &ptr, &len));
+    const nodes = ptr.?[0..len];
+
+    // Find the `<source>` by its now-exposed element name.
+    var source_node: ?*const TwigFlatNode = null;
+    for (nodes) |*n| {
+        if (n.name_ptr) |np| {
+            if (std.mem.eql(u8, np[0..n.name_len], "source")) source_node = n;
+        }
+    }
+    const src_el = source_node orelse return error.SourceElementMissing;
+
+    // Its attributes are readable, in order, with the right values.
+    const attrs = src_el.attrs_ptr.?[0..src_el.attrs_len];
+    try std.testing.expectEqual(@as(usize, 2), attrs.len);
+    try std.testing.expectEqualStrings("media", attrs[0].key.?[0..attrs[0].key_len]);
+    try std.testing.expectEqualStrings("(prefers-color-scheme: dark)", attrs[0].value.?[0..attrs[0].value_len]);
+    try std.testing.expectEqualStrings("srcset", attrs[1].key.?[0..attrs[1].key_len]);
+    try std.testing.expectEqualStrings("d.svg", attrs[1].value.?[0..attrs[1].value_len]);
+
+    // A plain `str`/`image` node carries no element name.
+    for (nodes) |*n| {
+        if (std.mem.orderZ(u8, n.kind, "str") == .eq) try std.testing.expect(n.name_ptr == null);
     }
 }
 

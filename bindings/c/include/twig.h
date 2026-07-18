@@ -28,7 +28,9 @@ extern "C" {
 // 2: TwigFlatNode grew head/alignment (96 -> 104 bytes). The new fields are
 //    appended, so every prior field kept its offset, but sizeof is part of the
 //    layout a consumer strides an array with — hence the bump.
-#define TWIG_ABI_VERSION 2
+// 3: TwigFlatNode grew name/attrs (104 -> 136 bytes) — an element's tag name
+//    and a node's (key, value) attributes on the read path. Appended, same as 2.
+#define TWIG_ABI_VERSION 3
 
 #define TWIG_FORMAT_DJOT 1
 #define TWIG_FORMAT_MARKDOWN 2
@@ -103,6 +105,19 @@ typedef struct TwigChange {
     TwigSpan new_span;
 } TwigChange;
 
+// One attribute pair — a (key, value) as written. A NULL `value` is a *bare*
+// attribute (HTML `disabled`, `<source media=...>` used as a flag), distinct
+// from a present-but-empty value (`value` non-NULL, `value_len == 0`). Used on
+// both the read path (TwigFlatNode.attrs, where key/value BORROW the node's
+// payload — same lifetime as text_ptr) and the write path
+// (twig_builder_set_attrs, where they are COPIED in).
+typedef struct TwigKeyVal {
+    const uint8_t *key;
+    size_t key_len;
+    const uint8_t *value;
+    size_t value_len;
+} TwigKeyVal;
+
 // One node in the editor's current tree — the flat-arena snapshot
 // twig_editor_nodes returns, the JSON-free read path. `id` is the node's index
 // in the arena; parent / first_child / next_sibling are ids or TWIG_NO_NODE.
@@ -118,6 +133,14 @@ typedef struct TwigChange {
 // (TWIG_HEAD_NONE / TWIG_ALIGN_NONE) for a kind that carries no such payload —
 // not `level`'s 0-means-absent trick, because a cell's TWIG_ALIGN_DEFAULT is
 // itself a meaningful value.
+//
+// name_ptr is a generic element's tag name ("picture", "source", ...) — NULL
+// for every non-element kind, since `kind` reports them all as "element". attrs
+// is the node's (key, value) attributes in source order (attrs_len of them), or
+// NULL/0 for a node with none. Both borrow the node's payload with the same
+// lifetime as text_ptr/destination_ptr (invalid after the next successful edit);
+// the TwigKeyVal records additionally live in a snapshot-owned buffer replaced
+// on the next twig_editor_nodes / twig_editor_subtree call.
 typedef struct TwigFlatNode {
     uint32_t id;
     uint32_t parent;
@@ -134,6 +157,10 @@ typedef struct TwigFlatNode {
     size_t destination_len;
     int head;
     int alignment;
+    const uint8_t *name_ptr;
+    size_t name_len;
+    const TwigKeyVal *attrs_ptr;
+    size_t attrs_len;
 } TwigFlatNode;
 
 // TwigFlatNode.head for a node that is neither a row nor a cell.
@@ -845,16 +872,6 @@ typedef enum TwigDirectiveForm {
     TWIG_DIRECTIVE_LEAF = 1,
     TWIG_DIRECTIVE_CONTAINER = 2,
 } TwigDirectiveForm;
-
-// One attribute pair for twig_builder_set_attrs. A NULL `value` is a *bare*
-// attribute (HTML `disabled`), distinct from a present-but-empty value (`value`
-// non-NULL, `value_len == 0`). Keys/values are copied.
-typedef struct TwigKeyVal {
-    const uint8_t *key;
-    size_t key_len;
-    const uint8_t *value;
-    size_t value_len;
-} TwigKeyVal;
 
 // Create/destroy a builder handle.
 TwigStatus twig_builder_create(TwigBuilder **out_builder);

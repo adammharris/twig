@@ -100,6 +100,15 @@ pub struct FlatNode {
     /// [`Alignment::Default`] is a real, unspecified alignment (a bare `---`) —
     /// distinct from the `None` a non-cell node reports.
     pub alignment: Option<Alignment>,
+    /// A generic `element`'s tag name (`"picture"`, `"source"`, …); `None` for
+    /// every semantic kind (whose identity is `kind` alone). With this an
+    /// `html_elements` parse's `<picture>`/`<source>` are distinguishable — both
+    /// report `kind == "element"`.
+    pub name: Option<String>,
+    /// The node's `{...}` / HTML attributes as `(key, value)` pairs in source
+    /// order (empty when it has none). A bare attribute (HTML `disabled`, or a
+    /// `<source media=…>` used as a flag) has a `None` value.
+    pub attrs: Vec<(String, Option<String>)>,
 }
 
 /// An inline mark for [`Editor::wrap_range`] / [`Editor::toggle_inline`] — a
@@ -1016,7 +1025,25 @@ fn flat_node_from_ffi(n: &ffi::TwigFlatNode) -> Result<FlatNode, Error> {
             v => Some(v != 0),
         },
         alignment: Alignment::from_c(n.alignment),
+        name: borrowed_bytes(n.name_ptr, n.name_len),
+        attrs: borrowed_attrs(n.attrs_ptr, n.attrs_len),
     })
+}
+
+/// Copy a borrowed `TwigKeyVal` array into owned `(key, value)` pairs, or an
+/// empty vec for a NULL pointer (the node has no attributes). A bare attribute
+/// (NULL `value`) maps to a `None` value, distinct from a present-but-empty one.
+fn borrowed_attrs(ptr: *const ffi::TwigKeyVal, len: usize) -> Vec<(String, Option<String>)> {
+    if ptr.is_null() || len == 0 {
+        return Vec::new();
+    }
+    let kvs = unsafe { std::slice::from_raw_parts(ptr, len) };
+    kvs.iter()
+        .map(|kv| {
+            let key = borrowed_bytes(kv.key, kv.key_len).unwrap_or_default();
+            (key, borrowed_bytes(kv.value, kv.value_len))
+        })
+        .collect()
 }
 
 /// Copy a NUL-terminated, library-owned C string into an owned `String`.
@@ -1610,6 +1637,45 @@ mod tests {
         let mut ed = Editor::new_str("<a><b>hi</b></a>", Format::Xml).expect("editor");
         ed.replace_content("0.0", "bye").expect("replace_content");
         assert_eq!(ed.source_str().expect("source"), "<a><b>bye</b></a>");
+    }
+
+    #[test]
+    fn flat_nodes_expose_element_name_and_attrs() {
+        // A `<picture>` with a theme-switching `<source>`: the dark alternative
+        // lives only in the `<source>`'s attributes, which the snapshot now
+        // surfaces (both `<picture>` and `<source>` report `kind == "element"`).
+        let src = "<picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"d.svg\"><img src=\"l.svg\" alt=\"x\"></picture>\n";
+        let mut ed = Editor::new_ext(
+            src.as_bytes(),
+            Format::Markdown,
+            MarkdownExtensions { html_elements: true, ..Default::default() },
+        )
+        .expect("editor");
+        let nodes = ed.nodes().expect("nodes");
+
+        let source = nodes
+            .iter()
+            .find(|n| n.name.as_deref() == Some("source"))
+            .expect("a <source> element node");
+        assert_eq!(
+            source.attrs,
+            vec![
+                ("media".to_string(), Some("(prefers-color-scheme: dark)".to_string())),
+                ("srcset".to_string(), Some("d.svg".to_string())),
+            ]
+        );
+
+        // The `<img>` fallback stays an `image` node (no element name), and its
+        // `src` is the ordinary `destination`.
+        let img = nodes.iter().find(|n| n.kind == "image").expect("an image node");
+        assert!(img.name.is_none());
+        assert_eq!(img.destination.as_deref(), Some("l.svg"));
+
+        // A semantic node carries neither an element name nor attributes.
+        let picture_kids_str = nodes.iter().find(|n| n.kind == "str");
+        if let Some(s) = picture_kids_str {
+            assert!(s.name.is_none() && s.attrs.is_empty());
+        }
     }
 
     #[test]
