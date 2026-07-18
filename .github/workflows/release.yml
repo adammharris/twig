@@ -1,10 +1,16 @@
 name: Release
 
-# Publishes the `twig` Rust crate to crates.io and cuts a GitHub release when a
+# Publishes the Twig Rust crates to crates.io and cuts a GitHub release when a
 # version tag is pushed. Tag the commit `v<major>.<minor>.<patch>` (matching the
 # crate/`build.zig.zon` version) to trigger it, e.g. `git tag v1.0.0 && git push
 # origin v1.0.0`. `workflow_dispatch` allows a manual dry run (publish is skipped
 # unless the run was triggered by a tag).
+#
+# The crate graph is published bottom-up, because crates.io rejects an upload
+# whose dependencies aren't already on the index:
+#   1. twig-sys-<target> payload crates (prebuilt libtwig.a, no deps)
+#   2. twig-sys        (FFI + build script; depends on the payload crates)
+#   3. twig-doc        (safe API; depends on twig-sys)
 on:
   push:
     tags: ["v*"]
@@ -15,10 +21,19 @@ permissions:
 
 env:
   ZIG_VERSION: "0.16.0"
+  # Ordered list consumed by the publish/dry-run steps. Payload crates first,
+  # then the FFI crate, then the safe wrapper. Keep in sync with
+  # bindings/rust/prebuilt-targets.tsv.
+  PAYLOAD_CRATES: >-
+    twig-sys-macos-arm64
+    twig-sys-linux-x64-gnu
+    twig-sys-linux-arm64-gnu
+    twig-sys-windows-x64-msvc
+    twig-sys-wasm32
 
 jobs:
   publish:
-    name: publish crate
+    name: publish crates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -31,8 +46,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Cross-compile every tier-1 target's libtwig.a into its payload crate's
+      # lib/ (git-ignored). Zig cross-compiles all targets from this one runner.
+      # Must run before any packaging: the payload crates' `include` list ships
+      # lib/<archive>, and the workspace test below exercises the prebuilt path.
+      - name: Build prebuilt payload libraries
+        working-directory: bindings/rust
+        run: bash scripts/build-payload-lib.sh all
+
       # Gate the release on a green build/test of both the Zig core and the
-      # binding before anything is published.
+      # bindings before anything is published. `cargo test --workspace` links
+      # the just-built prebuilt archive for this runner's target (path deps
+      # resolve locally; no registry needed).
       - name: Zig test
         run: zig build test
 
@@ -40,8 +65,8 @@ jobs:
         working-directory: bindings/rust
         run: cargo test --workspace
 
-      # The Rust workspace version must track build.zig.zon (the single source
-      # of truth). Fails with a fix hint if someone bumped one but not the other.
+      # The Rust workspace version (package + internal dep versions) must track
+      # build.zig.zon (the single source of truth). Fails with a fix hint on drift.
       - name: Check version sync
         run: bash scripts/sync-version.sh --check
 
@@ -58,25 +83,54 @@ jobs:
             exit 1
           fi
 
-      # Sync the Zig source into bindings/rust/twig/zig so the published crate
-      # is self-contained (see vendor-zig.sh / build.rs). --allow-dirty because
-      # that vendored tree is untracked (.gitignore'd).
+      # Sync the Zig source into bindings/rust/twig-sys/zig so the published
+      # twig-sys crate is self-contained (source-build fallback for targets
+      # without a payload). --allow-dirty because that tree is untracked.
       - name: Vendor Zig source
-        run: bash bindings/rust/twig/vendor-zig.sh
+        run: bash bindings/rust/twig-sys/vendor-zig.sh
 
+      # Ordered publish. `cargo publish` waits for each crate to land on the
+      # index before returning; a short retry loop absorbs any residual
+      # index-propagation lag before the next tier resolves it.
       - name: Publish to crates.io
         if: startsWith(github.ref, 'refs/tags/v')
         working-directory: bindings/rust
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p twig-doc --allow-dirty
+        run: |
+          set -euo pipefail
+          publish() {
+            local crate="$1"
+            for attempt in 1 2 3 4 5; do
+              echo "::group::cargo publish -p $crate (attempt $attempt)"
+              if cargo publish -p "$crate" --allow-dirty; then
+                echo "::endgroup::"; return 0
+              fi
+              echo "::endgroup::"
+              echo "publish $crate failed; retrying in 30s (index propagation?)"
+              sleep 30
+            done
+            echo "::error::failed to publish $crate after retries"; return 1
+          }
+          for crate in $PAYLOAD_CRATES; do publish "$crate"; done
+          publish twig-sys
+          publish twig-doc
 
-      # A dry run for manual (workflow_dispatch) invocations: package and verify
-      # the crate without pushing it to the registry.
-      - name: Package (dry run)
+      # Manual (workflow_dispatch) dry run: fully verify what can be verified
+      # without touching the registry — every payload crate packages and
+      # verify-builds standalone. twig-sys/twig-doc can only be packaged once
+      # their deps are on the index (crates.io rejects otherwise), so they're
+      # covered by the build/test steps above instead.
+      - name: Package payload crates (dry run)
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         working-directory: bindings/rust
-        run: cargo publish -p twig-doc --allow-dirty --dry-run
+        run: |
+          set -euo pipefail
+          for crate in $PAYLOAD_CRATES; do
+            echo "::group::cargo package -p $crate"
+            cargo package -p "$crate" --allow-dirty
+            echo "::endgroup::"
+          done
 
       - name: Create GitHub release
         if: startsWith(github.ref, 'refs/tags/v')

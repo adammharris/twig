@@ -27,8 +27,8 @@ include = [
 
 [dependencies]
 # The `-sys` layer: raw FFI + the `links = "twig"` build script that compiles
-# and links `libtwig.a`. Version-locked to this crate (shared workspace version).
-twig-sys = { path = "../twig-sys", version = "2.2.0" }
+# and links `libtwig.a`. Version-locked via [workspace.dependencies].
+twig-sys = { workspace = true }
 
 [lib]
 name = "twig"

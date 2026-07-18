@@ -33,9 +33,23 @@ if [ -z "$current" ]; then
     exit 1
 fi
 
+# Internal-crate dependency versions live in [workspace.dependencies] as lines
+# like `name = { path = "…", version = "x.y.z" }`. Every intra-workspace crate
+# shares the one project version, so these must track it too (twig-doc ->
+# twig-sys -> per-target payload crates all resolve by version at publish time).
+# Any such line whose version != canonical is drift.
+internal_drift="$(grep -n 'path = ".*version = "' "$cargo" \
+    | grep -v "version = \"$version\"" || true)"
+
 if [ "$check" = true ]; then
     if [ "$current" != "$version" ]; then
         echo "sync-version: version drift — build.zig.zon is $version but $cargo is $current." >&2
+        echo "              Run scripts/sync-version.sh and commit the result." >&2
+        exit 1
+    fi
+    if [ -n "$internal_drift" ]; then
+        echo "sync-version: internal [workspace.dependencies] version drift (want $version):" >&2
+        echo "$internal_drift" >&2
         echo "              Run scripts/sync-version.sh and commit the result." >&2
         exit 1
     fi
@@ -43,13 +57,18 @@ if [ "$check" = true ]; then
     exit 0
 fi
 
-if [ "$current" = "$version" ]; then
+if [ "$current" = "$version" ] && [ -z "$internal_drift" ]; then
     echo "sync-version: already in sync ($version)"
     exit 0
 fi
 
-# Portable in-place edit (works with both BSD/macOS and GNU sed).
+# Portable in-place edit (works with both BSD/macOS and GNU sed). Two rewrites:
+#   1. the [workspace.package] `version = "…"` (anchored at line start), and
+#   2. the `version = "…"` inside each internal `{ path = "…", version = "…" }`
+#      line in [workspace.dependencies].
 tmp="$(mktemp)"
-sed 's/^version = "[^"]*"/version = "'"$version"'"/' "$cargo" > "$tmp"
+sed -e 's/^version = "[^"]*"/version = "'"$version"'"/' \
+    -e 's/\(path = "[^"]*", version = "\)[^"]*"/\1'"$version"'"/' \
+    "$cargo" > "$tmp"
 mv "$tmp" "$cargo"
-echo "sync-version: bindings/rust/Cargo.toml $current -> $version"
+echo "sync-version: bindings/rust/Cargo.toml -> $version (package + internal deps)"
