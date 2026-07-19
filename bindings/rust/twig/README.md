@@ -1,6 +1,6 @@
 # twig
 
-Rust bindings for [Twig](https://github.com/adammharris/twig), a document
+Rust bindings for [Twig](https://github.com/diaryx-org/twig), a document
 parser and lossless AST editor for Djot, Markdown, HTML, and XML.
 
 Twig treats a document the way `jq` treats JSON: parse it into a shared AST,

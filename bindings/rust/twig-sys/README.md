@@ -1,7 +1,7 @@
 # twig-sys
 
 Low-level FFI bindings and the native static library for
-[Twig](https://github.com/adammharris/twig) — the Djot / Markdown / HTML / XML
+[Twig](https://github.com/diaryx-org/twig) — the Djot / Markdown / HTML / XML
 document engine.
 
 This crate exists to build and link `libtwig.a` and to expose the raw C ABI

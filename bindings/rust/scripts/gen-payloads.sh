@@ -31,7 +31,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Prebuilt libtwig.a for $rust_target. Support crate for twig-sys; not for direct use."
-repository = "https://github.com/adammharris/twig"
+repository = "https://github.com/diaryx-org/twig"
 # The build script hands \`lib/libtwig.a\`'s location to \`twig-sys\` via this
 # \`links\` key (as \`DEP_${links^^}_LIBDIR\`). Unique per payload crate.
 links = "$links"

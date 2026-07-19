@@ -54,7 +54,7 @@
 
             meta = {
               description = "Parse, query, edit, and losslessly round-trip Djot, Markdown, HTML, and XML documents";
-              homepage = "https://github.com/adammharris/twig";
+              homepage = "https://github.com/diaryx-org/twig";
               license = with pkgs.lib.licenses; [ mit asl20 ];
               mainProgram = "twig";
               platforms = pkgs.lib.platforms.unix;

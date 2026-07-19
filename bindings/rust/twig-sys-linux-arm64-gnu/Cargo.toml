@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Prebuilt libtwig.a for aarch64-unknown-linux-gnu. Support crate for twig-sys; not for direct use."
-repository = "https://github.com/adammharris/twig"
+repository = "https://github.com/diaryx-org/twig"
 # The build script hands `lib/libtwig.a`'s location to `twig-sys` via this
 # `links` key (as `DEP_TWIG_PREBUILT_LINUX_ARM64_GNU_LIBDIR`). Unique per payload crate.
 links = "twig_prebuilt_linux_arm64_gnu"

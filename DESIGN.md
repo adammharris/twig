@@ -16,7 +16,7 @@ with the repo. This file is deliberately self-contained.
 
 ## Relationship to `fig`
 
-Twig is a sister project to [`fig`](https://github.com/adammharris/fig).
+Twig is a sister project to [`fig`](https://github.com/diaryx-org/fig).
 `fig` parses **configuration** files (JSON, YAML, TOML) and edits them in
 place; Twig applies the same architecture to **document** files (Djot,
 Markdown, HTML, XML). Twig was built by carrying `fig`'s module layout and

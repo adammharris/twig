@@ -8,12 +8,12 @@ contents: ['[DESIGN](/DESIGN.md)', '[COOKBOOK](/COOKBOOK.md)']
 
 # Twig
 
-[![CI](https://img.shields.io/github/actions/workflow/status/adammharris/twig/ci.yml?branch=main)](https://github.com/adammharris/twig/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/diaryx-org/twig/ci.yml?branch=main)](https://github.com/diaryx-org/twig/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/twig-doc.svg)](https://crates.io/crates/twig-doc)
 [![docs.rs](https://img.shields.io/docsrs/twig-doc)](https://docs.rs/twig-doc)
 [![license](https://img.shields.io/crates/l/twig-doc.svg)](#license)
 
-A sister project to [`fig`](https://github.com/adammharris/fig).
+A sister project to [`fig`](https://github.com/diaryx-org/fig).
 While `fig` parses configuration files like JSON, YAML, and TOML,
 Twig parses **document** files, like HTML, Markdown, and Djot.
 

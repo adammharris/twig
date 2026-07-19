@@ -14,7 +14,7 @@
 //! side-tables, the block/inline dichotomy) lives in the djot module.
 //!
 //! Structurally this is the document-format counterpart to fig's config-tree
-//! `AST` https://github.com/adammharris/fig/blob/main/src/ast/ast.zig`
+//! `AST` https://github.com/diaryx-org/fig/blob/main/src/ast/ast.zig`
 //! and follows the same conventions:
 //! an index-based arena (`Node.Id = u32`, a flat `[]Node`),
 //! containers link their children via `first_child`/`next_sibling`
