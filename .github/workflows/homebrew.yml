@@ -23,7 +23,7 @@ name: Homebrew
 # binaries here and generating notes there don't conflict.
 #
 # Prerequisite before the first tagged release succeeds: add a HOMEBREW_TAP_TOKEN
-# secret to this repo — a PAT with contents:write on adammharris/homebrew-tap.
+# secret to this repo — a PAT with contents:write on diaryx-org/homebrew-tap.
 on:
   push: { tags: [v*.*.*] }
   workflow_dispatch: null
@@ -87,7 +87,7 @@ jobs:
     - name: Compute checksums and render the Homebrew formula
       run: |
         version="${GITHUB_REF_NAME#v}"
-        base="https://github.com/adammharris/twig/releases/download/${GITHUB_REF_NAME}"
+        base="https://github.com/diaryx-org/twig/releases/download/${GITHUB_REF_NAME}"
         mac_arm64_sha=$(curl -sL "$base/twig-macos-arm64.tar.gz" | sha256sum | cut -d' ' -f1)
         mac_x64_sha=$(curl -sL "$base/twig-macos-x86_64.tar.gz" | sha256sum | cut -d' ' -f1)
         linux_x64_sha=$(curl -sL "$base/twig-linux-x86_64.tar.gz" | sha256sum | cut -d' ' -f1)
@@ -95,28 +95,28 @@ jobs:
         cat > /tmp/twig.rb <<RUBY
         class Twig < Formula
           desc "Parse, query, edit, and losslessly round-trip Djot, Markdown, HTML, and XML documents"
-          homepage "https://github.com/adammharris/twig"
+          homepage "https://github.com/diaryx-org/twig"
           version "$version"
           license "MIT OR Apache-2.0"
 
           on_macos do
             on_arm do
-              url "https://github.com/adammharris/twig/releases/download/v$version/twig-macos-arm64.tar.gz"
+              url "https://github.com/diaryx-org/twig/releases/download/v$version/twig-macos-arm64.tar.gz"
               sha256 "$mac_arm64_sha"
             end
             on_intel do
-              url "https://github.com/adammharris/twig/releases/download/v$version/twig-macos-x86_64.tar.gz"
+              url "https://github.com/diaryx-org/twig/releases/download/v$version/twig-macos-x86_64.tar.gz"
               sha256 "$mac_x64_sha"
             end
           end
 
           on_linux do
             on_arm do
-              url "https://github.com/adammharris/twig/releases/download/v$version/twig-linux-aarch64.tar.gz"
+              url "https://github.com/diaryx-org/twig/releases/download/v$version/twig-linux-aarch64.tar.gz"
               sha256 "$linux_arm64_sha"
             end
             on_intel do
-              url "https://github.com/adammharris/twig/releases/download/v$version/twig-linux-x86_64.tar.gz"
+              url "https://github.com/diaryx-org/twig/releases/download/v$version/twig-linux-x86_64.tar.gz"
               sha256 "$linux_x64_sha"
             end
           end
@@ -133,7 +133,7 @@ jobs:
     - name: Push to the tap
       env: { COMMITTER_TOKEN: '${{ secrets.HOMEBREW_TAP_TOKEN }}' }
       run: |
-        git clone "https://x-access-token:${COMMITTER_TOKEN}@github.com/adammharris/homebrew-tap" tap
+        git clone "https://x-access-token:${COMMITTER_TOKEN}@github.com/diaryx-org/homebrew-tap" tap
         cp /tmp/twig.rb tap/Formula/twig.rb
         cd tap
         git config user.name "github-actions[bot]"
