@@ -420,6 +420,11 @@ unsafe extern "C" {
         container_kind: c_int,
         out_change: *mut TwigChange,
     ) -> TwigStatus;
+    pub fn twig_editor_renumber_ordered_lists(
+        editor: *mut TwigEditor,
+        offset: usize,
+        out_change: *mut TwigChange,
+    ) -> TwigStatus;
     pub fn twig_editor_insert_link(
         editor: *mut TwigEditor,
         start: usize,

@@ -700,6 +700,20 @@ TwigStatus twig_editor_toggle_block_container(
     TwigChange *out_change
 );
 
+// Renumber the ordered list at `offset` so its markers run 1, 2, 3, …, each
+// nesting level restarting at 1 — the numbering a caret editor keeps as items
+// are inserted, deleted, and nested (a plain splice leaves `1. 2. 2. 3.`).
+// TWIG_STATUS_NOT_FOUND when `offset` is not inside an ordered list. When the
+// numbering is already sequential this is a no-op that still returns
+// TWIG_STATUS_OK; out_change then reports the most recent prior edit (or is left
+// untouched when there is none), so OK is not proof the source moved. Fills
+// out_change on success if non-NULL.
+TwigStatus twig_editor_renumber_ordered_lists(
+    TwigEditor *editor,
+    size_t offset,
+    TwigChange *out_change
+);
+
 // Link [start, end) to `destination` — `[text](destination)`. Djot and Markdown
 // only, else TWIG_STATUS_UNSUPPORTED_FORMAT. TWIG_STATUS_INVALID_ARGUMENT for a
 // bad range, a NULL destination with a non-zero length, or a destination holding

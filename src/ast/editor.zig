@@ -294,6 +294,50 @@ pub const Editor = struct {
         return self.commitSplice(region_start, region_end, out.items);
     }
 
+    /// Renumber the ordered list at `offset` so its markers run `1, 2, 3, …`,
+    /// with each nesting level restarting at 1 — the numbering a caret editor
+    /// keeps as items are inserted, deleted, and nested, where a plain splice
+    /// leaves the source numbers stale (`1. 2. 2. 3.`). A no-op that returns
+    /// `error.NoBlock` when `offset` is not inside an ordered list.
+    ///
+    /// Numbering tracks the marker's INDENTATION, not the AST: one left-to-right
+    /// pass with a small stack of (indent column → next number), so a sub-list
+    /// restarts and its parent resumes where it left off. Only the numeric run of
+    /// a `N.` / `N)` marker is rewritten; its delimiter, spacing, indentation, and
+    /// every non-item (bullet, continuation, blank) line are copied byte-for-byte.
+    pub fn renumberOrderedLists(self: *Editor, offset: usize) Error!void {
+        const src = self.sourceBytes();
+        if (offset > src.len) return error.InvalidRange;
+        const ast = self.astView();
+        const allocator = self.splicer.allocator;
+
+        // The OUTERMOST ordered list on the descent to `offset`: renumber the
+        // whole nest under it in one pass so its levels stay consistent.
+        var chain: std.ArrayList(AST.Node.Id) = .empty;
+        defer chain.deinit(allocator);
+        locate.ancestorChain(allocator, ast, offset, src.len, &chain) catch
+            return error.OutOfMemory;
+        var outer: ?AST.Node.Id = null;
+        for (chain.items) |id| {
+            if (std.meta.activeTag(ast.nodes[id].kind) == .ordered_list) {
+                outer = id;
+                break;
+            }
+        }
+        const list = outer orelse return error.NoBlock;
+
+        const region_start = locate.lineStartAt(src, ast.nodes[list].span.start);
+        const region_end = locate.lineEndAt(src, ast.nodes[list].span.end -| 1);
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try buildRenumber(allocator, src, region_start, region_end, &out);
+
+        // Identical bytes: don't spend an edit (and an undo step) on a no-op.
+        if (std.mem.eql(u8, out.items, src[region_start..region_end])) return;
+        return self.commitSplice(region_start, region_end, out.items);
+    }
+
     // ── Links ──────────────────────────────────────────────────────────────
 
     /// Link `[start, end)` to `destination`, or repoint the link already there.
@@ -745,6 +789,74 @@ fn buildListRewrite(
         }
         line_start = line_end;
     }
+}
+
+/// One left-to-right rewrite of `[region_start, region_end)` that renumbers
+/// ordered-list items by their indentation depth — the body of
+/// [`Editor.renumberOrderedLists`], where its reasoning lives.
+fn buildRenumber(
+    allocator: Allocator,
+    src: []const u8,
+    region_start: usize,
+    region_end: usize,
+    out: *std.ArrayList(u8),
+) !void {
+    // A small stack of (indent column, next number), one entry per open nesting
+    // level. Documents don't nest lists dozens deep; 32 is plenty and keeps this
+    // allocation-free. A level deeper than 32 just isn't renumbered (copied).
+    var cols: [32]usize = undefined;
+    var nums: [32]u32 = undefined;
+    var depth: usize = 0;
+
+    var line_start = region_start;
+    while (line_start < region_end) {
+        const line_end = locate.lineEndAt(src, line_start);
+        const line = src[line_start..line_end];
+        const m = listMarkerAt(line);
+        const numbered = if (m) |mm| isNumberedMarker(line[mm.start..mm.end]) else false;
+        if (numbered) {
+            const mm = m.?;
+            const indent = mm.start; // columns of leading whitespace
+            // Drop levels deeper than this item; then resume this level or open it.
+            while (depth > 0 and cols[depth - 1] > indent) depth -= 1;
+            var number: u32 = 1;
+            if (depth > 0 and cols[depth - 1] == indent) {
+                number = nums[depth - 1];
+                nums[depth - 1] += 1;
+            } else if (depth < cols.len) {
+                cols[depth] = indent;
+                nums[depth] = 2; // this item is 1; its next sibling will be 2
+                depth += 1;
+            }
+            // Emit: indentation, an optional `(`, the new number, then the
+            // delimiter and everything after it verbatim.
+            try out.appendSlice(allocator, line[0..mm.start]);
+            var d = mm.start;
+            if (d < line.len and line[d] == '(') {
+                try out.append(allocator, '(');
+                d += 1;
+            }
+            var num_buf: [16]u8 = undefined;
+            const digits = std.fmt.bufPrint(&num_buf, "{d}", .{number}) catch unreachable;
+            try out.appendSlice(allocator, digits);
+            var k = d;
+            while (k < line.len and line[k] >= '0' and line[k] <= '9') k += 1;
+            try out.appendSlice(allocator, line[k..]);
+        } else {
+            // A bullet item, a continuation line, or a blank line: verbatim. A
+            // bullet doesn't disturb the ordered counters at other columns.
+            try out.appendSlice(allocator, line);
+        }
+        line_start = line_end;
+    }
+}
+
+/// Whether a marker (as returned by `listMarkerAt`) is an ordered one — a run of
+/// digits, allowing a leading `(` for the `(1)` form — rather than a bullet.
+fn isNumberedMarker(marker: []const u8) bool {
+    var j: usize = 0;
+    if (j < marker.len and marker[j] == '(') j += 1;
+    return j < marker.len and marker[j] >= '0' and marker[j] <= '9';
 }
 
 // ── Link internals ─────────────────────────────────────────────────────────

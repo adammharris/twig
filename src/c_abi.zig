@@ -1783,6 +1783,26 @@ pub export fn twig_editor_toggle_block_container(
     return .ok;
 }
 
+/// Renumber the ordered list at `offset` so its markers run `1, 2, 3, …` — see
+/// `twig.Editor.renumberOrderedLists`. `not_found` when `offset` is not inside an
+/// ordered list. When the numbering is already sequential this is a no-op that
+/// still returns `.ok`; `out_change` then reports the most recent prior edit (or
+/// is left untouched when there is none), so a caller must not treat a `.ok`
+/// return as proof the source moved.
+pub export fn twig_editor_renumber_ordered_lists(
+    ed: ?*TwigEditor,
+    offset: usize,
+    out_change: ?*TwigChange,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const handle = asEditor(raw);
+    handle.editor.renumberOrderedLists(offset) catch |err| return statusOfEditorError(err);
+    if (out_change) |slot| {
+        if (handle.editor.lastChange()) |c| slot.* = changeC(c);
+    }
+    return .ok;
+}
+
 // ── Links ────────────────────────────────────────────────────────────────────
 // The engine — the per-format escape alphabets, the autolink spelling, the
 // link/autolink node reasoning — is `twig.Editor.insertLink`.

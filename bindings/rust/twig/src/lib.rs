@@ -851,6 +851,24 @@ impl Editor {
         })
     }
 
+    /// Renumber the ordered list at byte `offset` so its markers run `1, 2, 3, …`,
+    /// each nesting level restarting at 1 — the numbering a caret editor keeps as
+    /// items are inserted, deleted, and nested, where a raw splice leaves the
+    /// source numbers stale (`1. 2. 2. 3.`). Djot and Markdown; the display of an
+    /// ordered list is renumbered by any CommonMark renderer regardless, so this
+    /// is source hygiene, not a render fix.
+    ///
+    /// [`Error::NotFound`] when `offset` is not inside an ordered list. When the
+    /// numbering is already sequential this is a no-op that still returns `Ok` —
+    /// the source is left byte-for-byte unchanged. The `Change` is not returned
+    /// because a no-op has none; re-read [`Editor::source_str`] for the result.
+    pub fn renumber_ordered_lists(&mut self, offset: usize) -> Result<(), Error> {
+        self.change_op(|ed, out| unsafe {
+            ffi::twig_editor_renumber_ordered_lists(ed, offset, out)
+        })?;
+        Ok(())
+    }
+
     /// Link `[start, end)` to `destination` — `[text](destination)`. Djot and
     /// Markdown only, else [`Error::UnsupportedFormat`];
     /// [`Error::InvalidArgument`] for a bad range or a destination containing a
@@ -2243,6 +2261,20 @@ mod tests {
         ed.undo().expect("undo ok").expect("something to undo");
         assert_eq!(ed.source_str().unwrap(), "\n");
         assert_eq!(ed.caret_blob().unwrap(), b"c0");
+    }
+
+    #[test]
+    fn editor_renumber_ordered_lists_fixes_a_stale_sequence() {
+        let mut ed =
+            Editor::new_str("1. a\n2. x\n2. b\n3. c\n", Format::Markdown).expect("editor");
+        ed.renumber_ordered_lists(0).expect("renumber ok");
+        assert_eq!(ed.source_str().unwrap(), "1. a\n2. x\n3. b\n4. c\n");
+    }
+
+    #[test]
+    fn editor_renumber_ordered_lists_off_a_list_is_not_found() {
+        let mut ed = Editor::new_str("a paragraph\n", Format::Markdown).expect("editor");
+        assert!(matches!(ed.renumber_ordered_lists(2), Err(Error::NotFound)));
     }
 
     #[test]

@@ -324,6 +324,34 @@ test "toggle_block_container: a list's continuation lines follow the new marker 
     try fx.expectSource("1. a\n   b\n");
 }
 
+test "renumberOrderedLists: makes a drifted sequence sequential" {
+    // The `1. 2. 2. 3.` a caret editor leaves after inserting an item mid-list.
+    var fx = try Fixture.init("1. a\n2. x\n2. b\n3. c\n", .markdown);
+    defer fx.deinit();
+    try fx.ed.renumberOrderedLists(0);
+    try fx.expectSource("1. a\n2. x\n3. b\n4. c\n");
+}
+
+test "renumberOrderedLists: each nesting level restarts at 1" {
+    var fx = try Fixture.init("1. a\n   5. b\n   9. c\n3. d\n", .markdown);
+    defer fx.deinit();
+    try fx.ed.renumberOrderedLists(0);
+    try fx.expectSource("1. a\n   1. b\n   2. c\n2. d\n");
+}
+
+test "renumberOrderedLists: leaves bullets and already-sequential lists alone" {
+    var fx = try Fixture.init("- a\n- b\n", .markdown);
+    defer fx.deinit();
+    // A bullet list at the offset isn't an ordered list: nothing to do.
+    try testing.expectError(error.NoBlock, fx.ed.renumberOrderedLists(0));
+}
+
+test "renumberOrderedLists: not inside an ordered list is NoBlock" {
+    var fx = try Fixture.init("just a paragraph\n", .markdown);
+    defer fx.deinit();
+    try testing.expectError(error.NoBlock, fx.ed.renumberOrderedLists(3));
+}
+
 test "toggle_block_container: a range covering no block is NoBlock" {
     var fx = try Fixture.init("a\n\nb\n", .djot);
     defer fx.deinit();
