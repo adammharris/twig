@@ -141,6 +141,33 @@ test "renders a simple paragraph with emphasis" {
     try testing.expectEqualStrings("<p>hello <em>world</em></p>\n", html);
 }
 
+test "a top-level block quote after a list is a sibling of the list, not nested in it" {
+    // `- item\n\n> quote`: the unindented `>` opens a new block quote beside the
+    // list, closing it. Not covered by the CommonMark spec suite; regression for
+    // a `>` block start that forgot to close the open list first.
+    var doc = try markdown.parse(testing.allocator, "- item\n\n> quote\n", .{});
+    defer doc.deinit();
+    const html = try renderAlloc(testing.allocator, &doc, .{});
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings(
+        "<ul>\n<li>item</li>\n</ul>\n<blockquote>\n<p>quote</p>\n</blockquote>\n",
+        html,
+    );
+}
+
+test "a block quote indented into a list item stays inside the item" {
+    // The companion case: indented to the item's content column, the `>` is the
+    // item's own second block, so it must NOT close the list.
+    var doc = try markdown.parse(testing.allocator, "- item\n\n  > quote\n", .{});
+    defer doc.deinit();
+    const html = try renderAlloc(testing.allocator, &doc, .{});
+    defer testing.allocator.free(html);
+    try testing.expectEqualStrings(
+        "<ul>\n<li>\n<p>item</p>\n<blockquote>\n<p>quote</p>\n</blockquote>\n</li>\n</ul>\n",
+        html,
+    );
+}
+
 test "footnote: a reference + definition render the noteref, sup, and endnotes section" {
     var doc = try markdown.parse(testing.allocator,
         \\text[^a] more

@@ -1961,6 +1961,12 @@ pub const Parser = struct {
 
                 if (s.len > 0 and s[0] == '>') {
                     if (interrupting) try self.closeLeaf(idx);
+                    // Close an open list first, exactly as every other non-list block
+                    // start does: a top-level `>` after a list (`- x\n\n> y`) is a new
+                    // block quote beside the list, not a child of it. `maybeCloseTopList`
+                    // no-ops when we're genuinely inside a list item (an indented `>`),
+                    // where the top container is the `.list_item`, not the `.list`.
+                    try self.maybeCloseTopList(idx, null);
                     self.markListsLoose();
                     try self.pushContainer(.block_quote, idx);
                     cur = matchBlockQuote(line, cur).?;
