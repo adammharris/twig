@@ -869,6 +869,56 @@ impl Editor {
         Ok(())
     }
 
+    // ── Tables ───────────────────────────────────────────────────────────────
+    // Structural editing of the pipe table at a byte `offset`: the caret's cell
+    // is the anchor. The whole table is re-spelled and spliced in one edit, so a
+    // caller re-reads [`Editor::source_str`] and re-places its caret rather than
+    // leaning on the returned span. [`Error::NotFound`] when `offset` is not in a
+    // table; [`Error::NotEditable`] for a refused (degenerate) edit.
+
+    /// Insert an empty row below (`below`) or above the caret's row.
+    pub fn table_insert_row(&mut self, offset: usize, below: bool) -> Result<(), Error> {
+        self.table_edit(offset, ffi::TWIG_TABLE_INSERT_ROW, below as c_int)
+    }
+
+    /// Delete the caret's row. [`Error::NotEditable`] for the header row or the
+    /// last remaining body row.
+    pub fn table_delete_row(&mut self, offset: usize) -> Result<(), Error> {
+        self.table_edit(offset, ffi::TWIG_TABLE_DELETE_ROW, 0)
+    }
+
+    /// Insert an empty column right (`right`) or left of the caret's column.
+    pub fn table_insert_column(&mut self, offset: usize, right: bool) -> Result<(), Error> {
+        self.table_edit(offset, ffi::TWIG_TABLE_INSERT_COLUMN, right as c_int)
+    }
+
+    /// Delete the caret's column. [`Error::NotEditable`] when it is the only one.
+    pub fn table_delete_column(&mut self, offset: usize) -> Result<(), Error> {
+        self.table_edit(offset, ffi::TWIG_TABLE_DELETE_COLUMN, 0)
+    }
+
+    /// Set the caret's column to `alignment`.
+    pub fn table_set_alignment(&mut self, offset: usize, alignment: Alignment) -> Result<(), Error> {
+        self.table_edit(offset, ffi::TWIG_TABLE_SET_ALIGNMENT, alignment.to_c())
+    }
+
+    /// Move the caret's row one place down (`down`) or up, within the body rows.
+    pub fn table_move_row(&mut self, offset: usize, down: bool) -> Result<(), Error> {
+        self.table_edit(offset, ffi::TWIG_TABLE_MOVE_ROW, down as c_int)
+    }
+
+    /// Move the caret's column one place right (`right`) or left.
+    pub fn table_move_column(&mut self, offset: usize, right: bool) -> Result<(), Error> {
+        self.table_edit(offset, ffi::TWIG_TABLE_MOVE_COLUMN, right as c_int)
+    }
+
+    fn table_edit(&mut self, offset: usize, op: c_int, arg: c_int) -> Result<(), Error> {
+        self.change_op(|ed, out| unsafe {
+            ffi::twig_editor_table_edit(ed, offset, op, arg, out)
+        })?;
+        Ok(())
+    }
+
     /// Link `[start, end)` to `destination` — `[text](destination)`. Djot and
     /// Markdown only, else [`Error::UnsupportedFormat`];
     /// [`Error::InvalidArgument`] for a bad range or a destination containing a
@@ -2275,6 +2325,25 @@ mod tests {
     fn editor_renumber_ordered_lists_off_a_list_is_not_found() {
         let mut ed = Editor::new_str("a paragraph\n", Format::Markdown).expect("editor");
         assert!(matches!(ed.renumber_ordered_lists(2), Err(Error::NotFound)));
+    }
+
+    #[test]
+    fn editor_table_insert_row_and_set_alignment() {
+        let src = "| a | b |\n| --- | --- |\n| 1 | 2 |\n";
+        let mut ed = Editor::new_str(src, Format::Markdown).expect("editor");
+        ed.table_insert_row(24, true).expect("insert row"); // caret in body `1`
+        assert_eq!(
+            ed.source_str().unwrap(),
+            "| a | b |\n| --- | --- |\n| 1 | 2 |\n|  |  |\n"
+        );
+        ed.table_set_alignment(6, Alignment::Center).expect("align"); // column `b`
+        assert!(ed.source_str().unwrap().contains("| --- | :---: |"));
+    }
+
+    #[test]
+    fn editor_table_edit_off_a_table_is_not_found() {
+        let mut ed = Editor::new_str("nope\n", Format::Markdown).expect("editor");
+        assert!(matches!(ed.table_delete_row(2), Err(Error::NotFound)));
     }
 
     #[test]

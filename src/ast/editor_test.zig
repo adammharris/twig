@@ -352,6 +352,77 @@ test "renumberOrderedLists: not inside an ordered list is NoBlock" {
     try testing.expectError(error.NoBlock, fx.ed.renumberOrderedLists(3));
 }
 
+// ── Tables ───────────────────────────────────────────────────────────────────
+
+const table_src = "| a | b |\n| --- | --- |\n| 1 | 2 |\n";
+
+test "tableInsertRow: adds an empty body row below the caret's row" {
+    var fx = try Fixture.init(table_src, .markdown);
+    defer fx.deinit();
+    try fx.ed.tableInsertRow(2, true); // caret in header cell `a`
+    try fx.expectSource("| a | b |\n| --- | --- |\n|  |  |\n| 1 | 2 |\n");
+}
+
+test "tableDeleteRow: removes the caret's body row" {
+    var fx = try Fixture.init("| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n", .markdown);
+    defer fx.deinit();
+    try fx.ed.tableDeleteRow(24); // caret in the `1` cell (first body row)
+    try fx.expectSource("| a | b |\n| --- | --- |\n| 3 | 4 |\n");
+}
+
+test "tableDeleteRow: refuses the header row" {
+    var fx = try Fixture.init(table_src, .markdown);
+    defer fx.deinit();
+    try testing.expectError(error.NotEditable, fx.ed.tableDeleteRow(2));
+}
+
+test "tableInsertColumn: adds an empty column to every row and the delimiter" {
+    var fx = try Fixture.init(table_src, .markdown);
+    defer fx.deinit();
+    try fx.ed.tableInsertColumn(2, true); // right of column `a`
+    try fx.expectSource("| a |  | b |\n| --- | --- | --- |\n| 1 |  | 2 |\n");
+}
+
+test "tableDeleteColumn: drops the caret's column from every row" {
+    var fx = try Fixture.init(table_src, .markdown);
+    defer fx.deinit();
+    try fx.ed.tableDeleteColumn(6); // caret in column `b`
+    try fx.expectSource("| a |\n| --- |\n| 1 |\n");
+}
+
+test "tableDeleteColumn: refuses the last column" {
+    var fx = try Fixture.init("| a |\n| --- |\n| 1 |\n", .markdown);
+    defer fx.deinit();
+    try testing.expectError(error.NotEditable, fx.ed.tableDeleteColumn(2));
+}
+
+test "tableSetAlignment: respells the delimiter for the caret's column" {
+    var fx = try Fixture.init(table_src, .markdown);
+    defer fx.deinit();
+    try fx.ed.tableSetAlignment(6, .center); // column `b`
+    try fx.expectSource("| a | b |\n| --- | :---: |\n| 1 | 2 |\n");
+}
+
+test "tableMoveColumn: swaps two columns, content and alignment together" {
+    var fx = try Fixture.init("| a | b |\n| :--- | ---: |\n| 1 | 2 |\n", .markdown);
+    defer fx.deinit();
+    try fx.ed.tableMoveColumn(2, true); // move `a` right
+    try fx.expectSource("| b | a |\n| ---: | :--- |\n| 2 | 1 |\n");
+}
+
+test "tableMoveRow: swaps two body rows" {
+    var fx = try Fixture.init("| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n", .markdown);
+    defer fx.deinit();
+    try fx.ed.tableMoveRow(24, true); // move first body row down
+    try fx.expectSource("| a | b |\n| --- | --- |\n| 3 | 4 |\n| 1 | 2 |\n");
+}
+
+test "table ops off a table are NoBlock" {
+    var fx = try Fixture.init("just a paragraph\n", .markdown);
+    defer fx.deinit();
+    try testing.expectError(error.NoBlock, fx.ed.tableInsertRow(3, true));
+}
+
 test "toggle_block_container: a range covering no block is NoBlock" {
     var fx = try Fixture.init("a\n\nb\n", .djot);
     defer fx.deinit();

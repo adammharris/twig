@@ -714,6 +714,33 @@ TwigStatus twig_editor_renumber_ordered_lists(
     TwigChange *out_change
 );
 
+// Table ops for twig_editor_table_edit's `op` argument. `arg` is the gesture's
+// parameter: for insert/move a side (0 = before/up/left, 1 = after/down/right),
+// for TWIG_TABLE_SET_ALIGNMENT a TwigAlignment, ignored for the deletes.
+typedef enum {
+    TWIG_TABLE_INSERT_ROW = 0,
+    TWIG_TABLE_DELETE_ROW = 1,
+    TWIG_TABLE_INSERT_COLUMN = 2,
+    TWIG_TABLE_DELETE_COLUMN = 3,
+    TWIG_TABLE_SET_ALIGNMENT = 4,
+    TWIG_TABLE_MOVE_ROW = 5,
+    TWIG_TABLE_MOVE_COLUMN = 6
+} TwigTableOp;
+
+// Edit the table at `offset` — add/remove/move a row or column, or set a
+// column's alignment. `op` is a TwigTableOp; `arg` is its parameter (see the
+// enum). The whole table is re-spelled and spliced in one edit.
+// TWIG_STATUS_NOT_FOUND when `offset` is not inside a table;
+// TWIG_STATUS_NOT_EDITABLE for a refused edit (deleting the header row, the last
+// body row, or the last column). Fills out_change on success if non-NULL.
+TwigStatus twig_editor_table_edit(
+    TwigEditor *editor,
+    size_t offset,
+    int op,
+    int arg,
+    TwigChange *out_change
+);
+
 // Link [start, end) to `destination` — `[text](destination)`. Djot and Markdown
 // only, else TWIG_STATUS_UNSUPPORTED_FORMAT. TWIG_STATUS_INVALID_ARGUMENT for a
 // bad range, a NULL destination with a non-zero length, or a destination holding

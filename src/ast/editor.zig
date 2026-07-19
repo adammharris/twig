@@ -42,6 +42,7 @@ const Allocator = std.mem.Allocator;
 const AST = @import("ast.zig");
 const Span = @import("../span.zig");
 const locate = @import("locate.zig");
+const table_edit = @import("table_edit.zig");
 const syntax_mod = @import("../syntax.zig");
 
 pub const Splicer = @import("splicer.zig").Splicer;
@@ -336,6 +337,96 @@ pub const Editor = struct {
         // Identical bytes: don't spend an edit (and an undo step) on a no-op.
         if (std.mem.eql(u8, out.items, src[region_start..region_end])) return;
         return self.commitSplice(region_start, region_end, out.items);
+    }
+
+    // ── Tables ───────────────────────────────────────────────────────────────
+    // A table is a grid, not a run of delimited text, so its edits are grid
+    // surgery (add/remove/move a row or column, set a column's alignment) rather
+    // than a toggle. The grid is lifted from the AST, mutated, and the whole
+    // table re-spelled in one splice — see `table_edit.zig`. Every gesture is
+    // addressed by a caret `offset`; the cell it lands in is the anchor.
+
+    /// Insert an empty row below (`after`) or above the caret's row.
+    pub fn tableInsertRow(self: *Editor, offset: usize, after: bool) Error!void {
+        return self.tableEdit(offset, .{ .insert_row = if (after) .after else .before });
+    }
+
+    /// Delete the caret's row. `error.NotEditable` for a header row or the last
+    /// body row (a table keeps a header and at least one body row).
+    pub fn tableDeleteRow(self: *Editor, offset: usize) Error!void {
+        return self.tableEdit(offset, .delete_row);
+    }
+
+    /// Insert an empty column right (`after`) or left of the caret's column.
+    pub fn tableInsertColumn(self: *Editor, offset: usize, after: bool) Error!void {
+        return self.tableEdit(offset, .{ .insert_column = if (after) .after else .before });
+    }
+
+    /// Delete the caret's column. `error.NotEditable` when it is the only one.
+    pub fn tableDeleteColumn(self: *Editor, offset: usize) Error!void {
+        return self.tableEdit(offset, .delete_column);
+    }
+
+    /// Set the caret's column to `alignment`.
+    pub fn tableSetAlignment(self: *Editor, offset: usize, alignment: AST.Alignment) Error!void {
+        return self.tableEdit(offset, .{ .set_alignment = alignment });
+    }
+
+    /// Move the caret's row one place down (`down`) or up, within the body rows.
+    pub fn tableMoveRow(self: *Editor, offset: usize, down: bool) Error!void {
+        return self.tableEdit(offset, .{ .move_row = if (down) .after else .before });
+    }
+
+    /// Move the caret's column one place right (`right`) or left.
+    pub fn tableMoveColumn(self: *Editor, offset: usize, right: bool) Error!void {
+        return self.tableEdit(offset, .{ .move_column = if (right) .after else .before });
+    }
+
+    const TableOp = union(enum) {
+        insert_row: table_edit.Side,
+        delete_row,
+        insert_column: table_edit.Side,
+        delete_column,
+        set_alignment: AST.Alignment,
+        move_row: table_edit.Side,
+        move_column: table_edit.Side,
+    };
+
+    /// Lift the table at `offset`, apply one grid op, and splice the rebuilt
+    /// table back — the shared body of every table gesture above.
+    fn tableEdit(self: *Editor, offset: usize, op: TableOp) Error!void {
+        const src = self.sourceBytes();
+        if (offset > src.len) return error.InvalidRange;
+        const ast = self.astView();
+        const allocator = self.splicer.allocator;
+
+        var grid = table_edit.extract(allocator, ast, src, offset) catch |e| return mapTableErr(e);
+        defer grid.deinit();
+
+        (switch (op) {
+            .insert_row => |s| table_edit.insertRow(&grid, s),
+            .delete_row => table_edit.deleteRow(&grid),
+            .insert_column => |s| table_edit.insertColumn(&grid, s),
+            .delete_column => table_edit.deleteColumn(&grid),
+            .set_alignment => |a| table_edit.setAlignment(&grid, a),
+            .move_row => |d| table_edit.moveRow(&grid, d),
+            .move_column => |d| table_edit.moveColumn(&grid, d),
+        }) catch |e| return mapTableErr(e);
+
+        const bytes = table_edit.emit(allocator, &grid) catch |e| return mapTableErr(e);
+        defer allocator.free(bytes);
+        return self.commitSplice(grid.region.start, grid.region.end, bytes);
+    }
+
+    /// Map a `table_edit` error onto the `Editor` error set: "not in a table"
+    /// reads as no block for the gesture, a refused (degenerate) edit as not
+    /// editable.
+    fn mapTableErr(e: table_edit.Error) Error {
+        return switch (e) {
+            error.NotInTable => error.NoBlock,
+            error.Refused => error.NotEditable,
+            error.OutOfMemory => error.OutOfMemory,
+        };
     }
 
     // ── Links ──────────────────────────────────────────────────────────────

@@ -1803,6 +1803,56 @@ pub export fn twig_editor_renumber_ordered_lists(
     return .ok;
 }
 
+// ── Tables ───────────────────────────────────────────────────────────────────
+// The engine — grid extraction, the mutations, the re-spelled delimiter — is
+// `twig.Editor`'s `table*` gestures over `table_edit.zig`. One entry point
+// carries them all: `op` picks the gesture, `arg` its parameter.
+
+/// The `op` codes for `twig_editor_table_edit` (the wire contract, mirrored by
+/// `TwigTableOp` in `twig.h`).
+const TwigTableOp = enum(c_int) {
+    insert_row = 0,
+    delete_row = 1,
+    insert_column = 2,
+    delete_column = 3,
+    set_alignment = 4,
+    move_row = 5,
+    move_column = 6,
+};
+
+/// Edit the table at `offset`. `op` names the gesture; `arg` is its parameter:
+/// for insert/move a side (0 = before/up/left, 1 = after/down/right), for
+/// set_alignment a `TwigAlignment`, and ignored for the deletes. `not_found`
+/// when `offset` is not in a table, `not_editable` for a refused (degenerate)
+/// edit. Fills out_change on success if non-NULL.
+pub export fn twig_editor_table_edit(
+    ed: ?*TwigEditor,
+    offset: usize,
+    op: c_int,
+    arg: c_int,
+    out_change: ?*TwigChange,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const handle = asEditor(raw);
+    const e = &handle.editor;
+    const result: twig.Editor.Error!void = switch (op) {
+        @intFromEnum(TwigTableOp.insert_row) => e.tableInsertRow(offset, arg != 0),
+        @intFromEnum(TwigTableOp.delete_row) => e.tableDeleteRow(offset),
+        @intFromEnum(TwigTableOp.insert_column) => e.tableInsertColumn(offset, arg != 0),
+        @intFromEnum(TwigTableOp.delete_column) => e.tableDeleteColumn(offset),
+        @intFromEnum(TwigTableOp.set_alignment) => e.tableSetAlignment(
+            offset,
+            alignmentOf(arg) orelse return .invalid_argument,
+        ),
+        @intFromEnum(TwigTableOp.move_row) => e.tableMoveRow(offset, arg != 0),
+        @intFromEnum(TwigTableOp.move_column) => e.tableMoveColumn(offset, arg != 0),
+        else => return .invalid_argument,
+    };
+    result catch |err| return statusOfEditorError(err);
+    if (out_change) |slot| slot.* = changeC(handle.editor.lastChange().?);
+    return .ok;
+}
+
 // ── Links ────────────────────────────────────────────────────────────────────
 // The engine — the per-format escape alphabets, the autolink spelling, the
 // link/autolink node reasoning — is `twig.Editor.insertLink`.
