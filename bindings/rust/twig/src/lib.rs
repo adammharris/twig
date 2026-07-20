@@ -1007,6 +1007,23 @@ impl Editor {
         })
     }
 
+    /// Insert a hard line break *inside a table cell* at `offset`, spelled the
+    /// format's way (`<br>` for Markdown). A table row is one source line, so the
+    /// ordinary newline-based hard break can't appear there; the spliced `<br>`
+    /// reparses as a semantic `hard_break` node — not opaque raw HTML — so the
+    /// break reads back as structure. Like the other gestures it leans on the
+    /// splice+reparse+rollback backstop: a break that would no longer parse as the
+    /// same table yields [`Error::EditConflict`] and changes nothing.
+    ///
+    /// Returns [`Error::UnsupportedFormat`] for a format with no in-cell break
+    /// spelling — djot (no idiomatic in-cell break), HTML and XML (parse-only);
+    /// [`Error::NotFound`] when `offset` is not inside a table cell (only the
+    /// in-cell gesture is spelled today); and [`Error::InvalidArgument`] when
+    /// `offset` is past the source.
+    pub fn insert_line_break(&mut self, offset: usize) -> Result<Change, Error> {
+        self.change_op(|ed, out| unsafe { ffi::twig_editor_insert_line_break(ed, offset, out) })
+    }
+
     /// Shared plumbing for the change-returning ops: run `op` (which fills a
     /// `TwigChange` out-param) and wrap the result.
     fn change_op(
@@ -2265,6 +2282,36 @@ mod tests {
 
         let mut xml = Editor::new_str("<a>hi</a>", Format::Xml).expect("editor");
         assert_eq!(xml.insert_literal(3, "x"), Err(Error::UnsupportedFormat));
+    }
+
+    #[test]
+    fn editor_insert_line_break_splices_in_cell_br() {
+        let mut ed =
+            Editor::new_str("| a | b |\n| --- | --- |\n", Format::Markdown).expect("editor");
+        // Caret just after `a` in the header cell.
+        ed.insert_line_break(3).expect("line break");
+        assert_eq!(ed.source_str().unwrap(), "| a<br> | b |\n| --- | --- |\n");
+        // The break reads back as a semantic node, not raw HTML.
+        let nodes = ed.nodes().expect("nodes");
+        assert!(nodes.iter().any(|n| n.kind == "hard_break"));
+        assert!(!nodes.iter().any(|n| n.kind == "raw_inline"));
+    }
+
+    #[test]
+    fn editor_insert_line_break_rejects_off_cell_off_format_and_bad_offset() {
+        // Not inside a cell → NotFound.
+        let mut para = Editor::new_str("just text\n", Format::Markdown).expect("editor");
+        assert_eq!(para.insert_line_break(3), Err(Error::NotFound));
+
+        // Djot has no in-cell break spelling → UnsupportedFormat.
+        let mut dj =
+            Editor::new_str("| a | b |\n| --- | --- |\n", Format::Djot).expect("editor");
+        assert_eq!(dj.insert_line_break(3), Err(Error::UnsupportedFormat));
+
+        // Out-of-range offset → InvalidArgument.
+        let mut ed =
+            Editor::new_str("| a | b |\n| --- | --- |\n", Format::Markdown).expect("editor");
+        assert_eq!(ed.insert_line_break(9999), Err(Error::InvalidArgument));
     }
 
     #[test]

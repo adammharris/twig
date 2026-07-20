@@ -1,11 +1,62 @@
 ---
 title: "Proposal: hard line breaks inside table cells"
-status: draft
+status: implemented
 author: adammharris
 created: 2026-07-19
 ---
 
 # Hard line breaks inside table cells
+
+## Update (2026-07-20): decisions & scope
+
+The open questions below are resolved for the first landing. Scope: **Markdown
+and HTML supported, djot deliberately not.**
+
+- **Djot → `cell_line_break = null` (open question 1: option A, *not* the draft's
+  recommended B).** Option B (`<br>` for djot too) buys shallow uniformity at a
+  real fidelity cost: a bare `<br>` isn't idiomatic djot, and the moment the
+  document leaves twig it renders as the literal text `<br>` in any other djot
+  implementation — a silent data-loss bug, strictly worse than an honest "this
+  format can't spell it." Option A is also the reversible choice: if djot ever
+  standardizes an in-cell break we fill in the real spelling with zero migration,
+  whereas B leaves twig-only documents in the wild that can't be walked back. So
+  `insertLineBreak` in a djot cell is `error.UnsupportedFormat`, and the frontend
+  degrades (disable / space-substitute), exactly as it already must for other
+  ragged gestures. A house-dialect escape hatch (option C) stays available later
+  as an *explicit* `options.dialect` opt-in — never the silent default.
+
+- **HTML is supported and needed no new machinery.** The HTML parser already
+  maps `<br>` → `hard_break` (`html/parser.zig:247`) and the HTML serializer
+  already emits `<br>` for `hard_break` (`html/serializer.zig:909`); an HTML cell
+  break already round-trips HTML → AST → HTML unchanged (the trailing newline the
+  serializer adds is insignificant HTML whitespace). HTML carries no `Syntax`
+  table (it is parse-only / unauthorable), so the editor op correctly reports
+  `error.UnsupportedFormat` for it — authoring is not the point, round-trip is.
+
+  Scope caveat, verified on the CLI: twig's HTML parser lowers `<table>`/`<tr>`/
+  `<td>` to **generic `element` nodes**, not the semantic `table`/`row`/`cell`
+  nodes the Markdown pipe-table path keys on. So HTML → Markdown does *not*
+  reconstruct a pipe table (the table passes through as raw HTML, and its
+  `hard_break` serializes via the ordinary arm) — that is a separate, pre-existing
+  limitation this proposal does not address. "HTML supported" here means the
+  HTML → AST → HTML round-trip of a cell break, not HTML → Markdown table
+  reconstruction. The Markdown serializer's `in_cell` branch only fires for a
+  `hard_break` that is a child of a real `cell` node.
+
+- **Round-trip goal is *canonicalizing*, not byte-preserving (open question 3).**
+  The narrow cell promotion accepts `<br>`, `<br/>`, and `<br />` and the
+  serializer emits the single spelling `<br>`, so the self-closing forms
+  normalize to `<br>`. The conformance assertion is "`canonical` output is
+  byte-stable and idempotent," not "input survives unchanged."
+
+- **The editor op is scoped to the in-cell gesture (open question 2).** `<br>`
+  → `hard_break` promotion fires **only** in table-cell context; headings and
+  other single-line inline contexts are unchanged for now. `insertLineBreak`
+  likewise only spells the *in-cell* break; a general (non-cell) hard-break
+  authoring gesture — which twig does not have today — is left as future work,
+  and the op reports `error.UnsupportedFormat` outside a cell.
+
+Everything from here down is the original draft, preserved for rationale.
 
 ## Summary
 

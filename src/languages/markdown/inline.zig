@@ -162,6 +162,24 @@ fn inlineSafeKind(kind: Node.Kind) bool {
     };
 }
 
+/// True when `tag` — a raw inline HTML tag with its angle brackets, already
+/// validated by `scanHtmlTag` — is a bare `<br>` void element in any of its
+/// spellings (`<br>`, `<br/>`, `<br />`, `<br >`), case-insensitively. Drives
+/// the narrow in-cell promotion (`Scanner.in_cell`): only a plain `<br>` becomes
+/// a `hard_break` there, so an attributed `<br class=…>` or any other void tag
+/// stays a `raw_inline` — the cell break is the one thing this position needs
+/// structural, and the 1:1 `<br>` round-trip depends on the spelling being plain.
+fn isBrTag(tag: []const u8) bool {
+    if (tag.len < 4 or tag[0] != '<' or tag[tag.len - 1] != '>') return false;
+    if (std.ascii.toLower(tag[1]) != 'b' or std.ascii.toLower(tag[2]) != 'r') return false;
+    // Between `br` and `>`: only optional whitespace and an optional `/`.
+    var j: usize = 3;
+    while (j < tag.len - 1 and (tag[j] == ' ' or tag[j] == '\t')) j += 1;
+    if (j < tag.len - 1 and tag[j] == '/') j += 1;
+    while (j < tag.len - 1 and (tag[j] == ' ' or tag[j] == '\t')) j += 1;
+    return j == tag.len - 1;
+}
+
 fn runScan(sc: *Scanner, text: []const u8) Allocator.Error![]Node.Id {
     const b = sc.b;
     var i: usize = 0;
@@ -261,7 +279,13 @@ fn runScan(sc: *Scanner, text: []const u8) Allocator.Error![]Node.Id {
                     i = end;
                 } else if (scanHtmlTag(text, i)) |end| {
                     try sc.flushBuf(i);
-                    if (!(sc.options.html_elements and try sc.promoteInlineHtml(text, i, end))) {
+                    // Promote a self-contained tag to a real node when
+                    // `html_elements` is on; independently, in a table cell,
+                    // narrowly promote just `<br>` to a `hard_break` so the
+                    // cell's only line-break spelling round-trips (`Scanner.in_cell`).
+                    const promote = sc.options.html_elements or
+                        (sc.in_cell and isBrTag(text[i..end]));
+                    if (!(promote and try sc.promoteInlineHtml(text, i, end))) {
                         const id = try b.addLeaf(.{ .raw_inline = .{ .format = "html", .text = text[i..end] } });
                         sc.setSpanIfMapped(id, i, end);
                         _ = try sc.appendItem(id);
@@ -642,6 +666,16 @@ pub const Scanner = struct {
     b: *Builder,
     link_refs: *const std.StringHashMapUnmanaged(Node.Id),
     options: Options = .{},
+    /// True while scanning the inline content of a table cell. A row is one
+    /// source line, so its break can't be spelled with a newline; GFM spells it
+    /// `<br>` instead. In cell context a `<br>` raw inline is promoted to a
+    /// `hard_break` (unconditionally — it is unambiguously a break, and the
+    /// spelling round-trips 1:1 via the serializer), so the token is a semantic
+    /// node the editor and downstream renderers can address. Outside a cell this
+    /// is `false` and a `<br>` stays a `raw_inline` under CommonMark/GFM, exactly
+    /// as before — the promotion is scoped to the one position that needs it.
+    /// Set per-block by `block.zig`'s `resolvePendingInline`.
+    in_cell: bool = false,
     /// Maps `text` offsets back to absolute source offsets -- see
     /// `Segment`'s doc comment. Empty (the default) means "no mapping is
     /// available at all", which every span-setting call below already
@@ -2347,6 +2381,67 @@ fn parseAndFinishMapped(text: []const u8, options: Options) !AST {
     defer b.allocator.free(children);
     const root = try b.addContainer(.para, children);
     return b.finish(root);
+}
+
+/// Parse `text` as the inline content of a *table cell* — the `in_cell` context
+/// `block.zig`'s `resolvePendingInline` sets, where a `<br>` promotes to a
+/// `hard_break`. Mirrors that call: a reused scanner with the flag set.
+fn parseCellAndFinish(text: []const u8) !AST {
+    var b = Builder.init(testing.allocator);
+    errdefer b.deinit();
+    var sc = initScanner(&b, &empty_refs, .{});
+    sc.in_cell = true;
+    defer sc.deinit();
+    const children = try scanReuse(&sc, text, &.{});
+    defer b.allocator.free(children);
+    const root = try b.addContainer(.{ .cell = .{ .head = false, .alignment = .default } }, children);
+    return b.finish(root);
+}
+
+fn nthKind(ast: *const AST, n: usize) ?std.meta.Tag(Node.Kind) {
+    var it = ast.children(ast.root);
+    var i: usize = 0;
+    while (it.next()) |child| : (i += 1) {
+        if (i == n) return std.meta.activeTag(child.kind);
+    }
+    return null;
+}
+
+test "in_cell: a <br> promotes to a hard_break (the cell's only line break)" {
+    var ast = try parseCellAndFinish("a<br>b");
+    defer ast.deinit();
+    try testing.expectEqual(@as(?std.meta.Tag(Node.Kind), .str), nthKind(&ast, 0));
+    try testing.expectEqual(@as(?std.meta.Tag(Node.Kind), .hard_break), nthKind(&ast, 1));
+    try testing.expectEqual(@as(?std.meta.Tag(Node.Kind), .str), nthKind(&ast, 2));
+}
+
+test "in_cell: the self-closing spellings all promote (they canonicalize to <br>)" {
+    for ([_][]const u8{ "a<br/>b", "a<br />b", "a<br >b", "a<BR>b" }) |src| {
+        var ast = try parseCellAndFinish(src);
+        defer ast.deinit();
+        try testing.expectEqual(@as(?std.meta.Tag(Node.Kind), .hard_break), nthKind(&ast, 1));
+    }
+}
+
+test "in_cell: only <br> promotes — another void tag stays raw_inline" {
+    // The promotion is narrow: an in-cell `<img>` is NOT a break, so it must not
+    // become a hard_break (nor, without `html_elements`, an image).
+    var ast = try parseCellAndFinish("a<img src=x>b");
+    defer ast.deinit();
+    try testing.expectEqual(@as(?std.meta.Tag(Node.Kind), .raw_inline), nthKind(&ast, 1));
+}
+
+test "OUT of a cell: a <br> stays a raw_inline (CommonMark/GFM unchanged)" {
+    var ast = try parseAndFinish("a<br>b");
+    defer ast.deinit();
+    try testing.expectEqual(@as(?std.meta.Tag(Node.Kind), .raw_inline), nthKind(&ast, 1));
+}
+
+test "isBrTag accepts the plain spellings and rejects the rest" {
+    for ([_][]const u8{ "<br>", "<br/>", "<br />", "<br >", "<BR>", "<Br/>" }) |t|
+        try testing.expect(isBrTag(t));
+    for ([_][]const u8{ "<br class=x>", "<brr>", "<b>", "<img>", "<br", "br>", "<x/>" }) |t|
+        try testing.expect(!isBrTag(t));
 }
 
 test "plain text becomes a single str node" {

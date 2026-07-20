@@ -7,6 +7,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 const markdown = @import("markdown.zig");
+const md_syntax = @import("syntax.zig");
 const Document = markdown.Document;
 const AST = markdown.AST;
 const Node = AST.Node;
@@ -24,6 +25,11 @@ const Prefix = struct {
 
 const Ctx = struct {
     prefix: ?*const Prefix = null,
+    /// True while rendering the inline children of a table `cell`. A row is a
+    /// single source line, so a `hard_break` here must be spelled as the
+    /// format's in-cell break (`Syntax.cell_line_break`, `<br>`) rather than the
+    /// ordinary `  \n`, which would break the row in two.
+    in_cell: bool = false,
 };
 
 const Renderer = struct {
@@ -378,9 +384,14 @@ const Renderer = struct {
                     try self.writePrefix(ctx);
                     try self.writer.writeByte('|');
                     var cell_it = self.ast.children(row.id);
+                    // Inside a cell a `hard_break` must spell as `<br>`, not a
+                    // row-breaking newline — flag the descent so the break arm
+                    // knows (see `Ctx.in_cell`).
+                    var cell_ctx = ctx;
+                    cell_ctx.in_cell = true;
                     while (cell_it.next()) |cell| {
                         try self.writer.writeByte(' ');
-                        try self.renderInlineChildren(cell.id, ctx);
+                        try self.renderInlineChildren(cell.id, cell_ctx);
                         try self.writer.writeAll(" |");
                     }
                     try self.writer.writeByte('\n');
@@ -497,7 +508,14 @@ const Renderer = struct {
                 try self.writer.writeByte('\n');
                 try self.writePrefix(ctx);
             },
-            .hard_break => {
+            .hard_break => if (ctx.in_cell) {
+                // A row is one source line: spell the break as `<br>` (no
+                // newline) so the row stays intact. The parser reads this back as
+                // a `hard_break` in cell context, closing the round-trip.
+                // Markdown always has this spelling (asserted coherent), so the
+                // unwrap is safe.
+                try self.writer.writeAll(md_syntax.table.cell_line_break.?);
+            } else {
                 try self.writer.writeAll("  \n");
                 try self.writePrefix(ctx);
             },

@@ -616,6 +616,39 @@ pub const Editor = struct {
 
         return self.commitSplice(offset, offset, out.items);
     }
+
+    /// Insert a hard line break *inside a table cell* at `offset`, spelled the
+    /// format's way (`Syntax.cell_line_break` — `<br>` for Markdown). A row is a
+    /// single source line, so this is the one break the cell can hold; the
+    /// spliced `<br>` reparses as a `hard_break` in cell context (see
+    /// `markdown/inline.zig`), so the caller reads back a semantic node, not raw
+    /// HTML.
+    ///
+    /// Errors:
+    /// - `UnsupportedFormat` — the format has no in-cell break spelling (djot,
+    ///   HTML, XML). Checked first: it is a property of the format, not the caret.
+    /// - `NoBlock` — `offset` is not inside a table cell. Only the in-cell
+    ///   gesture is spelled today; a general (non-cell) hard break is future work.
+    /// - `EditConflict` — the splice would no longer parse as the same table; the
+    ///   splicer rolled it back and nothing changed (the standard contract).
+    pub fn insertLineBreak(self: *Editor, offset: usize) Error!void {
+        try self.checkRange(offset, offset);
+
+        // Format capability before caret position: a format with no in-cell
+        // break spelling can never satisfy this gesture, wherever the caret is.
+        const spelling = self.syntax.cell_line_break orelse return error.UnsupportedFormat;
+
+        const allocator = self.splicer.allocator;
+        const ast = self.astView();
+        const src = self.sourceBytes();
+
+        var chain: std.ArrayList(AST.Node.Id) = .empty;
+        defer chain.deinit(allocator);
+        try locate.ancestorChain(allocator, ast, offset, src.len, &chain);
+        if (locate.innermostOfKind(ast, chain.items, .cell) == null) return error.NoBlock;
+
+        return self.commitSplice(offset, offset, spelling);
+    }
 };
 
 // ── Block-container internals ──────────────────────────────────────────────

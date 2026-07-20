@@ -60,6 +60,11 @@ pub const table: syntax.Syntax = .{
     // line by `text_escapes`, so they need no line-start entry.
     .block_start_escapes = "#>|",
     .spellsAutolink = spellsAutolink,
+    // No `cell_line_break`: djot has no native in-cell hard break, and spelling
+    // one as `<br>` would emit non-idiomatic djot that any other djot reader
+    // renders as literal `<br>` text. So it stays `null` — `insertLineBreak`
+    // inside a djot cell is a clean `error.UnsupportedFormat`. See
+    // `syntax.zig`'s field doc for the full rationale.
 };
 
 test "djot spells every inline kind" {
@@ -68,6 +73,10 @@ test "djot spells every inline kind" {
     }
     table.assertCoherent();
     try std.testing.expect(table.authorable());
+}
+
+test "djot has no in-cell break spelling (deliberately null)" {
+    try std.testing.expect(table.cell_line_break == null);
 }
 
 test "djot body-text literals extend the link-text alphabet with brace delimiters" {

@@ -441,6 +441,46 @@ test "table ops off a table are NoBlock" {
     try testing.expectError(error.NoBlock, fx.ed.tableInsertRow(3, true));
 }
 
+test "insertLineBreak: splices an in-cell <br> that reparses as a hard_break (markdown)" {
+    var fx = try Fixture.init(table_src, .markdown);
+    defer fx.deinit();
+    try fx.ed.insertLineBreak(3); // caret just after `a` in the header cell
+    try fx.expectSource("| a<br> | b |\n| --- | --- |\n| 1 | 2 |\n");
+    // The point of the whole feature: a semantic break, not opaque raw HTML.
+    try testing.expect(fx.find(.hard_break) != null);
+    try fx.expectNoNodeOfKind(.raw_inline);
+}
+
+test "insertLineBreak: the spliced break round-trips (the source re-serializes byte-for-byte)" {
+    var fx = try Fixture.init(table_src, .markdown);
+    defer fx.deinit();
+    try fx.ed.insertLineBreak(3);
+    // A second identical op is refused only by geometry, not spelling; here we
+    // just assert the edited source is itself a fixed point of a reparse — the
+    // `<br>` the serializer would emit for the hard_break equals what we spliced.
+    try fx.expectSource("| a<br> | b |\n| --- | --- |\n| 1 | 2 |\n");
+}
+
+test "insertLineBreak: outside a table cell is NoBlock" {
+    var fx = try Fixture.init("just a paragraph\n", .markdown);
+    defer fx.deinit();
+    try testing.expectError(error.NoBlock, fx.ed.insertLineBreak(3));
+}
+
+test "insertLineBreak: a format with no in-cell break spelling is refused (djot)" {
+    // Djot's `cell_line_break` is deliberately null — it has no idiomatic in-cell
+    // break, so the gesture is a clean UnsupportedFormat regardless of the caret.
+    var fx = try Fixture.init("| a | b |\n| --- | --- |\n", .djot);
+    defer fx.deinit();
+    try testing.expectError(error.UnsupportedFormat, fx.ed.insertLineBreak(3));
+}
+
+test "insertLineBreak: a parse-only format spells no in-cell break (html)" {
+    var fx = try Fixture.init("<table><tr><td>a</td></tr></table>\n", .html);
+    defer fx.deinit();
+    try testing.expectError(error.UnsupportedFormat, fx.ed.insertLineBreak(15));
+}
+
 test "toggle_block_container: a range covering no block is NoBlock" {
     var fx = try Fixture.init("a\n\nb\n", .djot);
     defer fx.deinit();

@@ -61,6 +61,11 @@ pub const table: syntax.Syntax = .{
     // already escaped everywhere by `text_escapes`, so they need no entry here.
     .block_start_escapes = "#>-+=",
     .spellsAutolink = spellsAutolink,
+    // GFM's only in-cell break: a table row is one source line, and raw HTML is
+    // valid inside a GFM cell, so `<br>` is the one spelling that fits. The
+    // inline parser promotes it back to a `hard_break` in cell context, so the
+    // token round-trips (`<br/>`/`<br />` normalize to this on the way out).
+    .cell_line_break = "<br>",
 };
 
 test "markdown spells three inline kinds and refuses the other five" {
@@ -72,6 +77,10 @@ test "markdown spells three inline kinds and refuses the other five" {
     }
     table.assertCoherent();
     try std.testing.expect(table.authorable());
+}
+
+test "markdown spells the in-cell break as <br>" {
+    try std.testing.expectEqualStrings("<br>", table.cell_line_break.?);
 }
 
 test "markdown spells body-text and line-start literals" {

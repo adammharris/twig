@@ -828,6 +828,26 @@ TwigStatus twig_editor_insert_literal(
     TwigChange *out_change
 );
 
+// Insert a hard line break INSIDE a table cell at `offset`, spelled the format's
+// way. A table row is a single source line, so the ordinary newline-based hard
+// break cannot appear there; GFM's only in-cell break is a `<br>`, which this
+// splices and which reparses as a semantic hard_break node (not opaque raw HTML),
+// so a caller reads the break back as structure. Leans on the same
+// splice+reparse+rollback backstop as the other gestures: a break that would no
+// longer parse as the same table is rolled back with TWIG_STATUS_EDIT_CONFLICT
+// and changes nothing.
+//
+// Returns TWIG_STATUS_UNSUPPORTED_FORMAT for a format with no in-cell break
+// spelling — djot (which has no idiomatic in-cell break), HTML and XML (parse
+// only); TWIG_STATUS_NOT_FOUND when `offset` is not inside a table cell (only the
+// in-cell gesture is spelled today); and TWIG_STATUS_INVALID_ARGUMENT when
+// `offset` is past the source.
+TwigStatus twig_editor_insert_line_break(
+    TwigEditor *editor,
+    size_t offset,
+    TwigChange *out_change
+);
+
 // ── Builder ───────────────────────────────────────────────────────────────────
 // Programmatic construction of a document — the write-path mirror of twig_parse.
 // Build the tree bottom-up: add children, then the container, wiring them with

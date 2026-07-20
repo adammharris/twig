@@ -172,6 +172,24 @@ pub const Syntax = struct {
     /// Markdown but an `email` in djot. Both refuse a relative path.
     spellsAutolink: ?*const fn (angled: []const u8) bool = null,
 
+    /// How a hard break is spelled *inside a table cell*, where a row is a
+    /// single source line so the ordinary newline spelling (`  \n`, djot's
+    /// `\`+newline) can't appear. This is a distinct alphabet from the ordinary
+    /// hard break precisely because the position forbids a line end: Markdown
+    /// spells it `<br>` (raw HTML is valid inside a GFM cell), and the same
+    /// `<br>` round-trips 1:1 because the parser reads it back as a `hard_break`
+    /// in cell context (see `markdown/inline.zig`) and the serializer re-emits it
+    /// from this field (see `markdown/serializer.zig`).
+    ///
+    /// `null` = this format has no in-cell break, so `Editor.insertLineBreak`
+    /// inside a cell is `error.UnsupportedFormat`. Djot is `null` on purpose: it
+    /// has no native in-cell break, and spelling one as `<br>` would emit
+    /// non-idiomatic djot that any other djot reader renders as the literal text
+    /// `<br>`. Unlike the other fields, a `null` here carries no coherence
+    /// obligation — it neither implies nor is implied by any other spelling, so
+    /// `assertCoherent` says nothing about it.
+    cell_line_break: ?[]const u8 = null,
+
     /// Whether this format can be authored into at all — true once it can spell
     /// any one gesture. `false` for a parse-only format (XML, HTML).
     pub fn authorable(self: *const Syntax) bool {

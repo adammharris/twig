@@ -989,6 +989,11 @@ pub const Parser = struct {
         for (self.pending_inline.items) |p| {
             defer self.allocator.free(p.text);
             defer self.allocator.free(p.segments);
+            // A `<br>` in a table cell is the format's only in-cell line break;
+            // the scanner promotes it to a `hard_break` only in this context
+            // (see `inline.zig`'s `Scanner.in_cell`). The one scanner is reused
+            // across blocks, so set the flag per block.
+            sc.in_cell = std.meta.activeTag(self.builder.nodes.items[p.id].kind) == .cell;
             const kids = try inline_mod.scanReuse(&sc, p.text, p.segments);
             defer self.allocator.free(kids);
             self.builder.setChildren(p.id, kids);

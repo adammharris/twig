@@ -1902,6 +1902,29 @@ pub export fn twig_editor_insert_literal(
     return .ok;
 }
 
+// ── In-cell line break ─────────────────────────────────────────────────────────
+// The engine is `twig.Editor.insertLineBreak`: inside a table cell it splices the
+// format's `Syntax.cell_line_break` (`<br>` for Markdown), which reparses as a
+// `hard_break`. `unsupported_format` when the format has no in-cell break (djot,
+// HTML, XML); `not_found` when `offset` is not inside a cell.
+
+/// Insert a hard line break inside the table cell at `offset`, spelled the
+/// format's way. See `twig.h` for the semantics and `twig.Editor.insertLineBreak`
+/// for the implementation and its rationale.
+pub export fn twig_editor_insert_line_break(
+    ed: ?*TwigEditor,
+    offset: usize,
+    out_change: ?*TwigChange,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const handle = asEditor(raw);
+
+    handle.editor.insertLineBreak(offset) catch |err|
+        return statusOfEditorError(err);
+    if (out_change) |slot| slot.* = changeC(handle.editor.lastChange().?);
+    return .ok;
+}
+
 // ── Builder ──────────────────────────────────────────────────────────────────
 // Programmatic construction of a document, the write-path mirror of `twig_parse`
 // (which reads a document from source). Wraps `twig.AST.Builder`: build the tree
@@ -3103,6 +3126,39 @@ test "insert_literal: the wire reaches the gesture and escapes for the format" {
     try std.testing.expectEqual(
         TwigStatus.invalid_argument,
         twig_editor_insert_literal(fx.ed, 999, "x", 1, null),
+    );
+}
+
+test "insert_line_break: the wire splices an in-cell <br>, refuses off-cell and off-format" {
+    var fx = try EditorFixture.initFmt("| a | b |\n| --- | --- |\n", .markdown);
+    defer fx.deinit();
+    // Caret just after `a` in the header cell.
+    try std.testing.expectEqual(
+        TwigStatus.ok,
+        twig_editor_insert_line_break(fx.ed, 3, null),
+    );
+    try fx.expectSource("| a<br> | b |\n| --- | --- |\n");
+
+    // Not inside a cell → not_found (maps from NoBlock).
+    var para = try EditorFixture.initFmt("just text\n", .markdown);
+    defer para.deinit();
+    try std.testing.expectEqual(
+        TwigStatus.not_found,
+        twig_editor_insert_line_break(para.ed, 3, null),
+    );
+
+    // Djot has no in-cell break spelling → unsupported_format.
+    var dj = try EditorFixture.initFmt("| a | b |\n| --- | --- |\n", .djot);
+    defer dj.deinit();
+    try std.testing.expectEqual(
+        TwigStatus.unsupported_format,
+        twig_editor_insert_line_break(dj.ed, 3, null),
+    );
+
+    // Out-of-range offset is invalid_argument.
+    try std.testing.expectEqual(
+        TwigStatus.invalid_argument,
+        twig_editor_insert_line_break(fx.ed, 9999, null),
     );
 }
 
