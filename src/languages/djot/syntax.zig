@@ -46,6 +46,19 @@ pub const table: syntax.Syntax = .{
         // spelling, so a space is escaped in place.
         .plain = "\\()[`",
     },
+    // Djot's inline metacharacters: its marks (`*_^~` and `` ` ``), its bracket
+    // and brace constructs (`[]`, `{}`), the smart punctuation that would
+    // transform (`"'-.:`), and — crucially — the delimiters INSIDE the braces
+    // that a `{…}` span keys on, `=` (highlight) and `+` (insert). Escaping the
+    // braces alone is not enough: djot reads `\{=m=\}` back as a `mark`, so the
+    // `=`/`+` must go too. `<` guards the `<url>` autolink form. A superset of
+    // `link_text_escapes`, which predates this and never needed the brace-inner
+    // delimiters.
+    .text_escapes = "\\[]*_^`~\"'-.:{}=+<",
+    // `#` heading, `>` quote, `|` table row. The bullet openers (`-`/`+`/`*`),
+    // the div `:` and the code fences (`` ` ``/`~`) are already escaped on every
+    // line by `text_escapes`, so they need no line-start entry.
+    .block_start_escapes = "#>|",
     .spellsAutolink = spellsAutolink,
 };
 
@@ -55,6 +68,19 @@ test "djot spells every inline kind" {
     }
     table.assertCoherent();
     try std.testing.expect(table.authorable());
+}
+
+test "djot body-text literals extend the link-text alphabet with brace delimiters" {
+    const te = table.text_escapes.?;
+    // A superset of link text: every link-text escape, plus the brace-inner
+    // delimiters (`=`/`+`) and the autolink `<` that body text also needs.
+    for (table.link_text_escapes.?) |c| try std.testing.expect(std.mem.indexOfScalar(u8, te, c) != null);
+    for ("=+<") |c| try std.testing.expect(std.mem.indexOfScalar(u8, te, c) != null);
+    const bse = table.block_start_escapes.?;
+    for ("#>|") |c| try std.testing.expect(std.mem.indexOfScalar(u8, bse, c) != null);
+    // Disjoint from the always-on set.
+    for (te) |c| try std.testing.expect(std.mem.indexOfScalar(u8, bse, c) == null);
+    table.assertCoherent();
 }
 
 test "djot autolinks by content, so a bare mailto: is an email" {

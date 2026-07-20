@@ -1,6 +1,6 @@
 ---
 title: "Proposal: format-correct literal text insertion"
-status: draft
+status: implemented
 author: adammharris
 created: 2026-07-19
 ---

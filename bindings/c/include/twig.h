@@ -797,6 +797,37 @@ TwigStatus twig_editor_insert_link(
     TwigChange *out_change
 );
 
+// Insert `text` at `offset` as a LITERAL run: every byte the format would read as
+// markup is backslash-escaped so the run reparses as exactly `text` — a typed
+// `*`, `#` or backtick stays that character instead of opening emphasis, a
+// heading or a code span. This is the inverse of serialization (which writes an
+// already-parsed run verbatim); it is what an editor calls to enter text that
+// must not become markup by keystroke — a WYSIWYG surface where formatting comes
+// only from commands.
+//
+// The escaping is positional and per-format, and neither is the caller's to
+// reproduce. `text_escapes` bytes (`*`, backtick, `[`, `<`…) are escaped anywhere
+// on the line; `block_start_escapes` bytes (`#`, `>`, `-`…) only where `offset`
+// sits in its line's leading whitespace, since they open a block only there — so
+// an inserted "5 - 3" keeps its `-` while "- item" at column zero does not become
+// a bullet. An embedded newline in `text` re-enters that line-start zone.
+//
+// Like twig_editor_insert_link, this guards the run's own bytes and leans on the
+// splice+reparse+rollback backstop for anything else: an insertion that would
+// still corrupt the document is rolled back with TWIG_STATUS_EDIT_CONFLICT and
+// changes nothing. Two constructs a byte-alphabet cannot reach are left as-is: a
+// GFM bare-URL autolink (`https://x.com`, no delimiter to escape) and an
+// ordered-list marker (`1.`, special only after digits). Returns
+// TWIG_STATUS_UNSUPPORTED_FORMAT for a parse-only format (XML, HTML), and
+// TWIG_STATUS_INVALID_ARGUMENT when `offset` is past the source.
+TwigStatus twig_editor_insert_literal(
+    TwigEditor *editor,
+    size_t offset,
+    const uint8_t *text,
+    size_t text_len,
+    TwigChange *out_change
+);
+
 // ── Builder ───────────────────────────────────────────────────────────────────
 // Programmatic construction of a document — the write-path mirror of twig_parse.
 // Build the tree bottom-up: add children, then the container, wiring them with

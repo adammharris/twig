@@ -139,6 +139,24 @@ fn insertLink(fx: *Fixture, start: usize, end: usize, dest: []const u8) !void {
     return fx.ed.insertLink(Span.init(start, end), dest);
 }
 
+fn insertLiteral(fx: *Fixture, offset: usize, text: []const u8) !void {
+    return fx.ed.insertLiteral(offset, text);
+}
+
+/// The document's VISIBLE text: every `str` payload joined, in node order. If a
+/// typed special slipped through as markup, its delimiter would parse into an
+/// emphasis/link/raw node instead of a `str`, so the join no longer equals the
+/// text that went in — which is exactly the round-trip `insertLiteral` promises.
+fn expectVisibleText(fx: *Fixture, expected: []const u8) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    for (fx.ed.astView().nodes) |n| switch (n.kind) {
+        .str => |s| try buf.appendSlice(testing.allocator, s),
+        else => {},
+    };
+    try testing.expectEqualStrings(expected, buf.items);
+}
+
 // ── inline marks ───────────────────────────────────────────────────────────
 
 test "toggleInline: bold on, then off, round-trips in both formats" {
@@ -829,4 +847,98 @@ test "insert_link rejects a newline in the destination and an unspellable format
     var xml = try Fixture.init("<r>ab</r>", .xml);
     defer xml.deinit();
     try testing.expectError(error.UnsupportedFormat, insertLink(&xml, 3, 5, "http://x.dev"));
+}
+
+// ── literal text ─────────────────────────────────────────────────────────────
+// The assertions read the REPARSED tree (via `expectVisibleText`), not the
+// spelled source: source that merely holds a `\*` still has to prove it reparses
+// to a literal `*` and not to emphasis. Both formats, because their inline
+// alphabets diverge in exactly the bytes these escape.
+
+test "insert_literal: typed markdown specials all stay literal" {
+    var fx = try Fixture.init("z\n", .markdown);
+    defer fx.deinit();
+    // Balanced emphasis, a code span, a full link, raw HTML and an entity — every
+    // one would mint markup unescaped.
+    const typed = "*b* _i_ `c` [t](u) <x> &amp;";
+    try insertLiteral(&fx, 0, typed);
+    try expectVisibleText(&fx, typed ++ "z");
+    for ([_]KindTag{ .emph, .strong, .verbatim, .link, .image, .raw_inline }) |k|
+        try fx.expectNoNodeOfKind(k);
+}
+
+test "insert_literal: typed djot specials all stay literal" {
+    var fx = try Fixture.init("z\n", .djot);
+    defer fx.deinit();
+    // Djot's own marks plus its attribute braces and smart punctuation.
+    const typed = "*b* _i_ `c` ^s^ ~t~ {=m=} \"q\" ...";
+    try insertLiteral(&fx, 0, typed);
+    try expectVisibleText(&fx, typed ++ "z");
+    for ([_]KindTag{ .emph, .strong, .verbatim, .superscript, .subscript, .mark }) |k|
+        try fx.expectNoNodeOfKind(k);
+}
+
+test "insert_literal: a block marker escapes at a line start, in both formats" {
+    for ([_]format.Format{ .djot, .markdown }) |fmt| {
+        var fx = try Fixture.init("z\n", fmt);
+        defer fx.deinit();
+        try insertLiteral(&fx, 0, "# ");
+        try fx.expectSource("\\# z\n");
+        try fx.expectNoNodeOfKind(.heading);
+    }
+}
+
+test "insert_literal: the same marker mid-line is ordinary text, left unescaped" {
+    for ([_]format.Format{ .djot, .markdown }) |fmt| {
+        var fx = try Fixture.init("az\n", fmt);
+        defer fx.deinit();
+        try insertLiteral(&fx, 1, "# ");
+        // No backslash: a `#` after other text on the line opens nothing.
+        try fx.expectSource("a# z\n");
+        try fx.expectNoNodeOfKind(.heading);
+    }
+}
+
+test "insert_literal: leading whitespace still counts as a line start" {
+    // Markdown lets up to three spaces precede a block marker, so an insertion
+    // sitting in that indent is still at a line start.
+    var fx = try Fixture.init("  z\n", .markdown);
+    defer fx.deinit();
+    try insertLiteral(&fx, 2, "# ");
+    try fx.expectSource("  \\# z\n");
+    try fx.expectNoNodeOfKind(.heading);
+}
+
+test "insert_literal: an embedded newline re-enters the line-start zone" {
+    var fx = try Fixture.init("z\n", .markdown);
+    defer fx.deinit();
+    // The first `#` is mid-line (after "a"); the second opens its own line.
+    try insertLiteral(&fx, 0, "a # b\n# c");
+    try fx.expectSource("a # b\n\\# cz\n");
+    try fx.expectNoNodeOfKind(.heading);
+}
+
+test "insert_literal: a lone backslash round-trips as a backslash" {
+    for ([_]format.Format{ .djot, .markdown }) |fmt| {
+        var fx = try Fixture.init("z\n", fmt);
+        defer fx.deinit();
+        try insertLiteral(&fx, 0, "a\\b");
+        try fx.expectSource("a\\\\bz\n");
+        try expectVisibleText(&fx, "a\\bz");
+    }
+}
+
+test "insert_literal: a parse-only format spells no literal" {
+    for ([_]format.Format{ .xml, .html }) |fmt| {
+        var fx = try Fixture.init("<r>ab</r>", fmt);
+        defer fx.deinit();
+        try testing.expectError(error.UnsupportedFormat, insertLiteral(&fx, 3, "x"));
+    }
+}
+
+test "insert_literal: an offset past the source is InvalidRange" {
+    var fx = try Fixture.init("ab\n", .markdown);
+    defer fx.deinit();
+    try testing.expectError(error.InvalidRange, insertLiteral(&fx, 99, "x"));
+    try fx.expectSource("ab\n");
 }

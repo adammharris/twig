@@ -131,6 +131,33 @@ pub const Syntax = struct {
     /// `link_text_escapes` is a contradiction — see `assertCoherent`.
     link_dest_escapes: ?DestEscapes = null,
 
+    /// The bytes a run of user-typed text must have backslash-escaped for the
+    /// run to reparse as ITSELF in ordinary *body-text* position — the alphabet
+    /// `Editor.insertLiteral` guards. These are the inline metacharacters that
+    /// fire anywhere on a line: `*`/`_`/`` ` ``/`~`/`^` emphasis-ish runs, `[`/`]`
+    /// link brackets, `\` itself, plus each format's own — Markdown's `<…>` raw
+    /// HTML and `&…;` entities, djot's `{…}` attributes and `"`/`'`/`-`/`.`/`:`
+    /// smart punctuation. A `\` before ASCII punctuation is that literal
+    /// character in both formats, so an escape here is always safe.
+    ///
+    /// A sibling of `link_text_escapes`, not the same set: link text sits inside
+    /// `[…]` where the brackets already bound it, while body text also opens
+    /// blocks (see `block_start_escapes`) and is where a typed `<https://…>`
+    /// would otherwise autolink. Over-escaping is safe (valid, just noisier
+    /// source), so this errs wide — the Hidden-mode caller never shows the
+    /// source. `null` = a parse-only format, so `insertLiteral` is
+    /// `error.UnsupportedFormat`.
+    text_escapes: ?[]const u8 = null,
+
+    /// The bytes that only open a construct at a LINE START — block markers
+    /// (`#`, `>`, `-`, `+`, table `|`, setext `=`…). `insertLiteral` escapes one
+    /// only when the insertion point sits in the leading whitespace of its line;
+    /// mid-line they are ordinary text and left alone, so a sentence's "5 - 3"
+    /// keeps its `-`. Disjoint from `text_escapes` by construction: a byte that
+    /// must be escaped everywhere lives there and needs no line-start entry here.
+    /// `null` iff `text_escapes` is — see `assertCoherent`.
+    block_start_escapes: ?[]const u8 = null,
+
     /// Whether `angled` — a `<dest>` run, BRACKETS INCLUDED — spells an
     /// autolink. `null` = this format has no autolink form.
     ///
@@ -150,6 +177,7 @@ pub const Syntax = struct {
     pub fn authorable(self: *const Syntax) bool {
         return self.link_text_escapes != null or
             self.heading_marker != null or
+            self.text_escapes != null or
             self.inline_delims.get(.strong) != null;
     }
 
@@ -161,6 +189,10 @@ pub const Syntax = struct {
         // A format with one but not the other would build `[text](` and then
         // have nothing to say about what follows.
         std.debug.assert((self.link_text_escapes == null) == (self.link_dest_escapes == null));
+        // The body-text and line-start alphabets are two halves of spelling ONE
+        // literal run: a format that could escape mid-line specials but not
+        // block markers (or vice versa) would let `insertLiteral` mint the other.
+        std.debug.assert((self.text_escapes == null) == (self.block_start_escapes == null));
     }
 };
 
@@ -170,5 +202,7 @@ test "a parse-only format spells nothing" {
     try std.testing.expect(s.inline_delims.get(.strong) == null);
     try std.testing.expect(s.container_spelling.get(.block_quote) == null);
     try std.testing.expect(s.heading_marker == null);
+    try std.testing.expect(s.text_escapes == null);
+    try std.testing.expect(s.block_start_escapes == null);
     s.assertCoherent();
 }

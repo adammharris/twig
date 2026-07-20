@@ -981,6 +981,32 @@ impl Editor {
         })
     }
 
+    /// Insert `text` at `offset` as a literal run: every byte the format reads as
+    /// markup is backslash-escaped so the run reparses as exactly `text` — a typed
+    /// `*`, `#` or `` ` `` stays that character rather than opening emphasis, a
+    /// heading or a code span. This is the inverse of serialization (which writes
+    /// an already-parsed run verbatim): it is what a WYSIWYG surface calls so that
+    /// keyboard input can never mint markup, leaving formatting to explicit
+    /// commands.
+    ///
+    /// The escaping is positional and per-format, and neither is the caller's to
+    /// reproduce: inline specials (`*`, `` ` ``, `[`, `<`…) are escaped anywhere
+    /// on the line, while block markers (`#`, `>`, `-`…) are escaped only where
+    /// `offset` sits in its line's leading whitespace — so an inserted "5 - 3"
+    /// keeps its `-` but "- item" at column zero does not become a bullet. An
+    /// embedded newline in `text` re-enters that line-start zone.
+    ///
+    /// Two constructs a byte-alphabet cannot reach are left as typed: a GFM
+    /// bare-URL autolink (`https://x.com`, with no delimiter to escape) and an
+    /// ordered-list marker (`1.`, special only after a digit run). Returns
+    /// [`Error::UnsupportedFormat`] for a parse-only format (XML, HTML) and
+    /// [`Error::InvalidArgument`] when `offset` is past the source.
+    pub fn insert_literal(&mut self, offset: usize, text: &str) -> Result<Change, Error> {
+        self.change_op(|ed, out| unsafe {
+            ffi::twig_editor_insert_literal(ed, offset, text.as_ptr(), text.len(), out)
+        })
+    }
+
     /// Shared plumbing for the change-returning ops: run `op` (which fills a
     /// `TwigChange` out-param) and wrap the result.
     fn change_op(
@@ -2197,6 +2223,48 @@ mod tests {
 
         let mut xml = Editor::new_str("<a>hi</a>", Format::Xml).expect("editor");
         assert_eq!(xml.insert_link(3, 5, "u"), Err(Error::UnsupportedFormat));
+    }
+
+    #[test]
+    fn editor_insert_literal_keeps_typed_specials_literal() {
+        for format in [Format::Markdown, Format::Djot] {
+            let mut ed = Editor::new_str("z\n", format).expect("editor");
+            // A `*` at a line start would open emphasis unescaped.
+            ed.insert_literal(0, "*hi*").expect("literal");
+
+            // Source that looks right can still parse wrong: assert the reparse.
+            let nodes = ed.nodes().expect("nodes");
+            assert!(!nodes.iter().any(|n| n.kind == "emph" || n.kind == "strong"));
+            let text: String = nodes
+                .iter()
+                .filter(|n| n.kind == "str")
+                .filter_map(|n| n.text.clone())
+                .collect();
+            assert_eq!(text, "*hi*z");
+        }
+    }
+
+    #[test]
+    fn editor_insert_literal_escapes_block_markers_only_at_line_start() {
+        // Mid-line, a `#` opens nothing and is left as typed.
+        let mut ed = Editor::new_str("az\n", Format::Markdown).expect("editor");
+        ed.insert_literal(1, "# ").expect("literal");
+        assert_eq!(ed.source_str().unwrap(), "a# z\n");
+
+        // At a line start it would open a heading, so it is escaped.
+        let mut ed2 = Editor::new_str("z\n", Format::Markdown).expect("editor");
+        ed2.insert_literal(0, "# ").expect("literal");
+        assert_eq!(ed2.source_str().unwrap(), "\\# z\n");
+        assert!(!ed2.nodes().expect("nodes").iter().any(|n| n.kind == "heading"));
+    }
+
+    #[test]
+    fn editor_insert_literal_rejects_bad_offset_and_parse_only_format() {
+        let mut ed = Editor::new_str("ab\n", Format::Markdown).expect("editor");
+        assert_eq!(ed.insert_literal(99, "x"), Err(Error::InvalidArgument));
+
+        let mut xml = Editor::new_str("<a>hi</a>", Format::Xml).expect("editor");
+        assert_eq!(xml.insert_literal(3, "x"), Err(Error::UnsupportedFormat));
     }
 
     #[test]

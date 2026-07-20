@@ -1878,6 +1878,30 @@ pub export fn twig_editor_insert_link(
     return .ok;
 }
 
+// ── Literal text ───────────────────────────────────────────────────────────────
+// The engine — the per-format `text_escapes`/`block_start_escapes` alphabets and
+// the positional escape walk — is `twig.Editor.insertLiteral`.
+
+/// Insert `text` at `offset` as a literal run, escaped for the format so it
+/// reparses as exactly `text`. See `twig.h` for the semantics and
+/// `twig.Editor.insertLiteral` for the implementation and its rationale.
+pub export fn twig_editor_insert_literal(
+    ed: ?*TwigEditor,
+    offset: usize,
+    text_ptr: ?[*]const u8,
+    text_len: usize,
+    out_change: ?*TwigChange,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const handle = asEditor(raw);
+    const text = sliceOf(text_ptr, text_len) orelse return .invalid_argument;
+
+    handle.editor.insertLiteral(offset, text) catch |err|
+        return statusOfEditorError(err);
+    if (out_change) |slot| slot.* = changeC(handle.editor.lastChange().?);
+    return .ok;
+}
+
 // ── Builder ──────────────────────────────────────────────────────────────────
 // Programmatic construction of a document, the write-path mirror of `twig_parse`
 // (which reads a document from source). Wraps `twig.AST.Builder`: build the tree
@@ -3058,6 +3082,30 @@ test "toolbar: the wire codes reach the right gesture" {
     try fx.expectSource("> ## *[a](x.dev)*\n");
 }
 
+test "insert_literal: the wire reaches the gesture and escapes for the format" {
+    var fx = try EditorFixture.initFmt("z\n", .markdown);
+    defer fx.deinit();
+    // A typed `*` at a line start would open emphasis; the op escapes it.
+    try std.testing.expectEqual(
+        TwigStatus.ok,
+        twig_editor_insert_literal(fx.ed, 0, "*hi*", 4, null),
+    );
+    try fx.expectSource("\\*hi\\*z\n");
+
+    // A parse-only format spells no literal.
+    var xml = try EditorFixture.init("<a>hi</a>");
+    defer xml.deinit();
+    try std.testing.expectEqual(
+        TwigStatus.unsupported_format,
+        twig_editor_insert_literal(xml.ed, 3, "x", 1, null),
+    );
+    // An out-of-range offset is invalid_argument.
+    try std.testing.expectEqual(
+        TwigStatus.invalid_argument,
+        twig_editor_insert_literal(fx.ed, 999, "x", 1, null),
+    );
+}
+
 test "toolbar: out_change reports the byte effect of a gesture" {
     var fx = try EditorFixture.initFmt("a\n", .djot);
     defer fx.deinit();
@@ -3139,6 +3187,7 @@ test "toolbar: a NULL editor is invalid_argument on every gesture" {
     try std.testing.expectEqual(TwigStatus.invalid_argument, twig_editor_set_block(null, 0, 0, 1, null));
     try std.testing.expectEqual(TwigStatus.invalid_argument, twig_editor_toggle_block_container(null, 0, 0, 0, null));
     try std.testing.expectEqual(TwigStatus.invalid_argument, twig_editor_insert_link(null, 0, 0, "x", 1, null));
+    try std.testing.expectEqual(TwigStatus.invalid_argument, twig_editor_insert_literal(null, 0, "x", 1, null));
 }
 
 // ── builder tests ─────────────────────────────────────────────────────────────

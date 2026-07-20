@@ -562,6 +562,60 @@ pub const Editor = struct {
 
         return self.commitSplice(target.start, target.end, out.items);
     }
+
+    // ── Literal text ─────────────────────────────────────────────────────────
+
+    /// Insert `text` at `offset` as a LITERAL run: every byte the format reads as
+    /// markup is backslash-escaped so the run reparses as exactly `text`, never as
+    /// emphasis, a code span, a link, an entity, or — at a line start — a heading,
+    /// quote or list. This is the inverse of the serializer, which writes an
+    /// already-parsed `str` verbatim: that byte survived a parse in place, whereas
+    /// `text` is arbitrary input that has to be MADE safe.
+    ///
+    /// The escaping is positional. `Syntax.text_escapes` fires anywhere on the
+    /// line (`*`, `` ` ``, `[`, `<`…); `Syntax.block_start_escapes` fires only
+    /// while `offset` sits in its line's leading whitespace (`#`, `>`, `-`…),
+    /// where those bytes open a block — so an inserted "5 - 3" keeps its `-` but
+    /// an inserted "- item" at column zero does not become a bullet. An embedded
+    /// newline in `text` re-enters that line-start zone for the bytes after it.
+    ///
+    /// Like the link ops, this guards the inserted run's OWN bytes; it does not
+    /// reason about source already flanking `offset`. The shared
+    /// splice+reparse+rollback path is the backstop: an insertion that somehow
+    /// still corrupts the document yields `error.EditConflict` and changes
+    /// nothing. `error.UnsupportedFormat` when the format can spell no literal
+    /// (`text_escapes == null`), `error.InvalidRange` when `offset` is past the
+    /// source.
+    ///
+    /// Two constructs a fixed byte-alphabet cannot reach, and so does not: a GFM
+    /// bare-URL autolink (`https://x.com`, linkified with no delimiter to
+    /// backslash) and an ordered-list marker (`1.`/`1)`, special only after a
+    /// digit run, not per-byte). Both mint at most a link or a list from
+    /// literal-looking text, never corruption; a caller that must suppress them
+    /// does so above this op.
+    pub fn insertLiteral(self: *Editor, offset: usize, text: []const u8) Error!void {
+        try self.checkRange(offset, offset);
+        if (self.syntax.text_escapes == null) return error.UnsupportedFormat;
+
+        const allocator = self.splicer.allocator;
+        const src = self.sourceBytes();
+
+        // At a line start iff every byte from this line's start up to `offset` is
+        // leading whitespace — the same zone in which a block marker bites.
+        var at_line_start = true;
+        for (src[locate.lineStartAt(src, offset)..offset]) |c| {
+            if (c != ' ' and c != '\t') {
+                at_line_start = false;
+                break;
+            }
+        }
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try writeLiteral(allocator, self.syntax, text, at_line_start, &out);
+
+        return self.commitSplice(offset, offset, out.items);
+    }
 };
 
 // ── Block-container internals ──────────────────────────────────────────────
@@ -1004,6 +1058,36 @@ fn writeLinkText(
     for (text) |c| {
         if (std.mem.indexOfScalar(u8, escapes, c) != null) try out.append(allocator, '\\');
         try out.append(allocator, c);
+    }
+}
+
+/// Escape `text` for BODY-TEXT position, backslash-escaping every `text_escapes`
+/// byte and — only while in a line's leading whitespace — every
+/// `block_start_escapes` byte. `at_line_start` seeds that zone for the first
+/// line; a `\n` re-enters it, and spaces/tabs (a block marker tolerates up to
+/// three leading spaces) hold it, so `\n  # h` still escapes the `#`. The two
+/// alphabets are separate because a `#` is a heading only at a line start but a
+/// `*` is emphasis anywhere. See `Editor.insertLiteral`.
+fn writeLiteral(
+    allocator: Allocator,
+    syntax: *const Syntax,
+    text: []const u8,
+    at_line_start: bool,
+    out: *std.ArrayList(u8),
+) !void {
+    const inline_escapes = syntax.text_escapes orelse return error.UnsupportedFormat;
+    const block_escapes = syntax.block_start_escapes orelse return error.UnsupportedFormat;
+    var block_pos = at_line_start;
+    for (text) |c| {
+        const escape = std.mem.indexOfScalar(u8, inline_escapes, c) != null or
+            (block_pos and std.mem.indexOfScalar(u8, block_escapes, c) != null);
+        if (escape) try out.append(allocator, '\\');
+        try out.append(allocator, c);
+        if (c == '\n') {
+            block_pos = true;
+        } else if (c != ' ' and c != '\t') {
+            block_pos = false;
+        }
     }
 }
 

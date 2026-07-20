@@ -450,6 +450,14 @@ unsafe extern "C" {
         out_change: *mut TwigChange,
     ) -> TwigStatus;
 
+    pub fn twig_editor_insert_literal(
+        editor: *mut TwigEditor,
+        offset: usize,
+        text: *const u8,
+        text_len: usize,
+        out_change: *mut TwigChange,
+    ) -> TwigStatus;
+
     pub fn twig_builder_create(out_builder: *mut *mut TwigBuilder) -> TwigStatus;
     pub fn twig_builder_destroy(builder: *mut TwigBuilder);
     pub fn twig_builder_add(builder: *mut TwigBuilder, kind: c_int, out_id: *mut u32) -> TwigStatus;

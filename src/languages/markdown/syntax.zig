@@ -49,6 +49,17 @@ pub const table: syntax.Syntax = .{
         // as `a&b`, corrupting the URL rather than breaking the link).
         .angle = .{ .escapes = "\\<>&" },
     },
+    // Body-text literals. Narrower than `link_text_escapes` in reasoning but
+    // reaching the same specials: `\` (escape), the emphasis/strike/code runs,
+    // the link brackets, and — unlike link TEXT, which is already bounded by its
+    // `[…]` — the two that mint markup out in the open, `<` (autolink / raw HTML)
+    // and `&` (entity). Block openers that only bite at column zero are in
+    // `block_start_escapes`, not here.
+    .text_escapes = "\\*_`[]~<&",
+    // `#` heading, `>` quote, `-`/`+` bullets (and `-` a thematic break or setext
+    // underline), `=` a setext underline. `*`/`_` also open bullets/breaks but are
+    // already escaped everywhere by `text_escapes`, so they need no entry here.
+    .block_start_escapes = "#>-+=",
     .spellsAutolink = spellsAutolink,
 };
 
@@ -61,6 +72,18 @@ test "markdown spells three inline kinds and refuses the other five" {
     }
     table.assertCoherent();
     try std.testing.expect(table.authorable());
+}
+
+test "markdown spells body-text and line-start literals" {
+    const te = table.text_escapes.?;
+    // The always-on inline specials.
+    for ("\\*_`[]~<&") |c| try std.testing.expect(std.mem.indexOfScalar(u8, te, c) != null);
+    const bse = table.block_start_escapes.?;
+    for ("#>-+=") |c| try std.testing.expect(std.mem.indexOfScalar(u8, bse, c) != null);
+    // The two sets are disjoint: a byte escaped everywhere needs no line-start
+    // entry, and `assertCoherent` pairs their nullness.
+    for (te) |c| try std.testing.expect(std.mem.indexOfScalar(u8, bse, c) == null);
+    table.assertCoherent();
 }
 
 test "markdown autolinks by scheme, so a bare word would be raw HTML" {
