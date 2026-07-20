@@ -700,6 +700,47 @@ TwigStatus twig_editor_toggle_block_container(
     TwigChange *out_change
 );
 
+// Renumber the ordered list at `offset` so its markers run 1, 2, 3, …, each
+// nesting level restarting at 1 — the numbering a caret editor keeps as items
+// are inserted, deleted, and nested (a plain splice leaves `1. 2. 2. 3.`).
+// TWIG_STATUS_NOT_FOUND when `offset` is not inside an ordered list. When the
+// numbering is already sequential this is a no-op that still returns
+// TWIG_STATUS_OK; out_change then reports the most recent prior edit (or is left
+// untouched when there is none), so OK is not proof the source moved. Fills
+// out_change on success if non-NULL.
+TwigStatus twig_editor_renumber_ordered_lists(
+    TwigEditor *editor,
+    size_t offset,
+    TwigChange *out_change
+);
+
+// Table ops for twig_editor_table_edit's `op` argument. `arg` is the gesture's
+// parameter: for insert/move a side (0 = before/up/left, 1 = after/down/right),
+// for TWIG_TABLE_SET_ALIGNMENT a TwigAlignment, ignored for the deletes.
+typedef enum {
+    TWIG_TABLE_INSERT_ROW = 0,
+    TWIG_TABLE_DELETE_ROW = 1,
+    TWIG_TABLE_INSERT_COLUMN = 2,
+    TWIG_TABLE_DELETE_COLUMN = 3,
+    TWIG_TABLE_SET_ALIGNMENT = 4,
+    TWIG_TABLE_MOVE_ROW = 5,
+    TWIG_TABLE_MOVE_COLUMN = 6
+} TwigTableOp;
+
+// Edit the table at `offset` — add/remove/move a row or column, or set a
+// column's alignment. `op` is a TwigTableOp; `arg` is its parameter (see the
+// enum). The whole table is re-spelled and spliced in one edit.
+// TWIG_STATUS_NOT_FOUND when `offset` is not inside a table;
+// TWIG_STATUS_NOT_EDITABLE for a refused edit (deleting the header row, the last
+// body row, or the last column). Fills out_change on success if non-NULL.
+TwigStatus twig_editor_table_edit(
+    TwigEditor *editor,
+    size_t offset,
+    int op,
+    int arg,
+    TwigChange *out_change
+);
+
 // Link [start, end) to `destination` — `[text](destination)`. Djot and Markdown
 // only, else TWIG_STATUS_UNSUPPORTED_FORMAT. TWIG_STATUS_INVALID_ARGUMENT for a
 // bad range, a NULL destination with a non-zero length, or a destination holding
@@ -753,6 +794,37 @@ TwigStatus twig_editor_insert_link(
     size_t end,
     const uint8_t *destination,
     size_t destination_len,
+    TwigChange *out_change
+);
+
+// Insert `text` at `offset` as a LITERAL run: every byte the format would read as
+// markup is backslash-escaped so the run reparses as exactly `text` — a typed
+// `*`, `#` or backtick stays that character instead of opening emphasis, a
+// heading or a code span. This is the inverse of serialization (which writes an
+// already-parsed run verbatim); it is what an editor calls to enter text that
+// must not become markup by keystroke — a WYSIWYG surface where formatting comes
+// only from commands.
+//
+// The escaping is positional and per-format, and neither is the caller's to
+// reproduce. `text_escapes` bytes (`*`, backtick, `[`, `<`…) are escaped anywhere
+// on the line; `block_start_escapes` bytes (`#`, `>`, `-`…) only where `offset`
+// sits in its line's leading whitespace, since they open a block only there — so
+// an inserted "5 - 3" keeps its `-` while "- item" at column zero does not become
+// a bullet. An embedded newline in `text` re-enters that line-start zone.
+//
+// Like twig_editor_insert_link, this guards the run's own bytes and leans on the
+// splice+reparse+rollback backstop for anything else: an insertion that would
+// still corrupt the document is rolled back with TWIG_STATUS_EDIT_CONFLICT and
+// changes nothing. Two constructs a byte-alphabet cannot reach are left as-is: a
+// GFM bare-URL autolink (`https://x.com`, no delimiter to escape) and an
+// ordered-list marker (`1.`, special only after digits). Returns
+// TWIG_STATUS_UNSUPPORTED_FORMAT for a parse-only format (XML, HTML), and
+// TWIG_STATUS_INVALID_ARGUMENT when `offset` is past the source.
+TwigStatus twig_editor_insert_literal(
+    TwigEditor *editor,
+    size_t offset,
+    const uint8_t *text,
+    size_t text_len,
     TwigChange *out_change
 );
 

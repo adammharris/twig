@@ -203,6 +203,15 @@ pub const TWIG_ALIGN_LEFT: c_int = 1;
 pub const TWIG_ALIGN_RIGHT: c_int = 2;
 pub const TWIG_ALIGN_CENTER: c_int = 3;
 
+// `op` codes for `twig_editor_table_edit` — mirror of `TwigTableOp` in twig.h.
+pub const TWIG_TABLE_INSERT_ROW: c_int = 0;
+pub const TWIG_TABLE_DELETE_ROW: c_int = 1;
+pub const TWIG_TABLE_INSERT_COLUMN: c_int = 2;
+pub const TWIG_TABLE_DELETE_COLUMN: c_int = 3;
+pub const TWIG_TABLE_SET_ALIGNMENT: c_int = 4;
+pub const TWIG_TABLE_MOVE_ROW: c_int = 5;
+pub const TWIG_TABLE_MOVE_COLUMN: c_int = 6;
+
 unsafe extern "C" {
     pub fn twig_abi_version() -> u32;
     pub fn twig_version() -> u32;
@@ -420,12 +429,32 @@ unsafe extern "C" {
         container_kind: c_int,
         out_change: *mut TwigChange,
     ) -> TwigStatus;
+    pub fn twig_editor_renumber_ordered_lists(
+        editor: *mut TwigEditor,
+        offset: usize,
+        out_change: *mut TwigChange,
+    ) -> TwigStatus;
+    pub fn twig_editor_table_edit(
+        editor: *mut TwigEditor,
+        offset: usize,
+        op: c_int,
+        arg: c_int,
+        out_change: *mut TwigChange,
+    ) -> TwigStatus;
     pub fn twig_editor_insert_link(
         editor: *mut TwigEditor,
         start: usize,
         end: usize,
         destination: *const u8,
         destination_len: usize,
+        out_change: *mut TwigChange,
+    ) -> TwigStatus;
+
+    pub fn twig_editor_insert_literal(
+        editor: *mut TwigEditor,
+        offset: usize,
+        text: *const u8,
+        text_len: usize,
         out_change: *mut TwigChange,
     ) -> TwigStatus;
 

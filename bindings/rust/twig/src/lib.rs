@@ -851,6 +851,74 @@ impl Editor {
         })
     }
 
+    /// Renumber the ordered list at byte `offset` so its markers run `1, 2, 3, …`,
+    /// each nesting level restarting at 1 — the numbering a caret editor keeps as
+    /// items are inserted, deleted, and nested, where a raw splice leaves the
+    /// source numbers stale (`1. 2. 2. 3.`). Djot and Markdown; the display of an
+    /// ordered list is renumbered by any CommonMark renderer regardless, so this
+    /// is source hygiene, not a render fix.
+    ///
+    /// [`Error::NotFound`] when `offset` is not inside an ordered list. When the
+    /// numbering is already sequential this is a no-op that still returns `Ok` —
+    /// the source is left byte-for-byte unchanged. The `Change` is not returned
+    /// because a no-op has none; re-read [`Editor::source_str`] for the result.
+    pub fn renumber_ordered_lists(&mut self, offset: usize) -> Result<(), Error> {
+        self.change_op(|ed, out| unsafe {
+            ffi::twig_editor_renumber_ordered_lists(ed, offset, out)
+        })?;
+        Ok(())
+    }
+
+    // ── Tables ───────────────────────────────────────────────────────────────
+    // Structural editing of the pipe table at a byte `offset`: the caret's cell
+    // is the anchor. The whole table is re-spelled and spliced in one edit, so a
+    // caller re-reads [`Editor::source_str`] and re-places its caret rather than
+    // leaning on the returned span. [`Error::NotFound`] when `offset` is not in a
+    // table; [`Error::NotEditable`] for a refused (degenerate) edit.
+
+    /// Insert an empty row below (`below`) or above the caret's row.
+    pub fn table_insert_row(&mut self, offset: usize, below: bool) -> Result<(), Error> {
+        self.table_edit(offset, ffi::TWIG_TABLE_INSERT_ROW, below as c_int)
+    }
+
+    /// Delete the caret's row. [`Error::NotEditable`] for the header row or the
+    /// last remaining body row.
+    pub fn table_delete_row(&mut self, offset: usize) -> Result<(), Error> {
+        self.table_edit(offset, ffi::TWIG_TABLE_DELETE_ROW, 0)
+    }
+
+    /// Insert an empty column right (`right`) or left of the caret's column.
+    pub fn table_insert_column(&mut self, offset: usize, right: bool) -> Result<(), Error> {
+        self.table_edit(offset, ffi::TWIG_TABLE_INSERT_COLUMN, right as c_int)
+    }
+
+    /// Delete the caret's column. [`Error::NotEditable`] when it is the only one.
+    pub fn table_delete_column(&mut self, offset: usize) -> Result<(), Error> {
+        self.table_edit(offset, ffi::TWIG_TABLE_DELETE_COLUMN, 0)
+    }
+
+    /// Set the caret's column to `alignment`.
+    pub fn table_set_alignment(&mut self, offset: usize, alignment: Alignment) -> Result<(), Error> {
+        self.table_edit(offset, ffi::TWIG_TABLE_SET_ALIGNMENT, alignment.to_c())
+    }
+
+    /// Move the caret's row one place down (`down`) or up, within the body rows.
+    pub fn table_move_row(&mut self, offset: usize, down: bool) -> Result<(), Error> {
+        self.table_edit(offset, ffi::TWIG_TABLE_MOVE_ROW, down as c_int)
+    }
+
+    /// Move the caret's column one place right (`right`) or left.
+    pub fn table_move_column(&mut self, offset: usize, right: bool) -> Result<(), Error> {
+        self.table_edit(offset, ffi::TWIG_TABLE_MOVE_COLUMN, right as c_int)
+    }
+
+    fn table_edit(&mut self, offset: usize, op: c_int, arg: c_int) -> Result<(), Error> {
+        self.change_op(|ed, out| unsafe {
+            ffi::twig_editor_table_edit(ed, offset, op, arg, out)
+        })?;
+        Ok(())
+    }
+
     /// Link `[start, end)` to `destination` — `[text](destination)`. Djot and
     /// Markdown only, else [`Error::UnsupportedFormat`];
     /// [`Error::InvalidArgument`] for a bad range or a destination containing a
@@ -910,6 +978,32 @@ impl Editor {
                 destination.len(),
                 out,
             )
+        })
+    }
+
+    /// Insert `text` at `offset` as a literal run: every byte the format reads as
+    /// markup is backslash-escaped so the run reparses as exactly `text` — a typed
+    /// `*`, `#` or `` ` `` stays that character rather than opening emphasis, a
+    /// heading or a code span. This is the inverse of serialization (which writes
+    /// an already-parsed run verbatim): it is what a WYSIWYG surface calls so that
+    /// keyboard input can never mint markup, leaving formatting to explicit
+    /// commands.
+    ///
+    /// The escaping is positional and per-format, and neither is the caller's to
+    /// reproduce: inline specials (`*`, `` ` ``, `[`, `<`…) are escaped anywhere
+    /// on the line, while block markers (`#`, `>`, `-`…) are escaped only where
+    /// `offset` sits in its line's leading whitespace — so an inserted "5 - 3"
+    /// keeps its `-` but "- item" at column zero does not become a bullet. An
+    /// embedded newline in `text` re-enters that line-start zone.
+    ///
+    /// Two constructs a byte-alphabet cannot reach are left as typed: a GFM
+    /// bare-URL autolink (`https://x.com`, with no delimiter to escape) and an
+    /// ordered-list marker (`1.`, special only after a digit run). Returns
+    /// [`Error::UnsupportedFormat`] for a parse-only format (XML, HTML) and
+    /// [`Error::InvalidArgument`] when `offset` is past the source.
+    pub fn insert_literal(&mut self, offset: usize, text: &str) -> Result<Change, Error> {
+        self.change_op(|ed, out| unsafe {
+            ffi::twig_editor_insert_literal(ed, offset, text.as_ptr(), text.len(), out)
         })
     }
 
@@ -2132,6 +2226,48 @@ mod tests {
     }
 
     #[test]
+    fn editor_insert_literal_keeps_typed_specials_literal() {
+        for format in [Format::Markdown, Format::Djot] {
+            let mut ed = Editor::new_str("z\n", format).expect("editor");
+            // A `*` at a line start would open emphasis unescaped.
+            ed.insert_literal(0, "*hi*").expect("literal");
+
+            // Source that looks right can still parse wrong: assert the reparse.
+            let nodes = ed.nodes().expect("nodes");
+            assert!(!nodes.iter().any(|n| n.kind == "emph" || n.kind == "strong"));
+            let text: String = nodes
+                .iter()
+                .filter(|n| n.kind == "str")
+                .filter_map(|n| n.text.clone())
+                .collect();
+            assert_eq!(text, "*hi*z");
+        }
+    }
+
+    #[test]
+    fn editor_insert_literal_escapes_block_markers_only_at_line_start() {
+        // Mid-line, a `#` opens nothing and is left as typed.
+        let mut ed = Editor::new_str("az\n", Format::Markdown).expect("editor");
+        ed.insert_literal(1, "# ").expect("literal");
+        assert_eq!(ed.source_str().unwrap(), "a# z\n");
+
+        // At a line start it would open a heading, so it is escaped.
+        let mut ed2 = Editor::new_str("z\n", Format::Markdown).expect("editor");
+        ed2.insert_literal(0, "# ").expect("literal");
+        assert_eq!(ed2.source_str().unwrap(), "\\# z\n");
+        assert!(!ed2.nodes().expect("nodes").iter().any(|n| n.kind == "heading"));
+    }
+
+    #[test]
+    fn editor_insert_literal_rejects_bad_offset_and_parse_only_format() {
+        let mut ed = Editor::new_str("ab\n", Format::Markdown).expect("editor");
+        assert_eq!(ed.insert_literal(99, "x"), Err(Error::InvalidArgument));
+
+        let mut xml = Editor::new_str("<a>hi</a>", Format::Xml).expect("editor");
+        assert_eq!(xml.insert_literal(3, "x"), Err(Error::UnsupportedFormat));
+    }
+
+    #[test]
     fn editor_undo_redo_round_trip() {
         let mut ed = Editor::new_str("hello\n", Format::Markdown).expect("editor");
         ed.edit_range(5, 5, "!").expect("edit");
@@ -2243,6 +2379,39 @@ mod tests {
         ed.undo().expect("undo ok").expect("something to undo");
         assert_eq!(ed.source_str().unwrap(), "\n");
         assert_eq!(ed.caret_blob().unwrap(), b"c0");
+    }
+
+    #[test]
+    fn editor_renumber_ordered_lists_fixes_a_stale_sequence() {
+        let mut ed =
+            Editor::new_str("1. a\n2. x\n2. b\n3. c\n", Format::Markdown).expect("editor");
+        ed.renumber_ordered_lists(0).expect("renumber ok");
+        assert_eq!(ed.source_str().unwrap(), "1. a\n2. x\n3. b\n4. c\n");
+    }
+
+    #[test]
+    fn editor_renumber_ordered_lists_off_a_list_is_not_found() {
+        let mut ed = Editor::new_str("a paragraph\n", Format::Markdown).expect("editor");
+        assert!(matches!(ed.renumber_ordered_lists(2), Err(Error::NotFound)));
+    }
+
+    #[test]
+    fn editor_table_insert_row_and_set_alignment() {
+        let src = "| a | b |\n| --- | --- |\n| 1 | 2 |\n";
+        let mut ed = Editor::new_str(src, Format::Markdown).expect("editor");
+        ed.table_insert_row(24, true).expect("insert row"); // caret in body `1`
+        assert_eq!(
+            ed.source_str().unwrap(),
+            "| a | b |\n| --- | --- |\n| 1 | 2 |\n|  |  |\n"
+        );
+        ed.table_set_alignment(6, Alignment::Center).expect("align"); // column `b`
+        assert!(ed.source_str().unwrap().contains("| --- | :---: |"));
+    }
+
+    #[test]
+    fn editor_table_edit_off_a_table_is_not_found() {
+        let mut ed = Editor::new_str("nope\n", Format::Markdown).expect("editor");
+        assert!(matches!(ed.table_delete_row(2), Err(Error::NotFound)));
     }
 
     #[test]

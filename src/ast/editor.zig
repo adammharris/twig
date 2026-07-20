@@ -42,6 +42,7 @@ const Allocator = std.mem.Allocator;
 const AST = @import("ast.zig");
 const Span = @import("../span.zig");
 const locate = @import("locate.zig");
+const table_edit = @import("table_edit.zig");
 const syntax_mod = @import("../syntax.zig");
 
 pub const Splicer = @import("splicer.zig").Splicer;
@@ -294,6 +295,140 @@ pub const Editor = struct {
         return self.commitSplice(region_start, region_end, out.items);
     }
 
+    /// Renumber the ordered list at `offset` so its markers run `1, 2, 3, …`,
+    /// with each nesting level restarting at 1 — the numbering a caret editor
+    /// keeps as items are inserted, deleted, and nested, where a plain splice
+    /// leaves the source numbers stale (`1. 2. 2. 3.`). A no-op that returns
+    /// `error.NoBlock` when `offset` is not inside an ordered list.
+    ///
+    /// Numbering tracks the marker's INDENTATION, not the AST: one left-to-right
+    /// pass with a small stack of (indent column → next number), so a sub-list
+    /// restarts and its parent resumes where it left off. Only the numeric run of
+    /// a `N.` / `N)` marker is rewritten; its delimiter, spacing, indentation, and
+    /// every non-item (bullet, continuation, blank) line are copied byte-for-byte.
+    pub fn renumberOrderedLists(self: *Editor, offset: usize) Error!void {
+        const src = self.sourceBytes();
+        if (offset > src.len) return error.InvalidRange;
+        const ast = self.astView();
+        const allocator = self.splicer.allocator;
+
+        // The OUTERMOST ordered list on the descent to `offset`: renumber the
+        // whole nest under it in one pass so its levels stay consistent.
+        var chain: std.ArrayList(AST.Node.Id) = .empty;
+        defer chain.deinit(allocator);
+        locate.ancestorChain(allocator, ast, offset, src.len, &chain) catch
+            return error.OutOfMemory;
+        var outer: ?AST.Node.Id = null;
+        for (chain.items) |id| {
+            if (std.meta.activeTag(ast.nodes[id].kind) == .ordered_list) {
+                outer = id;
+                break;
+            }
+        }
+        const list = outer orelse return error.NoBlock;
+
+        const region_start = locate.lineStartAt(src, ast.nodes[list].span.start);
+        const region_end = locate.lineEndAt(src, ast.nodes[list].span.end -| 1);
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try buildRenumber(allocator, src, region_start, region_end, &out);
+
+        // Identical bytes: don't spend an edit (and an undo step) on a no-op.
+        if (std.mem.eql(u8, out.items, src[region_start..region_end])) return;
+        return self.commitSplice(region_start, region_end, out.items);
+    }
+
+    // ── Tables ───────────────────────────────────────────────────────────────
+    // A table is a grid, not a run of delimited text, so its edits are grid
+    // surgery (add/remove/move a row or column, set a column's alignment) rather
+    // than a toggle. The grid is lifted from the AST, mutated, and the whole
+    // table re-spelled in one splice — see `table_edit.zig`. Every gesture is
+    // addressed by a caret `offset`; the cell it lands in is the anchor.
+
+    /// Insert an empty row below (`after`) or above the caret's row.
+    pub fn tableInsertRow(self: *Editor, offset: usize, after: bool) Error!void {
+        return self.tableEdit(offset, .{ .insert_row = if (after) .after else .before });
+    }
+
+    /// Delete the caret's row. `error.NotEditable` for a header row or the last
+    /// body row (a table keeps a header and at least one body row).
+    pub fn tableDeleteRow(self: *Editor, offset: usize) Error!void {
+        return self.tableEdit(offset, .delete_row);
+    }
+
+    /// Insert an empty column right (`after`) or left of the caret's column.
+    pub fn tableInsertColumn(self: *Editor, offset: usize, after: bool) Error!void {
+        return self.tableEdit(offset, .{ .insert_column = if (after) .after else .before });
+    }
+
+    /// Delete the caret's column. `error.NotEditable` when it is the only one.
+    pub fn tableDeleteColumn(self: *Editor, offset: usize) Error!void {
+        return self.tableEdit(offset, .delete_column);
+    }
+
+    /// Set the caret's column to `alignment`.
+    pub fn tableSetAlignment(self: *Editor, offset: usize, alignment: AST.Alignment) Error!void {
+        return self.tableEdit(offset, .{ .set_alignment = alignment });
+    }
+
+    /// Move the caret's row one place down (`down`) or up, within the body rows.
+    pub fn tableMoveRow(self: *Editor, offset: usize, down: bool) Error!void {
+        return self.tableEdit(offset, .{ .move_row = if (down) .after else .before });
+    }
+
+    /// Move the caret's column one place right (`right`) or left.
+    pub fn tableMoveColumn(self: *Editor, offset: usize, right: bool) Error!void {
+        return self.tableEdit(offset, .{ .move_column = if (right) .after else .before });
+    }
+
+    const TableOp = union(enum) {
+        insert_row: table_edit.Side,
+        delete_row,
+        insert_column: table_edit.Side,
+        delete_column,
+        set_alignment: AST.Alignment,
+        move_row: table_edit.Side,
+        move_column: table_edit.Side,
+    };
+
+    /// Lift the table at `offset`, apply one grid op, and splice the rebuilt
+    /// table back — the shared body of every table gesture above.
+    fn tableEdit(self: *Editor, offset: usize, op: TableOp) Error!void {
+        const src = self.sourceBytes();
+        if (offset > src.len) return error.InvalidRange;
+        const ast = self.astView();
+        const allocator = self.splicer.allocator;
+
+        var grid = table_edit.extract(allocator, ast, src, offset) catch |e| return mapTableErr(e);
+        defer grid.deinit();
+
+        (switch (op) {
+            .insert_row => |s| table_edit.insertRow(&grid, s),
+            .delete_row => table_edit.deleteRow(&grid),
+            .insert_column => |s| table_edit.insertColumn(&grid, s),
+            .delete_column => table_edit.deleteColumn(&grid),
+            .set_alignment => |a| table_edit.setAlignment(&grid, a),
+            .move_row => |d| table_edit.moveRow(&grid, d),
+            .move_column => |d| table_edit.moveColumn(&grid, d),
+        }) catch |e| return mapTableErr(e);
+
+        const bytes = table_edit.emit(allocator, &grid) catch |e| return mapTableErr(e);
+        defer allocator.free(bytes);
+        return self.commitSplice(grid.region.start, grid.region.end, bytes);
+    }
+
+    /// Map a `table_edit` error onto the `Editor` error set: "not in a table"
+    /// reads as no block for the gesture, a refused (degenerate) edit as not
+    /// editable.
+    fn mapTableErr(e: table_edit.Error) Error {
+        return switch (e) {
+            error.NotInTable => error.NoBlock,
+            error.Refused => error.NotEditable,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
     // ── Links ──────────────────────────────────────────────────────────────
 
     /// Link `[start, end)` to `destination`, or repoint the link already there.
@@ -426,6 +561,60 @@ pub const Editor = struct {
         try out.append(allocator, ')');
 
         return self.commitSplice(target.start, target.end, out.items);
+    }
+
+    // ── Literal text ─────────────────────────────────────────────────────────
+
+    /// Insert `text` at `offset` as a LITERAL run: every byte the format reads as
+    /// markup is backslash-escaped so the run reparses as exactly `text`, never as
+    /// emphasis, a code span, a link, an entity, or — at a line start — a heading,
+    /// quote or list. This is the inverse of the serializer, which writes an
+    /// already-parsed `str` verbatim: that byte survived a parse in place, whereas
+    /// `text` is arbitrary input that has to be MADE safe.
+    ///
+    /// The escaping is positional. `Syntax.text_escapes` fires anywhere on the
+    /// line (`*`, `` ` ``, `[`, `<`…); `Syntax.block_start_escapes` fires only
+    /// while `offset` sits in its line's leading whitespace (`#`, `>`, `-`…),
+    /// where those bytes open a block — so an inserted "5 - 3" keeps its `-` but
+    /// an inserted "- item" at column zero does not become a bullet. An embedded
+    /// newline in `text` re-enters that line-start zone for the bytes after it.
+    ///
+    /// Like the link ops, this guards the inserted run's OWN bytes; it does not
+    /// reason about source already flanking `offset`. The shared
+    /// splice+reparse+rollback path is the backstop: an insertion that somehow
+    /// still corrupts the document yields `error.EditConflict` and changes
+    /// nothing. `error.UnsupportedFormat` when the format can spell no literal
+    /// (`text_escapes == null`), `error.InvalidRange` when `offset` is past the
+    /// source.
+    ///
+    /// Two constructs a fixed byte-alphabet cannot reach, and so does not: a GFM
+    /// bare-URL autolink (`https://x.com`, linkified with no delimiter to
+    /// backslash) and an ordered-list marker (`1.`/`1)`, special only after a
+    /// digit run, not per-byte). Both mint at most a link or a list from
+    /// literal-looking text, never corruption; a caller that must suppress them
+    /// does so above this op.
+    pub fn insertLiteral(self: *Editor, offset: usize, text: []const u8) Error!void {
+        try self.checkRange(offset, offset);
+        if (self.syntax.text_escapes == null) return error.UnsupportedFormat;
+
+        const allocator = self.splicer.allocator;
+        const src = self.sourceBytes();
+
+        // At a line start iff every byte from this line's start up to `offset` is
+        // leading whitespace — the same zone in which a block marker bites.
+        var at_line_start = true;
+        for (src[locate.lineStartAt(src, offset)..offset]) |c| {
+            if (c != ' ' and c != '\t') {
+                at_line_start = false;
+                break;
+            }
+        }
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try writeLiteral(allocator, self.syntax, text, at_line_start, &out);
+
+        return self.commitSplice(offset, offset, out.items);
     }
 };
 
@@ -747,6 +936,74 @@ fn buildListRewrite(
     }
 }
 
+/// One left-to-right rewrite of `[region_start, region_end)` that renumbers
+/// ordered-list items by their indentation depth — the body of
+/// [`Editor.renumberOrderedLists`], where its reasoning lives.
+fn buildRenumber(
+    allocator: Allocator,
+    src: []const u8,
+    region_start: usize,
+    region_end: usize,
+    out: *std.ArrayList(u8),
+) !void {
+    // A small stack of (indent column, next number), one entry per open nesting
+    // level. Documents don't nest lists dozens deep; 32 is plenty and keeps this
+    // allocation-free. A level deeper than 32 just isn't renumbered (copied).
+    var cols: [32]usize = undefined;
+    var nums: [32]u32 = undefined;
+    var depth: usize = 0;
+
+    var line_start = region_start;
+    while (line_start < region_end) {
+        const line_end = locate.lineEndAt(src, line_start);
+        const line = src[line_start..line_end];
+        const m = listMarkerAt(line);
+        const numbered = if (m) |mm| isNumberedMarker(line[mm.start..mm.end]) else false;
+        if (numbered) {
+            const mm = m.?;
+            const indent = mm.start; // columns of leading whitespace
+            // Drop levels deeper than this item; then resume this level or open it.
+            while (depth > 0 and cols[depth - 1] > indent) depth -= 1;
+            var number: u32 = 1;
+            if (depth > 0 and cols[depth - 1] == indent) {
+                number = nums[depth - 1];
+                nums[depth - 1] += 1;
+            } else if (depth < cols.len) {
+                cols[depth] = indent;
+                nums[depth] = 2; // this item is 1; its next sibling will be 2
+                depth += 1;
+            }
+            // Emit: indentation, an optional `(`, the new number, then the
+            // delimiter and everything after it verbatim.
+            try out.appendSlice(allocator, line[0..mm.start]);
+            var d = mm.start;
+            if (d < line.len and line[d] == '(') {
+                try out.append(allocator, '(');
+                d += 1;
+            }
+            var num_buf: [16]u8 = undefined;
+            const digits = std.fmt.bufPrint(&num_buf, "{d}", .{number}) catch unreachable;
+            try out.appendSlice(allocator, digits);
+            var k = d;
+            while (k < line.len and line[k] >= '0' and line[k] <= '9') k += 1;
+            try out.appendSlice(allocator, line[k..]);
+        } else {
+            // A bullet item, a continuation line, or a blank line: verbatim. A
+            // bullet doesn't disturb the ordered counters at other columns.
+            try out.appendSlice(allocator, line);
+        }
+        line_start = line_end;
+    }
+}
+
+/// Whether a marker (as returned by `listMarkerAt`) is an ordered one — a run of
+/// digits, allowing a leading `(` for the `(1)` form — rather than a bullet.
+fn isNumberedMarker(marker: []const u8) bool {
+    var j: usize = 0;
+    if (j < marker.len and marker[j] == '(') j += 1;
+    return j < marker.len and marker[j] >= '0' and marker[j] <= '9';
+}
+
 // ── Link internals ─────────────────────────────────────────────────────────
 // `toggleInline` can't spell a link: its delimiters are a fixed `(open, close)`
 // pair, and a link's closing half carries a payload (`](dest)`). Hence a
@@ -801,6 +1058,36 @@ fn writeLinkText(
     for (text) |c| {
         if (std.mem.indexOfScalar(u8, escapes, c) != null) try out.append(allocator, '\\');
         try out.append(allocator, c);
+    }
+}
+
+/// Escape `text` for BODY-TEXT position, backslash-escaping every `text_escapes`
+/// byte and — only while in a line's leading whitespace — every
+/// `block_start_escapes` byte. `at_line_start` seeds that zone for the first
+/// line; a `\n` re-enters it, and spaces/tabs (a block marker tolerates up to
+/// three leading spaces) hold it, so `\n  # h` still escapes the `#`. The two
+/// alphabets are separate because a `#` is a heading only at a line start but a
+/// `*` is emphasis anywhere. See `Editor.insertLiteral`.
+fn writeLiteral(
+    allocator: Allocator,
+    syntax: *const Syntax,
+    text: []const u8,
+    at_line_start: bool,
+    out: *std.ArrayList(u8),
+) !void {
+    const inline_escapes = syntax.text_escapes orelse return error.UnsupportedFormat;
+    const block_escapes = syntax.block_start_escapes orelse return error.UnsupportedFormat;
+    var block_pos = at_line_start;
+    for (text) |c| {
+        const escape = std.mem.indexOfScalar(u8, inline_escapes, c) != null or
+            (block_pos and std.mem.indexOfScalar(u8, block_escapes, c) != null);
+        if (escape) try out.append(allocator, '\\');
+        try out.append(allocator, c);
+        if (c == '\n') {
+            block_pos = true;
+        } else if (c != ' ' and c != '\t') {
+            block_pos = false;
+        }
     }
 }
 

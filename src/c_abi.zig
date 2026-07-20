@@ -1783,6 +1783,76 @@ pub export fn twig_editor_toggle_block_container(
     return .ok;
 }
 
+/// Renumber the ordered list at `offset` so its markers run `1, 2, 3, …` — see
+/// `twig.Editor.renumberOrderedLists`. `not_found` when `offset` is not inside an
+/// ordered list. When the numbering is already sequential this is a no-op that
+/// still returns `.ok`; `out_change` then reports the most recent prior edit (or
+/// is left untouched when there is none), so a caller must not treat a `.ok`
+/// return as proof the source moved.
+pub export fn twig_editor_renumber_ordered_lists(
+    ed: ?*TwigEditor,
+    offset: usize,
+    out_change: ?*TwigChange,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const handle = asEditor(raw);
+    handle.editor.renumberOrderedLists(offset) catch |err| return statusOfEditorError(err);
+    if (out_change) |slot| {
+        if (handle.editor.lastChange()) |c| slot.* = changeC(c);
+    }
+    return .ok;
+}
+
+// ── Tables ───────────────────────────────────────────────────────────────────
+// The engine — grid extraction, the mutations, the re-spelled delimiter — is
+// `twig.Editor`'s `table*` gestures over `table_edit.zig`. One entry point
+// carries them all: `op` picks the gesture, `arg` its parameter.
+
+/// The `op` codes for `twig_editor_table_edit` (the wire contract, mirrored by
+/// `TwigTableOp` in `twig.h`).
+const TwigTableOp = enum(c_int) {
+    insert_row = 0,
+    delete_row = 1,
+    insert_column = 2,
+    delete_column = 3,
+    set_alignment = 4,
+    move_row = 5,
+    move_column = 6,
+};
+
+/// Edit the table at `offset`. `op` names the gesture; `arg` is its parameter:
+/// for insert/move a side (0 = before/up/left, 1 = after/down/right), for
+/// set_alignment a `TwigAlignment`, and ignored for the deletes. `not_found`
+/// when `offset` is not in a table, `not_editable` for a refused (degenerate)
+/// edit. Fills out_change on success if non-NULL.
+pub export fn twig_editor_table_edit(
+    ed: ?*TwigEditor,
+    offset: usize,
+    op: c_int,
+    arg: c_int,
+    out_change: ?*TwigChange,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const handle = asEditor(raw);
+    const e = &handle.editor;
+    const result: twig.Editor.Error!void = switch (op) {
+        @intFromEnum(TwigTableOp.insert_row) => e.tableInsertRow(offset, arg != 0),
+        @intFromEnum(TwigTableOp.delete_row) => e.tableDeleteRow(offset),
+        @intFromEnum(TwigTableOp.insert_column) => e.tableInsertColumn(offset, arg != 0),
+        @intFromEnum(TwigTableOp.delete_column) => e.tableDeleteColumn(offset),
+        @intFromEnum(TwigTableOp.set_alignment) => e.tableSetAlignment(
+            offset,
+            alignmentOf(arg) orelse return .invalid_argument,
+        ),
+        @intFromEnum(TwigTableOp.move_row) => e.tableMoveRow(offset, arg != 0),
+        @intFromEnum(TwigTableOp.move_column) => e.tableMoveColumn(offset, arg != 0),
+        else => return .invalid_argument,
+    };
+    result catch |err| return statusOfEditorError(err);
+    if (out_change) |slot| slot.* = changeC(handle.editor.lastChange().?);
+    return .ok;
+}
+
 // ── Links ────────────────────────────────────────────────────────────────────
 // The engine — the per-format escape alphabets, the autolink spelling, the
 // link/autolink node reasoning — is `twig.Editor.insertLink`.
@@ -1803,6 +1873,30 @@ pub export fn twig_editor_insert_link(
     const dest = sliceOf(destination_ptr, destination_len) orelse return .invalid_argument;
 
     handle.editor.insertLink(twig.Span.init(start, end), dest) catch |err|
+        return statusOfEditorError(err);
+    if (out_change) |slot| slot.* = changeC(handle.editor.lastChange().?);
+    return .ok;
+}
+
+// ── Literal text ───────────────────────────────────────────────────────────────
+// The engine — the per-format `text_escapes`/`block_start_escapes` alphabets and
+// the positional escape walk — is `twig.Editor.insertLiteral`.
+
+/// Insert `text` at `offset` as a literal run, escaped for the format so it
+/// reparses as exactly `text`. See `twig.h` for the semantics and
+/// `twig.Editor.insertLiteral` for the implementation and its rationale.
+pub export fn twig_editor_insert_literal(
+    ed: ?*TwigEditor,
+    offset: usize,
+    text_ptr: ?[*]const u8,
+    text_len: usize,
+    out_change: ?*TwigChange,
+) TwigStatus {
+    const raw = ed orelse return .invalid_argument;
+    const handle = asEditor(raw);
+    const text = sliceOf(text_ptr, text_len) orelse return .invalid_argument;
+
+    handle.editor.insertLiteral(offset, text) catch |err|
         return statusOfEditorError(err);
     if (out_change) |slot| slot.* = changeC(handle.editor.lastChange().?);
     return .ok;
@@ -2988,6 +3082,30 @@ test "toolbar: the wire codes reach the right gesture" {
     try fx.expectSource("> ## *[a](x.dev)*\n");
 }
 
+test "insert_literal: the wire reaches the gesture and escapes for the format" {
+    var fx = try EditorFixture.initFmt("z\n", .markdown);
+    defer fx.deinit();
+    // A typed `*` at a line start would open emphasis; the op escapes it.
+    try std.testing.expectEqual(
+        TwigStatus.ok,
+        twig_editor_insert_literal(fx.ed, 0, "*hi*", 4, null),
+    );
+    try fx.expectSource("\\*hi\\*z\n");
+
+    // A parse-only format spells no literal.
+    var xml = try EditorFixture.init("<a>hi</a>");
+    defer xml.deinit();
+    try std.testing.expectEqual(
+        TwigStatus.unsupported_format,
+        twig_editor_insert_literal(xml.ed, 3, "x", 1, null),
+    );
+    // An out-of-range offset is invalid_argument.
+    try std.testing.expectEqual(
+        TwigStatus.invalid_argument,
+        twig_editor_insert_literal(fx.ed, 999, "x", 1, null),
+    );
+}
+
 test "toolbar: out_change reports the byte effect of a gesture" {
     var fx = try EditorFixture.initFmt("a\n", .djot);
     defer fx.deinit();
@@ -3069,6 +3187,7 @@ test "toolbar: a NULL editor is invalid_argument on every gesture" {
     try std.testing.expectEqual(TwigStatus.invalid_argument, twig_editor_set_block(null, 0, 0, 1, null));
     try std.testing.expectEqual(TwigStatus.invalid_argument, twig_editor_toggle_block_container(null, 0, 0, 0, null));
     try std.testing.expectEqual(TwigStatus.invalid_argument, twig_editor_insert_link(null, 0, 0, "x", 1, null));
+    try std.testing.expectEqual(TwigStatus.invalid_argument, twig_editor_insert_literal(null, 0, "x", 1, null));
 }
 
 // ── builder tests ─────────────────────────────────────────────────────────────
